@@ -1,0 +1,14 @@
+schema: spec-driven
+
+context: |
+  Language: Go (go.mod at repo root)
+  Entry: cmd/main/main.go
+  Architecture: internal/ 按职责分包 ——
+    engine   = MainLoop 核心循环
+    provider = 大模型接口抽象 + 各厂商 SDK 实现
+    context  = Token 监控、Prompt 动态组装
+    tools    = 工具注册表、Middleware、基础工具(bash/edit)
+    memory   = 基于文件系统的记忆存取
+    feishu   = 飞书机器人交互回调
+  Convention: 新功能必须归入上述 internal 子包，不新增顶层目录
+  Full details: README.md
