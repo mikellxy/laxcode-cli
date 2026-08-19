@@ -1,5 +1,7 @@
 package schema
 
+import "encoding/json"
+
 type Role string
 
 const (
@@ -9,6 +11,31 @@ const (
 )
 
 type Message struct {
-	Role    Role   `json:"role"`
-	Content string `json:"content"`
+	Role       Role       `json:"role"`
+	Content    string     `json:"content"`
+	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`
+	ToolCallID string     `json:"tool_call_id,omitempty"`
+}
+
+type ToolCall struct {
+	ID        string          `json:"id"`
+	Name      string          `json:"name"`
+	Arguments json.RawMessage `json:"arguments"`
+}
+
+type ToolDefinition struct {
+	Name        string         `json:"name"`
+	Description string         `json:"description"`
+	Parameters  map[string]any `json:"parameters"`
+}
+
+const (
+	ToolDefParamProperties = "properties"
+	ToolDefParamRequired   = "required"
+)
+
+type ToolResult struct {
+	ToolCallID string `json:"tool_call_id"`
+	Output     string `json:"output"`
+	IsError    bool   `json:"is_error"`
 }
