@@ -59,13 +59,16 @@ func (r ReadFileTool) Execute(ctx context.Context, args json.RawMessage) (string
 	}
 
 	path, ok := argsMap["path"]
-	if !ok {
+	if !ok || strings.TrimSpace(path) == "" {
 		return "", fmt.Errorf("file path required")
 	}
 
-	path = filepath.Join(env.WorkDir, path)
+	target, err := safeJoinWorkDir(path)
+	if err != nil {
+		return "", err
+	}
 
-	b, err := os.ReadFile(path)
+	b, err := os.ReadFile(target)
 
 	return string(b), err
 }
