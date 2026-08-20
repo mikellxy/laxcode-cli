@@ -31,6 +31,7 @@ func NewDefaultRegistry() *DefaultRegistry {
 	}
 
 	reg.Registry(new(ReadFileTool))
+	reg.Registry(new(BashTool))
 
 	return reg
 }

@@ -97,7 +97,7 @@ func (b BashTool) Definition() schema.ToolDefinition {
 			"properties": map[string]any{
 				"command": map[string]any{
 					"type":        "string",
-					"description": "bash 命令，如 grep -rn NewAgentEngine",
+					"description": "执行bash 命令，如 grep -rn NewAgentEngine",
 				},
 			},
 			"required": []string{"command"},

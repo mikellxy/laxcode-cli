@@ -3,7 +3,6 @@ package engine
 import (
 	"bufio"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -88,10 +87,8 @@ func (f *AgentEngine) Run(ctx context.Context) error {
 			return fmt.Errorf("generating message: %w", err)
 		}
 
-		fmt.Printf("\033[32m[LaxCode] LLM generates: %s\033[0m\n", msg.Content)
-		if len(msg.ToolCalls) > 0 {
-			b, _ := json.Marshal(msg.ToolCalls)
-			fmt.Printf("\033[33m[LaxCode] LLM asks for tool calls: %s\033[0m\n", string(b))
+		if len(msg.Content) > 0 {
+			fmt.Printf("\033[32m[LaxCode] LLM generates: %s\033[0m\n", msg.Content)
 		}
 
 		if len(msg.ToolCalls) == 0 {
