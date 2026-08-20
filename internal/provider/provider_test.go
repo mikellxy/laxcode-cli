@@ -17,11 +17,11 @@ func TestOpenAIProvider_GenerateWithTool(t *testing.T) {
 		providers    []Provider
 	}{
 		{
-			name: "user ask the weather of beijing",
+			name: "user ask about the content of file",
 			msgs: []schema.Message{
-				{Role: schema.RoleUser, Content: "北京现在的天气是否适合户外跑步?"},
+				{Role: schema.RoleUser, Content: "internal/tools/read_file.go文件实现了什么功能"},
 			},
-			toolRegistry: tools.NewFakeRegistry(),
+			toolRegistry: tools.NewDefaultRegistry(),
 			providers: []Provider{
 				NewOpenApiProvider(Info{Name: "deepseek anthropic"}),
 				NewAnthropicProvider(Info{Name: "deepseek openai"}),

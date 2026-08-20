@@ -18,14 +18,11 @@ func TestMianLoop_GenerateWithTool(t *testing.T) {
 		engines      []*AgentEngine
 	}{
 		{
-			name: "user ask the weather of beijing",
-			msgs: []schema.Message{
-				{Role: schema.RoleUser, Content: "北京现在的天气是否适合户外跑步?"},
-			},
-			toolRegistry: tools.NewFakeRegistry(),
+			name:         "user ask the weather of beijing",
+			toolRegistry: tools.NewDefaultRegistry(),
 			engines: []*AgentEngine{
-				NewAgentEngine(tools.NewFakeRegistry(), provider.NewOpenApiProvider(provider.Info{Name: "deepseek openai"})),
-				NewAgentEngine(tools.NewFakeRegistry(), provider.NewAnthropicProvider(provider.Info{Name: "deepseek anthropic"})),
+				NewAgentEngine(tools.NewDefaultRegistry(), provider.NewOpenApiProvider(provider.Info{Name: "deepseek openai"})),
+				NewAgentEngine(tools.NewDefaultRegistry(), provider.NewAnthropicProvider(provider.Info{Name: "deepseek anthropic"})),
 			},
 		},
 	}
@@ -33,7 +30,7 @@ func TestMianLoop_GenerateWithTool(t *testing.T) {
 	for _, test := range testSet {
 		for _, e := range test.engines {
 			t.Run(test.name, func(t *testing.T) {
-				msg, err := e.Loop(context.Background(), "北京现在的天气是否适合户外跑步?")
+				msg, err := e.Run(context.Background(), "main_loop.go文件中实现了什么功能")
 				if err != nil {
 					t.Fatal(err)
 				}
