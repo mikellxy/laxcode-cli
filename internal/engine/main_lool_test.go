@@ -13,7 +13,6 @@ func TestMianLoop_GenerateWithTool(t *testing.T) {
 	t.Parallel()
 	testSet := []struct {
 		name         string
-		msgs         []schema.Message
 		toolRegistry tools.Registry
 		engines      []*AgentEngine
 	}{
@@ -21,8 +20,8 @@ func TestMianLoop_GenerateWithTool(t *testing.T) {
 			name:         "user ask the weather of beijing",
 			toolRegistry: tools.NewDefaultRegistry(),
 			engines: []*AgentEngine{
-				NewAgentEngine(tools.NewDefaultRegistry(), provider.NewOpenApiProvider(provider.Info{Name: "deepseek openai"})),
-				NewAgentEngine(tools.NewDefaultRegistry(), provider.NewAnthropicProvider(provider.Info{Name: "deepseek anthropic"})),
+				NewAgentEngine(tools.NewDefaultRegistry(), provider.NewOpenApiProvider(provider.Info{Name: "deepseek openai"}), "."),
+				NewAgentEngine(tools.NewDefaultRegistry(), provider.NewAnthropicProvider(provider.Info{Name: "deepseek anthropic"}), "."),
 			},
 		},
 	}
@@ -30,11 +29,16 @@ func TestMianLoop_GenerateWithTool(t *testing.T) {
 	for _, test := range testSet {
 		for _, e := range test.engines {
 			t.Run(test.name, func(t *testing.T) {
-				msg, err := e.Run(context.Background(), "main_loop.go文件中实现了什么功能")
-				if err != nil {
+				// 初始化system prompt并追加用户问题，模拟 Loop 中的多轮输入
+				e.contextHis = append(e.contextHis,
+					schema.Message{Role: schema.RoleSystem, Content: BuildSysPrompt(e.WorkingDir)},
+					schema.Message{Role: schema.RoleUser, Content: "main_loop.go文件中实现了什么功能"},
+				)
+
+				if err := e.Run(context.Background()); err != nil {
 					t.Fatal(err)
 				}
-				t.Logf("[%v] generate: %s", e.Provider.Info(), msg.Content)
+				t.Logf("[%v] generate done", e.Provider.Info())
 			})
 		}
 	}
