@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 
 	"github.com/mikellxy/laxcode/internal/env"
 	"github.com/mikellxy/laxcode/internal/schema"
@@ -131,4 +132,134 @@ func (b BashTool) Execute(ctx context.Context, args json.RawMessage) (string, er
 	}
 
 	return stdout.String(), nil
+}
+
+type WriteFileTool struct{}
+
+func (w WriteFileTool) Info(args json.RawMessage) string {
+	argsMap := make(map[string]string)
+	if err := json.Unmarshal(args, &argsMap); err != nil {
+		return "write_file()"
+	}
+	path, ok := argsMap["path"]
+	if !ok {
+		return "write_file()"
+	}
+
+	return fmt.Sprintf("write_file(%s)", path)
+}
+
+func (w WriteFileTool) Name() string {
+	return "write_file"
+}
+
+func (w WriteFileTool) Definition() schema.ToolDefinition {
+	return schema.ToolDefinition{
+		Name:        "write_file",
+		Description: "写入内容到文件。**严格限制**只写入你的工作目录下的文件，提供文件在工作目录的相对路径；若父目录不存在会自动创建",
+		Parameters: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"path": map[string]any{
+					"type":        "string",
+					"description": "要写入的文件的相对路径，如 cmd/main/main.go",
+				},
+				"content": map[string]any{
+					"type":        "string",
+					"description": "要写入的完整文件内容",
+				},
+				"mode": map[string]any{
+					"type":        "string",
+					"enum":        []string{"write", "append"},
+					"description": "写入模式：write 覆盖写入(默认)，append 追加到文件末尾",
+				},
+			},
+			"required": []string{"path", "content"},
+		},
+	}
+}
+
+func (w WriteFileTool) Execute(ctx context.Context, args json.RawMessage) (string, error) {
+	argsMap := make(map[string]string)
+	if err := json.Unmarshal(args, &argsMap); err != nil {
+		return "", err
+	}
+
+	path, ok := argsMap["path"]
+	if !ok || strings.TrimSpace(path) == "" {
+		return "", fmt.Errorf("file path required")
+	}
+
+	content, ok := argsMap["content"]
+	if !ok {
+		return "", fmt.Errorf("file content required")
+	}
+
+	mode := argsMap["mode"]
+	if mode == "" {
+		mode = "write"
+	}
+
+	target, err := safeJoinWorkDir(path)
+	if err != nil {
+		return "", err
+	}
+
+	// 自动创建父目录
+	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+		return "", fmt.Errorf("create parent dir: %w", err)
+	}
+
+	switch mode {
+	case "write":
+		if err := os.WriteFile(target, []byte(content), 0o644); err != nil {
+			return "", err
+		}
+	case "append":
+		f, err := os.OpenFile(target, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+		if err != nil {
+			return "", err
+		}
+		defer f.Close()
+		if _, err := f.WriteString(content); err != nil {
+			return "", err
+		}
+	default:
+		return "", fmt.Errorf("unsupported mode %q, only \"write\" or \"append\"", mode)
+	}
+
+	// 返回相对工作目录的路径，便于模型确认
+	rel, err := filepath.Rel(env.WorkDir, target)
+	if err != nil {
+		rel = target
+	}
+
+	return fmt.Sprintf("file written: %s (mode=%s)", filepath.ToSlash(rel), mode), nil
+}
+
+// safeJoinWorkDir 将用户提供的相对路径安全地解析到工作目录内，
+// 防止 ../ 路径穿越或绝对路径逃逸到工作目录之外。
+func safeJoinWorkDir(rel string) (string, error) {
+	workDirAbs, err := filepath.Abs(env.WorkDir)
+	if err != nil {
+		return "", fmt.Errorf("resolve work dir: %w", err)
+	}
+
+	// 工具契约要求相对路径，显式拒绝绝对路径，避免语义歧义
+	if filepath.IsAbs(rel) {
+		return "", fmt.Errorf("path %q must be a relative path within working directory %q", rel, workDirAbs)
+	}
+
+	target := filepath.Clean(filepath.Join(workDirAbs, rel))
+
+	// 校验目标路径必须位于工作目录内
+	check, err := filepath.Rel(workDirAbs, target)
+	if err != nil {
+		return "", fmt.Errorf("resolve target path: %w", err)
+	}
+	if check == ".." || strings.HasPrefix(check, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("path %q escapes working directory %q", rel, workDirAbs)
+	}
+
+	return target, nil
 }
