@@ -156,7 +156,7 @@ func (w WriteFileTool) Name() string {
 func (w WriteFileTool) Definition() schema.ToolDefinition {
 	return schema.ToolDefinition{
 		Name:        "write_file",
-		Description: "写入内容到文件。**严格限制**只写入你的工作目录下的文件，提供文件在工作目录的相对路径；若父目录不存在会自动创建",
+		Description: "写入完整文件内容，创建新文件或覆写已有文件。**严格限制**只写入你的工作目录下的文件，提供文件在工作目录的相对路径；若父目录不存在会自动创建",
 		Parameters: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -167,11 +167,6 @@ func (w WriteFileTool) Definition() schema.ToolDefinition {
 				"content": map[string]any{
 					"type":        "string",
 					"description": "要写入的完整文件内容",
-				},
-				"mode": map[string]any{
-					"type":        "string",
-					"enum":        []string{"write", "append"},
-					"description": "写入模式：write 覆盖写入(默认)，append 追加到文件末尾",
 				},
 			},
 			"required": []string{"path", "content"},
@@ -195,11 +190,6 @@ func (w WriteFileTool) Execute(ctx context.Context, args json.RawMessage) (strin
 		return "", fmt.Errorf("file content required")
 	}
 
-	mode := argsMap["mode"]
-	if mode == "" {
-		mode = "write"
-	}
-
 	target, err := safeJoinWorkDir(path)
 	if err != nil {
 		return "", err
@@ -210,22 +200,8 @@ func (w WriteFileTool) Execute(ctx context.Context, args json.RawMessage) (strin
 		return "", fmt.Errorf("create parent dir: %w", err)
 	}
 
-	switch mode {
-	case "write":
-		if err := os.WriteFile(target, []byte(content), 0o644); err != nil {
-			return "", err
-		}
-	case "append":
-		f, err := os.OpenFile(target, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
-		if err != nil {
-			return "", err
-		}
-		defer f.Close()
-		if _, err := f.WriteString(content); err != nil {
-			return "", err
-		}
-	default:
-		return "", fmt.Errorf("unsupported mode %q, only \"write\" or \"append\"", mode)
+	if err := os.WriteFile(target, []byte(content), 0o644); err != nil {
+		return "", err
 	}
 
 	// 返回相对工作目录的路径，便于模型确认
@@ -234,7 +210,7 @@ func (w WriteFileTool) Execute(ctx context.Context, args json.RawMessage) (strin
 		rel = target
 	}
 
-	return fmt.Sprintf("file written: %s (mode=%s)", filepath.ToSlash(rel), mode), nil
+	return fmt.Sprintf("内容成功写入文件：%s", filepath.ToSlash(rel)), nil
 }
 
 // safeJoinWorkDir 将用户提供的相对路径安全地解析到工作目录内，
