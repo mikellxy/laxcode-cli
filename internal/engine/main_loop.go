@@ -76,6 +76,7 @@ func (f *AgentEngine) Run(ctx context.Context) error {
 	contextHis := f.contextHis
 
 	turnCnt := 0
+	prevTurnHasReadOrBash := false
 
 	for {
 		turnCnt++
@@ -96,7 +97,13 @@ func (f *AgentEngine) Run(ctx context.Context) error {
 		}
 
 		contextHis = append(contextHis, *msg)
+
+		// 统计本轮 read_file / bash 工具调用，并执行全部工具
+		readBashCnt := 0
 		for _, toolCall := range msg.ToolCalls {
+			if toolCall.Name == "read_file" || toolCall.Name == "bash" {
+				readBashCnt++
+			}
 			toolResult := f.ToolRegistry.Execute(ctx, &toolCall)
 			contextHis = append(contextHis, schema.Message{
 				Role:       schema.RoleUser,
@@ -104,5 +111,26 @@ func (f *AgentEngine) Run(ctx context.Context) error {
 				ToolCallID: toolResult.ToolCallID,
 			})
 		}
+
+		// 记录并判断是否需要触发一轮“深度思考规划”：
+		// 1. 连续两次外层 for 循环都发起了 read_file/bash 调用
+		// 2. 本次一次发起了多个工具调用，且其中至少两个是 read_file/bash
+		currTurnHasReadOrBash := readBashCnt > 0
+		needDeepThink := (prevTurnHasReadOrBash && currTurnHasReadOrBash) || readBashCnt >= 2
+		prevTurnHasReadOrBash = currTurnHasReadOrBash
+
+		if !needDeepThink {
+			continue
+		}
+
+		// 不带 available tools 发起一次生成请求，引导 LLM 根据新收集到的信息进行一轮深度思考规划
+		deepMsg, err := f.Provider.Generate(ctx, contextHis, nil)
+		if err != nil {
+			return fmt.Errorf("generating deep thinking message: %w", err)
+		}
+		if len(deepMsg.Content) > 0 {
+			fmt.Printf("\033[33m[LaxCode] LLM deep thinking: %s\033[0m\n", deepMsg.Content)
+		}
+		//contextHis = append(contextHis, *deepMsg)
 	}
 }
