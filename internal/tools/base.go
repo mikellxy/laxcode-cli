@@ -1,11 +1,9 @@
 package tools
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -119,19 +117,21 @@ func (b BashTool) Execute(ctx context.Context, args json.RawMessage) (string, er
 
 	cmd := exec.CommandContext(ctx, "bash", "-c", command)
 	cmd.Dir = env.WorkDir
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = io.Writer(&stdout)
-	cmd.Stderr = io.Writer(&stderr)
-
-	if err := cmd.Run(); err != nil {
-		return "", err
+	output, err := cmd.CombinedOutput()
+	outputStr := string(output)
+	if err != nil {
+		return fmt.Sprintf("执行报错: %s\nbash输出:%s\n", err.Error(), outputStr), nil
+	}
+	if len(outputStr) == 0 {
+		return "命令执行成功，无bash输", nil
 	}
 
-	if errMsg := stderr.String(); errMsg != "" {
-		return "", fmt.Errorf("%s", errMsg)
+	const maxLen = 8000
+	if len(outputStr) > maxLen {
+		return fmt.Sprintf("命令执行成功. bash输出过长以截断至前%d字节:\n%s", maxLen, outputStr[:maxLen]), nil
 	}
 
-	return stdout.String(), nil
+	return fmt.Sprintf("命令执行成功, bash输出:\n%s", outputStr), nil
 }
 
 type WriteFileTool struct{}
