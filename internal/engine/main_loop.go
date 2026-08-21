@@ -76,61 +76,40 @@ func (f *AgentEngine) Run(ctx context.Context) error {
 	contextHis := f.contextHis
 
 	turnCnt := 0
-	prevTurnHasReadOrBash := false
 
 	for {
 		turnCnt++
 		if turnCnt > 50 {
 			return errors.New("too many turns")
 		}
-		msg, err := f.Provider.Generate(ctx, contextHis, f.ToolRegistry.GetAvailableTools())
+		msgs, err := f.Provider.Generate(ctx, contextHis, f.ToolRegistry.GetAvailableTools())
 		if err != nil {
 			return fmt.Errorf("generating message: %w", err)
 		}
 
-		if len(msg.Content) > 0 {
-			fmt.Printf("\033[32m[LaxCode] LLM generates: %s\033[0m\n", msg.Content)
-		}
-
-		if len(msg.ToolCalls) == 0 {
-			return nil
-		}
-
-		contextHis = append(contextHis, *msg)
-
-		// 统计本轮 read_file / bash 工具调用，并执行全部工具
-		readBashCnt := 0
-		for _, toolCall := range msg.ToolCalls {
-			if toolCall.Name == "read_file" || toolCall.Name == "bash" {
-				readBashCnt++
+		var toolCallCnt int
+		for _, msg := range msgs {
+			if len(msg.Content) > 0 {
+				fmt.Printf("\033[32m[LaxCode] LLM generates: %s\033[0m\n", msg.Content)
 			}
-			toolResult := f.ToolRegistry.Execute(ctx, &toolCall)
-			contextHis = append(contextHis, schema.Message{
-				Role:       schema.RoleUser,
-				Content:    toolResult.Output,
-				ToolCallID: toolResult.ToolCallID,
-			})
-		}
 
-		// 记录并判断是否需要触发一轮“深度思考规划”：
-		// 1. 连续两次外层 for 循环都发起了 read_file/bash 调用
-		// 2. 本次一次发起了多个工具调用，且其中至少两个是 read_file/bash
-		currTurnHasReadOrBash := readBashCnt > 0
-		needDeepThink := (prevTurnHasReadOrBash && currTurnHasReadOrBash) || readBashCnt >= 2
-		prevTurnHasReadOrBash = currTurnHasReadOrBash
+			toolCallCnt += len(msg.ToolCalls)
 
-		if !needDeepThink {
-			continue
-		}
+			contextHis = append(contextHis, msg)
 
-		// 不带 available tools 发起一次生成请求，引导 LLM 根据新收集到的信息进行一轮深度思考规划
-		deepMsg, err := f.Provider.Generate(ctx, contextHis, nil)
-		if err != nil {
-			return fmt.Errorf("generating deep thinking message: %w", err)
+			for _, toolCall := range msg.ToolCalls {
+				toolResult := f.ToolRegistry.Execute(ctx, &toolCall)
+				contextHis = append(contextHis, schema.Message{
+					Role:       schema.RoleUser,
+					Content:    toolResult.Output,
+					ToolCallID: toolResult.ToolCallID,
+				})
+			}
 		}
-		if len(deepMsg.Content) > 0 {
-			fmt.Printf("\033[33m[LaxCode] LLM deep thinking: %s\033[0m\n", deepMsg.Content)
+		if toolCallCnt == 0 {
+			break
 		}
-		//contextHis = append(contextHis, *deepMsg)
 	}
+
+	return nil
 }

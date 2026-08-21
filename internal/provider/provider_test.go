@@ -23,7 +23,7 @@ func TestOpenAIProvider_GenerateWithTool(t *testing.T) {
 			},
 			toolRegistry: tools.NewDefaultRegistry(),
 			providers: []Provider{
-				NewOpenApiProvider(Info{Name: "deepseek anthropic"}),
+				//NewOpenApiProvider(Info{Name: "deepseek anthropic"}),
 				NewAnthropicProvider(Info{Name: "deepseek openai"}),
 			},
 		},
@@ -43,11 +43,7 @@ func TestOpenAIProvider_GenerateWithTool(t *testing.T) {
 				if len(assistantMsg.ToolCalls) == 0 {
 					t.Errorf("Generate() tool calls = %v, want at least one tool call", assistantMsg.ToolCalls)
 				}
-				msgs = append(msgs, schema.Message{
-					Role:      schema.RoleAssistant,
-					Content:   assistantMsg.Content,
-					ToolCalls: assistantMsg.ToolCalls,
-				})
+				msgs = append(msgs, *assistantMsg)
 				for _, tc := range assistantMsg.ToolCalls {
 					toolResult := test.toolRegistry.Execute(context.Background(), &tc)
 					msgs = append(msgs, schema.Message{

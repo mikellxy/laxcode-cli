@@ -7,7 +7,7 @@ import (
 )
 
 type Provider interface {
-	Generate(ctx context.Context, msgs []schema.Message, tools []schema.ToolDefinition) (*schema.Message, error)
+	Generate(ctx context.Context, msgs []schema.Message, tools []schema.ToolDefinition) ([]schema.Message, error)
 	Info() *Info
 }
 

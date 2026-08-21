@@ -33,7 +33,7 @@ func (p *AnthropicProvider) Info() *Info {
 	return &p.info
 }
 
-func (p *AnthropicProvider) Generate(ctx context.Context, msgs []schema.Message, tools []schema.ToolDefinition) (*schema.Message, error) {
+func (p *AnthropicProvider) Generate(ctx context.Context, msgs []schema.Message, tools []schema.ToolDefinition) ([]schema.Message, error) {
 	var inputMsgs []anthropic.MessageParam
 	var sysPrompt string
 
@@ -110,7 +110,7 @@ func (p *AnthropicProvider) Generate(ctx context.Context, msgs []schema.Message,
 		return nil, fmt.Errorf("Claude/Zhipu API 请求失败: %w", err)
 	}
 
-	msg := &schema.Message{
+	msg := schema.Message{
 		Role: schema.RoleAssistant,
 	}
 
@@ -128,5 +128,5 @@ func (p *AnthropicProvider) Generate(ctx context.Context, msgs []schema.Message,
 		}
 	}
 
-	return msg, nil
+	return []schema.Message{msg}, nil
 }

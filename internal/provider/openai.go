@@ -8,6 +8,7 @@ import (
 	"github.com/mikellxy/laxcode/internal/schema"
 	"github.com/openai/openai-go/v3"
 	"github.com/openai/openai-go/v3/option"
+	"github.com/openai/openai-go/v3/responses"
 )
 
 type OpenApiProvider struct {
@@ -32,96 +33,82 @@ func (p *OpenApiProvider) Info() *Info {
 	return &p.info
 }
 
-func (p *OpenApiProvider) Generate(ctx context.Context, msgs []schema.Message, tools []schema.ToolDefinition) (*schema.Message, error) {
-	var inputMsgs []openai.ChatCompletionMessageParamUnion
+func (p *OpenApiProvider) Generate(ctx context.Context, msgs []schema.Message, toolsDefs []schema.ToolDefinition) ([]schema.Message, error) {
+	var inputParams responses.ResponseNewParamsInputUnion
 
 	for _, msg := range msgs {
 		switch msg.Role {
 		case schema.RoleSystem:
-			inputMsgs = append(inputMsgs, openai.SystemMessage(msg.Content))
-
+			item := responses.ResponseInputItemParamOfMessage(msg.Content, responses.EasyInputMessageRoleSystem)
+			inputParams.OfInputItemList = append(inputParams.OfInputItemList, item)
 		case schema.RoleUser:
 			if msg.ToolCallID != "" {
-				inputMsgs = append(inputMsgs, openai.ToolMessage(msg.Content, msg.ToolCallID))
+				item := responses.ResponseInputItemParamOfFunctionCallOutput(msg.ToolCallID, msg.Content)
+				inputParams.OfInputItemList = append(inputParams.OfInputItemList, item)
 			} else {
-				inputMsgs = append(inputMsgs, openai.UserMessage(msg.Content))
+				item := responses.ResponseInputItemParamOfMessage(msg.Content, responses.EasyInputMessageRoleUser)
+				inputParams.OfInputItemList = append(inputParams.OfInputItemList, item)
 			}
 
 		case schema.RoleAssistant:
-			var astMsgParam openai.ChatCompletionAssistantMessageParam
 			if len(msg.Content) > 0 {
-				astMsgParam.Content = openai.ChatCompletionAssistantMessageParamContentUnion{
-					OfString: openai.String(msg.Content),
-				}
+				item := responses.ResponseInputItemParamOfMessage(msg.Content, responses.EasyInputMessageRoleAssistant)
+				inputParams.OfInputItemList = append(inputParams.OfInputItemList, item)
 			}
 
 			if len(msg.ToolCalls) > 0 {
-				var toolCallParams []openai.ChatCompletionMessageToolCallUnionParam
 				for _, tc := range msg.ToolCalls {
-					toolCallParams = append(toolCallParams, openai.ChatCompletionMessageToolCallUnionParam{
-						OfFunction: &openai.ChatCompletionMessageFunctionToolCallParam{
-							ID:   tc.ID,
-							Type: "function",
-							Function: openai.ChatCompletionMessageFunctionToolCallFunctionParam{
-								Name:      tc.Name,
-								Arguments: string(tc.Arguments),
-							},
-						},
-					})
+					item := responses.ResponseInputItemParamOfFunctionCall(string(tc.Arguments), tc.ID, tc.Name)
+					inputParams.OfInputItemList = append(inputParams.OfInputItemList, item)
 				}
-				astMsgParam.ToolCalls = toolCallParams
 			}
-
-			inputMsgs = append(inputMsgs, openai.ChatCompletionMessageParamUnion{
-				OfAssistant: &astMsgParam,
-			})
-
 		}
 
 	}
 
-	params := openai.ChatCompletionNewParams{
-		Messages: inputMsgs,
-		Model:    p.model,
+	reqParams := responses.ResponseNewParams{
+		Model: p.model,
+		Input: inputParams,
 	}
 
-	if len(tools) > 0 {
-		var toolParams []openai.ChatCompletionToolUnionParam
-		for _, tool := range tools {
-			toolParams = append(toolParams, openai.ChatCompletionToolUnionParam{
-				OfFunction: &openai.ChatCompletionFunctionToolParam{
-					Function: openai.FunctionDefinitionParam{
-						Name:        tool.Name,
-						Description: openai.String(tool.Description),
-						Parameters:  openai.FunctionParameters(tool.Parameters),
-					},
-				},
-			})
+	if len(toolsDefs) > 0 {
+		for _, td := range toolsDefs {
+			tool := responses.ToolParamOfFunction(td.Name, td.Parameters, true)
+			tool.OfFunction.Description = openai.String(td.Description)
+			reqParams.Tools = append(reqParams.Tools, tool)
 		}
-		params.Tools = toolParams
 	}
 
-	resp, err := p.client.Chat.Completions.New(ctx, params)
+	resp, err := p.client.Responses.New(ctx, reqParams)
 	if err != nil {
 		return nil, err
 	}
 
-	choice := resp.Choices[0].Message
-
-	msg := &schema.Message{
-		Role:    schema.RoleAssistant,
-		Content: choice.Content,
-	}
-
-	if len(choice.ToolCalls) > 0 {
-		for _, tc := range choice.ToolCalls {
+	var respMsgs []schema.Message
+	for _, output := range resp.Output {
+		switch output.Type {
+		case "function_call":
+			c := output.AsFunctionCall()
+			msg := schema.Message{
+				Role: schema.RoleAssistant,
+			}
 			msg.ToolCalls = append(msg.ToolCalls, schema.ToolCall{
-				ID:        tc.ID,
-				Name:      tc.Function.Name,
-				Arguments: json.RawMessage(tc.Function.Arguments),
+				ID:        c.CallID,
+				Name:      c.Name,
+				Arguments: json.RawMessage(c.Arguments),
 			})
+			respMsgs = append(respMsgs, msg)
+		case "message":
+			c := output.AsMessage()
+			for _, content := range c.Content {
+				msg := schema.Message{
+					Role:    schema.Role(c.Role),
+					Content: content.Text,
+				}
+				respMsgs = append(respMsgs, msg)
+			}
 		}
 	}
 
-	return msg, nil
+	return respMsgs, nil
 }
