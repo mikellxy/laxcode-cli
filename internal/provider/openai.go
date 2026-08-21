@@ -83,32 +83,48 @@ func (p *OpenApiProvider) Generate(ctx context.Context, msgs []schema.Message, t
 	if err != nil {
 		return nil, err
 	}
-
 	var respMsgs []schema.Message
+	//for _, output := range resp.Output {
+	//	switch output.Type {
+	//	case "function_call":
+	//		c := output.AsFunctionCall()
+	//		msg := schema.Message{
+	//			Role: schema.RoleAssistant,
+	//		}
+	//		msg.ToolCalls = append(msg.ToolCalls, schema.ToolCall{
+	//			ID:        c.CallID,
+	//			Name:      c.Name,
+	//			Arguments: json.RawMessage(c.Arguments),
+	//		})
+	//		respMsgs = append(respMsgs, msg)
+	//	case "message":
+	//		c := output.AsMessage()
+	//		for _, content := range c.Content {
+	//			msg := schema.Message{
+	//				Role:    schema.Role(c.Role),
+	//				Content: content.Text,
+	//			}
+	//			respMsgs = append(respMsgs, msg)
+	//		}
+	//	}
+	//}
+
+	msg := schema.Message{
+		Role:    schema.RoleAssistant,
+		Content: resp.OutputText(),
+	}
 	for _, output := range resp.Output {
 		switch output.Type {
 		case "function_call":
 			c := output.AsFunctionCall()
-			msg := schema.Message{
-				Role: schema.RoleAssistant,
-			}
 			msg.ToolCalls = append(msg.ToolCalls, schema.ToolCall{
 				ID:        c.CallID,
 				Name:      c.Name,
 				Arguments: json.RawMessage(c.Arguments),
 			})
-			respMsgs = append(respMsgs, msg)
-		case "message":
-			c := output.AsMessage()
-			for _, content := range c.Content {
-				msg := schema.Message{
-					Role:    schema.Role(c.Role),
-					Content: content.Text,
-				}
-				respMsgs = append(respMsgs, msg)
-			}
 		}
 	}
+	respMsgs = append(respMsgs, msg)
 
 	return respMsgs, nil
 }
