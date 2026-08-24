@@ -8,6 +8,7 @@ import (
 	"os"
 	"strings"
 
+	laxctx "github.com/mikellxy/laxcode/internal/context"
 	"github.com/mikellxy/laxcode/internal/provider"
 	"github.com/mikellxy/laxcode/internal/schema"
 	"github.com/mikellxy/laxcode/internal/tools"
@@ -33,10 +34,11 @@ func NewAgentEngine(toolRegistry tools.Registry, provider provider.Provider, wor
 }
 
 func (f *AgentEngine) Loop(ctx context.Context) error {
-	// 初始化system prompt，只做一次！后续多轮用户输入不再重复加system
+	// 初始化system prompt，只做一次！后续多轮用户输入不再重复加system；
+	// 技能索引随启动时加载一次并注入，会话内不刷新
 	f.contextHis = append(f.contextHis, schema.Message{
 		Role:    schema.RoleSystem,
-		Content: BuildSysPrompt(f.WorkingDir),
+		Content: BuildSysPrompt(f.WorkingDir, laxctx.LoadSkills(f.WorkingDir)),
 	})
 
 	scanner := bufio.NewScanner(os.Stdin)

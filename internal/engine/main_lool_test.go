@@ -4,6 +4,7 @@ import (
 	"context"
 	"testing"
 
+	laxctx "github.com/mikellxy/laxcode/internal/context"
 	"github.com/mikellxy/laxcode/internal/provider"
 	"github.com/mikellxy/laxcode/internal/schema"
 	"github.com/mikellxy/laxcode/internal/tools"
@@ -31,7 +32,7 @@ func TestMianLoop_GenerateWithTool(t *testing.T) {
 			t.Run(test.name, func(t *testing.T) {
 				// 初始化system prompt并追加用户问题，模拟 Loop 中的多轮输入
 				e.contextHis = append(e.contextHis,
-					schema.Message{Role: schema.RoleSystem, Content: BuildSysPrompt(e.WorkingDir)},
+					schema.Message{Role: schema.RoleSystem, Content: BuildSysPrompt(e.WorkingDir, laxctx.LoadSkills(e.WorkingDir))},
 					schema.Message{Role: schema.RoleUser, Content: "main_loop.go文件中实现了什么功能"},
 				)
 

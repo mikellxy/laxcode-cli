@@ -33,18 +33,23 @@ func TestOpenAIProvider_GenerateWithTool(t *testing.T) {
 		for _, p := range test.providers {
 			t.Run(test.name, func(t *testing.T) {
 				msgs := test.msgs
-				assistantMsg, err := p.Generate(context.Background(), msgs, test.toolRegistry.GetAvailableTools())
+				respMsgs, err := p.Generate(context.Background(), msgs, test.toolRegistry.GetAvailableTools())
 				if err != nil {
 					t.Fatalf("Generate() error = %v", err)
 				}
-				if assistantMsg.Role != schema.RoleAssistant {
-					t.Errorf("Generate() role = %q, want %q", assistantMsg.Role, schema.RoleAssistant)
+				msgs = append(msgs, respMsgs...)
+
+				var toolCalls []schema.ToolCall
+				for _, m := range respMsgs {
+					if m.Role != schema.RoleAssistant {
+						t.Errorf("Generate() role = %q, want %q", m.Role, schema.RoleAssistant)
+					}
+					toolCalls = append(toolCalls, m.ToolCalls...)
 				}
-				if len(assistantMsg.ToolCalls) == 0 {
-					t.Errorf("Generate() tool calls = %v, want at least one tool call", assistantMsg.ToolCalls)
+				if len(toolCalls) == 0 {
+					t.Errorf("Generate() tool calls = %v, want at least one tool call", toolCalls)
 				}
-				msgs = append(msgs, *assistantMsg)
-				for _, tc := range assistantMsg.ToolCalls {
+				for _, tc := range toolCalls {
 					toolResult := test.toolRegistry.Execute(context.Background(), &tc)
 					msgs = append(msgs, schema.Message{
 						Role:       schema.RoleUser,
@@ -53,14 +58,16 @@ func TestOpenAIProvider_GenerateWithTool(t *testing.T) {
 					})
 				}
 
-				assistantMsg, err = p.Generate(context.Background(), msgs, test.toolRegistry.GetAvailableTools())
+				respMsgs, err = p.Generate(context.Background(), msgs, test.toolRegistry.GetAvailableTools())
 				if err != nil {
 					t.Fatalf("Generate() error = %v", err)
 				}
-				if assistantMsg.Role != schema.RoleAssistant {
-					t.Errorf("Generate() role = %q, want %q", assistantMsg.Role, schema.RoleAssistant)
+				for _, m := range respMsgs {
+					if m.Role != schema.RoleAssistant {
+						t.Errorf("Generate() role = %q, want %q", m.Role, schema.RoleAssistant)
+					}
+					t.Logf("[%v] Generate() response = %q\n", p.Info(), m.Content)
 				}
-				t.Logf("[%v] Generate() response = %q\n", p.Info(), assistantMsg.Content)
 			})
 		}
 	}
