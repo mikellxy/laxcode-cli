@@ -1,3 +1,11 @@
 .qoder/
 .idea
 .DS_Store
+
+# LaxCode: 会话目录不入库
+.laxcode/.session/
+
+# LaxCode: skills 只提交 example 目录
+.laxcode/skills/*
+!.laxcode/skills/example/
+
