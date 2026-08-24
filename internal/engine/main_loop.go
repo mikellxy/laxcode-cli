@@ -13,6 +13,10 @@ import (
 	"github.com/mikellxy/laxcode/internal/tools"
 )
 
+// errTooManyTurns 是 Run 触发单轮工具循环上限的 sentinel error，
+// Loop 依赖 errors.Is 识别它并继续等待下一轮输入，而不是终止 REPL
+var errTooManyTurns = errors.New("too many turns")
+
 type AgentEngine struct {
 	ToolRegistry tools.Registry
 	Provider     provider.Provider
@@ -63,7 +67,7 @@ func (f *AgentEngine) Loop(ctx context.Context) error {
 		err := f.Run(ctx)
 		if err != nil {
 			// warn too many turns
-			if errors.Is(err, errors.New("too many turns")) {
+			if errors.Is(err, errTooManyTurns) {
 				fmt.Printf("[warn] %v\n", err)
 			} else {
 				return fmt.Errorf("run llm tool loop: %w", err)
@@ -74,13 +78,17 @@ func (f *AgentEngine) Loop(ctx context.Context) error {
 
 func (f *AgentEngine) Run(ctx context.Context) error {
 	contextHis := f.contextHis
+	// contextHis 只复制了 slice 头，与 f.contextHis 共享底层数组；
+	// 本轮累积的 assistant 回复与工具结果必须写回 f.contextHis，
+	// 否则下一轮模型看不到历史回复，会把旧问题重新回答一遍
+	defer func() { f.contextHis = contextHis }()
 
 	turnCnt := 0
 
 	for {
 		turnCnt++
 		if turnCnt > 50 {
-			return errors.New("too many turns")
+			return errTooManyTurns
 		}
 		msgs, err := f.Provider.Generate(ctx, contextHis, f.ToolRegistry.GetAvailableTools())
 		if err != nil {

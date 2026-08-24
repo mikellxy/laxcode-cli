@@ -59,14 +59,16 @@ func (r ReadFileTool) Definition() schema.ToolDefinition {
 				},
 				"start_line_no": map[string]any{
 					"type":        "integer",
-					"description": "起始行/从哪一行开始读，从头开始读时start_line_no=1",
+					"minimum":     1,
+					"description": "起始行号，1-based，最小为 1，禁止传 0；从头开始读传 start_line_no=1",
 				},
 				"start_bytes": map[string]any{
 					"type":        "integer",
-					"description": "从起始行的第几个字节开始，从起始字节开始读时start_bytes=1",
+					"minimum":     1,
+					"description": "起始行内字节偏移，1-based，最小为 1，禁止传 0；从起始字节开始读传 start_bytes=1",
 				},
 			},
-			"required": []string{"path"},
+			"required": []string{"path", "start_line_no", "start_bytes"},
 		},
 	}
 }
