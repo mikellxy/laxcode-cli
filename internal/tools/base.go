@@ -16,20 +16,30 @@ import (
 	"github.com/mikellxy/laxcode/internal/utils"
 )
 
+type readFileToolArgs struct {
+	Path        string `json:"path"`
+	StartLineNo int    `json:"start_line_no"`
+	StartBytes  int    `json:"start_bytes"`
+}
+
+const (
+	readFileToolMaxReadLines = 2000
+	readFileToolMaxReadBytes = 50 * 1024
+)
+
 type ReadFileTool struct {
 }
 
 func (r ReadFileTool) Info(args json.RawMessage) string {
-	argsMap := make(map[string]string)
-	if err := json.Unmarshal(args, &argsMap); err != nil {
+	var argsObj readFileToolArgs
+	if err := json.Unmarshal(args, &argsObj); err != nil {
 		return "read_file()"
 	}
-	path, ok := argsMap["path"]
-	if !ok {
+	if argsObj.Path == "" {
 		return "read_file()"
 	}
 
-	return fmt.Sprintf("read_file(%s)", path)
+	return fmt.Sprintf("read_file(path=%s, start_line_no=%d, start_bytes=%d)", argsObj.Path, argsObj.StartLineNo, argsObj.StartBytes)
 }
 
 func (r ReadFileTool) Name() string {
@@ -60,17 +70,6 @@ func (r ReadFileTool) Definition() schema.ToolDefinition {
 		},
 	}
 }
-
-type readFileToolArgs struct {
-	Path        string `json:"path"`
-	StartLineNo int    `json:"start_line_no"`
-	StartBytes  int    `json:"start_bytes"`
-}
-
-const (
-	readFileToolMaxReadLines = 2000
-	readFileToolMaxReadBytes = 50 * 1024
-)
 
 func (r ReadFileTool) Execute(ctx context.Context, args json.RawMessage) (string, error) {
 	var argsObj readFileToolArgs
