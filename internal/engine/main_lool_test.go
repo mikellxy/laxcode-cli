@@ -30,13 +30,13 @@ func TestMianLoop_GenerateWithTool(t *testing.T) {
 	for _, test := range testSet {
 		for _, e := range test.engines {
 			t.Run(test.name, func(t *testing.T) {
-				// 初始化system prompt并追加用户问题，模拟 Loop 中的多轮输入
-				e.contextHis = append(e.contextHis,
-					schema.Message{Role: schema.RoleSystem, Content: BuildSysPrompt(e.WorkingDir, laxctx.LoadSkills(e.WorkingDir))},
-					schema.Message{Role: schema.RoleUser, Content: "main_loop.go文件中实现了什么功能"},
-				)
+				// 模拟 Loop 的会话历史：system prompt 由 Run 内 View 组装注入（不落盘），
+				// 这里只经 Append 注入用户问题
+				sess := newSession(t.TempDir(), "test-session")
+				sess.Append(schema.Message{Role: schema.RoleUser, Content: "main_loop.go文件中实现了什么功能"})
 
-				if err := e.Run(context.Background()); err != nil {
+				sysPrompt := BuildSysPrompt(e.WorkingDir, laxctx.LoadSkills(e.WorkingDir))
+				if err := e.Run(context.Background(), sess, sysPrompt); err != nil {
 					t.Fatal(err)
 				}
 				t.Logf("[%v] generate done", e.Provider.Info())

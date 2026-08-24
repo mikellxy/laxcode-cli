@@ -22,7 +22,6 @@ type AgentEngine struct {
 	ToolRegistry tools.Registry
 	Provider     provider.Provider
 	WorkingDir   string
-	contextHis   []schema.Message
 }
 
 func NewAgentEngine(toolRegistry tools.Registry, provider provider.Provider, workDir string) *AgentEngine {
@@ -33,13 +32,16 @@ func NewAgentEngine(toolRegistry tools.Registry, provider provider.Provider, wor
 	}
 }
 
-func (f *AgentEngine) Loop(ctx context.Context) error {
+func (f *AgentEngine) Loop(ctx context.Context, sessionID string) error {
+	sess := getSession(sessionID)
+	if sess == nil {
+		return fmt.Errorf("session %q not found in session db (InitSessionDB not called?)", sessionID)
+	}
+
 	// 初始化system prompt，只做一次！后续多轮用户输入不再重复加system；
-	// 技能索引随启动时加载一次并注入，会话内不刷新
-	f.contextHis = append(f.contextHis, schema.Message{
-		Role:    schema.RoleSystem,
-		Content: BuildSysPrompt(f.WorkingDir, laxctx.LoadSkills(f.WorkingDir)),
-	})
+	// 技能索引随启动时加载一次并注入，会话内不刷新。system prompt 不落盘，
+	// 每次启动重建，续聊时模板/技能变更即时生效
+	sysPrompt := BuildSysPrompt(f.WorkingDir, laxctx.LoadSkills(f.WorkingDir))
 
 	scanner := bufio.NewScanner(os.Stdin)
 	fmt.Println(">>> Agent ready, input your question, input exit to quit")
@@ -61,12 +63,12 @@ func (f *AgentEngine) Loop(ctx context.Context) error {
 		}
 
 		// user prompy
-		f.contextHis = append(f.contextHis, schema.Message{
+		sess.Append(schema.Message{
 			Role:    schema.RoleUser,
 			Content: userInput,
 		})
 
-		err := f.Run(ctx)
+		err := f.Run(ctx, sess, sysPrompt)
 		if err != nil {
 			// warn too many turns
 			if errors.Is(err, errTooManyTurns) {
@@ -78,13 +80,7 @@ func (f *AgentEngine) Loop(ctx context.Context) error {
 	}
 }
 
-func (f *AgentEngine) Run(ctx context.Context) error {
-	contextHis := f.contextHis
-	// contextHis 只复制了 slice 头，与 f.contextHis 共享底层数组；
-	// 本轮累积的 assistant 回复与工具结果必须写回 f.contextHis，
-	// 否则下一轮模型看不到历史回复，会把旧问题重新回答一遍
-	defer func() { f.contextHis = contextHis }()
-
+func (f *AgentEngine) Run(ctx context.Context, sess *Session, sysPrompt string) error {
 	turnCnt := 0
 
 	for {
@@ -92,7 +88,9 @@ func (f *AgentEngine) Run(ctx context.Context) error {
 		if turnCnt > 50 {
 			return errTooManyTurns
 		}
-		msgs, err := f.Provider.Generate(ctx, contextHis, f.ToolRegistry.GetAvailableTools())
+		// 历史唯一真相源是 session：Generate 前每轮重拼视图（system + 已有
+		// 历史 + 本轮新消息），产生的消息一律经 Append 写回，无 slice 别名回写
+		msgs, err := f.Provider.Generate(ctx, sess.View(sysPrompt), f.ToolRegistry.GetAvailableTools())
 		if err != nil {
 			return fmt.Errorf("generating message: %w", err)
 		}
@@ -105,11 +103,11 @@ func (f *AgentEngine) Run(ctx context.Context) error {
 
 			toolCallCnt += len(msg.ToolCalls)
 
-			contextHis = append(contextHis, msg)
+			sess.Append(msg)
 
 			for _, toolCall := range msg.ToolCalls {
 				toolResult := f.ToolRegistry.Execute(ctx, &toolCall)
-				contextHis = append(contextHis, schema.Message{
+				sess.Append(schema.Message{
 					Role:       schema.RoleUser,
 					Content:    toolResult.Output,
 					ToolCallID: toolResult.ToolCallID,
