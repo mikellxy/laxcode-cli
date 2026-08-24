@@ -13,6 +13,7 @@ import (
 
 	"github.com/mikellxy/laxcode/internal/env"
 	"github.com/mikellxy/laxcode/internal/schema"
+	"github.com/mikellxy/laxcode/internal/utils"
 )
 
 type ReadFileTool struct {
@@ -38,7 +39,7 @@ func (r ReadFileTool) Name() string {
 func (r ReadFileTool) Definition() schema.ToolDefinition {
 	return schema.ToolDefinition{
 		Name:        "read_file",
-		Description: "读取文件内容。 **严格限制**只读取你的工作目录下的文件，提供文件在工作目录的相对路径",
+		Description: "读取文件内容。 **严格限制**只读取你的工作目录下的文件，提供文件在工作目录的相对路径。单次最多返回 2000 行且内容不超过 50KB，输出末尾以 (...) 标注是否读完、最后一行行号及续读参数，未读完时按标注的 start_line_no/start_bytes 续读",
 		Parameters: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -46,31 +47,92 @@ func (r ReadFileTool) Definition() schema.ToolDefinition {
 					"type":        "string",
 					"description": "要读的文件的相对路径，如 cmd/main/main.go",
 				},
+				"start_line_no": map[string]any{
+					"type":        "integer",
+					"description": "起始行/从哪一行开始读，从头开始读时start_line_no=1",
+				},
+				"start_bytes": map[string]any{
+					"type":        "integer",
+					"description": "从起始行的第几个字节开始，从起始字节开始读时start_bytes=1",
+				},
 			},
 			"required": []string{"path"},
 		},
 	}
 }
 
+type readFileToolArgs struct {
+	Path        string `json:"path"`
+	StartLineNo int    `json:"start_line_no"`
+	StartBytes  int    `json:"start_bytes"`
+}
+
+const (
+	readFileToolMaxReadLines = 2000
+	readFileToolMaxReadBytes = 50 * 1024
+)
+
 func (r ReadFileTool) Execute(ctx context.Context, args json.RawMessage) (string, error) {
-	argsMap := make(map[string]string)
-	if err := json.Unmarshal(args, &argsMap); err != nil {
+	var argsObj readFileToolArgs
+	if err := json.Unmarshal(args, &argsObj); err != nil {
 		return "", err
 	}
 
-	path, ok := argsMap["path"]
-	if !ok || strings.TrimSpace(path) == "" {
+	if argsObj.Path == "" || strings.TrimSpace(argsObj.Path) == "" {
 		return "", fmt.Errorf("file path required")
 	}
 
-	target, err := safeJoinWorkDir(path)
+	pathSafe, err := safeJoinWorkDir(argsObj.Path)
 	if err != nil {
 		return "", err
 	}
 
-	b, err := os.ReadFile(target)
+	result := utils.ReadUpToNKB(readFileToolMaxReadBytes, readFileToolMaxReadLines,
+		argsObj.StartLineNo, argsObj.StartBytes, pathSafe)
+	if result.Err != nil {
+		return "", result.Err
+	}
 
-	return string(b), err
+	if len(result.Content) == 0 {
+		return "(" + readFooter(result) + ")\n", nil
+	}
+
+	var sb strings.Builder
+	sb.Write(result.Content)
+	sb.WriteString("\n(")
+	sb.WriteString(readFooter(result))
+	sb.WriteString(")\n")
+	return sb.String(), nil
+}
+
+// readFooter 生成 read_file 输出的尾部状态说明：文件是否读完、读到的
+// 最后一行行号、最后一行是否截断及该行已读字节数，并给出续读参数，
+// 使模型无需额外信息即可自行翻页。
+func readFooter(res *utils.ReadResult) string {
+	if res.EndLineNo == 0 {
+		return "文件为空"
+	}
+
+	var b strings.Builder
+	if res.Finished {
+		b.WriteString("文件已读完")
+	} else {
+		b.WriteString("文件未读完")
+	}
+	fmt.Fprintf(&b, "，最后一行行号: %d", res.EndLineNo)
+
+	switch {
+	case res.LastLineTruncated:
+		fmt.Fprintf(&b, "，该行未读完整(已读 %d 字节)，续读请传 start_line_no=%d, start_bytes=%d",
+			res.LastLineTruncatedBytes, res.EndLineNo, res.LastLineTruncatedBytes+1)
+	case !res.Finished:
+		fmt.Fprintf(&b, "，续读请传 start_line_no=%d, start_bytes=1", res.EndLineNo+1)
+	}
+
+	if res.Finished && len(res.Content) == 0 {
+		b.WriteString("（本次未读取到内容：起始行超出文件范围）")
+	}
+	return b.String()
 }
 
 type BashTool struct{}
