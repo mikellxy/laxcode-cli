@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 
+	"github.com/mikellxy/laxcode/internal/env"
 	"github.com/mikellxy/laxcode/internal/schema"
 	"github.com/openai/openai-go/v3"
 	"github.com/openai/openai-go/v3/option"
@@ -51,6 +52,19 @@ func (p *OpenApiProvider) Generate(ctx context.Context, msgs []schema.Message, t
 			}
 
 		case schema.RoleAssistant:
+			// The reasoning item must precede the message and function_call
+			// items of the same turn: it is the thinking part of that output.
+			if msg.ReasoningContent != "" {
+				inputParams.OfInputItemList = append(inputParams.OfInputItemList, responses.ResponseInputItemUnionParam{
+					OfReasoning: &responses.ResponseReasoningItemParam{
+						ID: msg.ReasoningID,
+						Content: []responses.ResponseReasoningItemContentParam{
+							{Text: msg.ReasoningContent},
+						},
+					},
+				})
+				env.Debugf("reasoning replayed: id=%q len=%d", msg.ReasoningID, len(msg.ReasoningContent))
+			}
 			if len(msg.Content) > 0 {
 				item := responses.ResponseInputItemParamOfMessage(msg.Content, responses.EasyInputMessageRoleAssistant)
 				inputParams.OfInputItemList = append(inputParams.OfInputItemList, item)
@@ -95,6 +109,13 @@ func (p *OpenApiProvider) Generate(ctx context.Context, msgs []schema.Message, t
 	}
 	for _, output := range resp.Output {
 		switch output.Type {
+		case "reasoning":
+			r := output.AsReasoning()
+			msg.ReasoningID = r.ID
+			for _, c := range r.Content {
+				msg.ReasoningContent += c.Text
+			}
+			env.Debugf("reasoning parsed: id=%q len=%d", r.ID, len(msg.ReasoningContent))
 		case "function_call":
 			c := output.AsFunctionCall()
 			msg.ToolCalls = append(msg.ToolCalls, schema.ToolCall{

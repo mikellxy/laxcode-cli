@@ -111,6 +111,9 @@ func (f *AgentEngine) Run(ctx context.Context, sess *Session) error {
 
 		var toolCallCnt int
 		for _, msg := range msgs {
+			if msg.ReasoningContent != "" {
+				fmt.Printf("\033[90m[LaxCode] thinking: %s\033[0m\n", msg.ReasoningContent)
+			}
 			if len(msg.Content) > 0 {
 				fmt.Printf("\033[32m[LaxCode] LLM generates: %s\033[0m\n", msg.Content)
 			}

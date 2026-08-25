@@ -32,6 +32,16 @@ func (s simpleStrategy) Compress(msgs []schema.Message, maxToken int, winConsume
 	}
 
 	minInMemoryIdx := len(msgs) - 1
+
+	// Reasoning only matters since the last human input; older ones are
+	// stale and get dropped to save context tokens.
+	lastUserIdx := -1
+	for i, m := range msgs {
+		if m.Role == schema.RoleUser && m.ToolCallID == "" {
+			lastUserIdx = i
+		}
+	}
+
 	for i, msg := range msgs {
 		inMemory := i >= minInMemoryIdx
 
@@ -39,7 +49,7 @@ func (s simpleStrategy) Compress(msgs []schema.Message, maxToken int, winConsume
 		if msg.Role == schema.RoleUser && msg.ToolCallID != "" {
 			if !inMemory {
 				if len(msg.Content) > 200 {
-					newContent = fmt.Sprint("为节省上下文空间，早起工具输出已被系统清理。原始输出长度为:%d字节", len(msg.Content))
+					newContent = fmt.Sprintf("为节省上下文空间，早起工具输出已被系统清理。原始输出长度为:%d字节", len(msg.Content))
 				}
 				result.InputTokenCompressed += EstimateTokenInt(msg.Content) - EstimateTokenInt(newContent)
 			} else if len(msg.Content) > 1000 {
@@ -59,7 +69,13 @@ func (s simpleStrategy) Compress(msgs []schema.Message, maxToken int, winConsume
 			}
 		}
 
-		msg.Content = newContent
+		// Write back through the slice index: msg is a per-iteration copy.
+		msgs[i].Content = newContent
+
+		if msg.Role == schema.RoleAssistant && i < lastUserIdx && msg.ReasoningContent != "" {
+			result.OutputTokenCompressed += EstimateTokenInt(msg.ReasoningContent)
+			msgs[i].ReasoningContent = ""
+		}
 	}
 
 	return msgs, result

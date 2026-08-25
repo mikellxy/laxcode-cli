@@ -20,10 +20,14 @@ func (t *TokenStatistics) Total() int {
 }
 
 type Message struct {
-	Role       Role       `json:"role"`
-	Content    string     `json:"content"`
-	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`
-	ToolCallID string     `json:"tool_call_id,omitempty"`
+	Role    Role   `json:"role"`
+	Content string `json:"content"`
+	// ReasoningID and ReasoningContent carry the model's chain-of-thought
+	// (assistant messages only), replayed to Responses API on later turns.
+	ReasoningID      string     `json:"reasoning_id,omitempty"`
+	ReasoningContent string     `json:"reasoning_content,omitempty"`
+	ToolCalls        []ToolCall `json:"tool_calls,omitempty"`
+	ToolCallID       string     `json:"tool_call_id,omitempty"`
 	// TokenUsed 记录该消息产生时那次模型调用的 token 用量，raw 计费口径：
 	// TokenInput 为本次请求发送的全部输入（含 system prompt 与当时全部历史），
 	// TokenOutput 为本次响应输出。仅 assistant 消息携带非零值；

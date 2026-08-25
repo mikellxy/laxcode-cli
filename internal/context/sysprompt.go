@@ -5,8 +5,6 @@ import (
 	"fmt"
 	"path/filepath"
 	"strings"
-
-	"github.com/mikellxy/laxcode/internal/env"
 )
 
 var personalityPrompt string = `你是一个通用AI智能体，能够基于自身推理和恰当的工具使用完成用户提交的各类复杂任务，如方案设计、代码开发等。  
@@ -27,10 +25,10 @@ var planModePrompt string
 func BuildSysPrompt(workDir string, skills []Skill, isPlanMode bool, sessID string) string {
 	var sb strings.Builder
 
-	sb.WriteString(fmt.Sprintf(personalityPrompt, env.WorkDir))
+	sb.WriteString(fmt.Sprintf(personalityPrompt, workDir))
 
 	if index := RenderSkillIndex(skills); index != "" {
-		sb.WriteString("\n")
+		sb.WriteString("\n\n")
 		sb.WriteString(index)
 	}
 

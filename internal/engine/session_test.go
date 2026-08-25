@@ -74,19 +74,17 @@ func TestSession_View(t *testing.T) {
 	sess := newSession(t.TempDir(), "view")
 	sess.Append(schema.Message{Role: schema.RoleUser, Content: "hi"})
 
-	view := sess.View("SYS")
-	if len(view) != 2 || view[0].Role != schema.RoleSystem || view[0].Content != "SYS" || view[1].Content != "hi" {
-		t.Fatalf("View 应为 [system]+历史，got %#v", view)
+	// View 就地注入：system prompt 进入会话历史头部，供 Generate 直接使用
+	sess.View("SYS")
+	msgs := sess.Messages
+	if len(msgs) != 2 || msgs[0].Role != schema.RoleSystem || msgs[0].Content != "SYS" || msgs[1].Content != "hi" {
+		t.Fatalf("View 应为 [system]+历史，got %#v", msgs)
 	}
 
-	// View 是只读组装：不影响内部状态，后续追加正常反映在新视图里
+	// 注入后追加的消息正常出现在历史尾部
 	sess.Append(schema.Message{Role: schema.RoleAssistant, Content: "hello"})
-	view2 := sess.View("SYS")
-	if len(view2) != 3 || view2[2].Content != "hello" {
-		t.Fatalf("View 后追加应反映在后续视图中，got %#v", view2)
-	}
-	if len(view) != 2 {
-		t.Fatalf("先前返回的视图不应被后续追加影响，got %#v", view)
+	if len(sess.Messages) != 3 || sess.Messages[2].Content != "hello" {
+		t.Fatalf("View 后追加应正常进入历史，got %#v", sess.Messages)
 	}
 }
 

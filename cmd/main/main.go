@@ -15,6 +15,7 @@ import (
 
 func main() {
 	env.WorkDir, _ = os.Getwd()
+	env.LoadConfig(env.WorkDir)
 
 	// make session dir
 	if err := os.MkdirAll(".laxcode/.session", 0755); err != nil {
@@ -42,7 +43,7 @@ func main() {
 		env.WorkDir,
 	)
 
-	fmt.Printf("starting LaxCode... work_dir: %s, session: %s, plan_mode: %v\n", env.WorkDir, id, env.IsPlanMode)
+	fmt.Printf("starting LaxCode... work_dir: %s, session: %s, plan_mode: %v, debug: %v\n", env.WorkDir, id, env.IsPlanMode, env.Debug)
 
 	err := agentAgent.TerminalLoop(context.Background(), id)
 	if err != nil {
