@@ -28,8 +28,8 @@ func TestSession_AppendLoadRoundTrip(t *testing.T) {
 	sess.Append(schema.Message{Role: schema.RoleUser, Content: "file content...", ToolCallID: "call_1"})
 
 	loaded := loadSession(workDir, "round-trip")
-	if !reflect.DeepEqual(sess.messages, loaded.messages) {
-		t.Fatalf("round-trip 后历史不一致:\n got: %#v\nwant: %#v", loaded.messages, sess.messages)
+	if !reflect.DeepEqual(sess.Messages, loaded.Messages) {
+		t.Fatalf("round-trip 后历史不一致:\n got: %#v\nwant: %#v", loaded.Messages, sess.Messages)
 	}
 }
 
@@ -54,8 +54,8 @@ func TestSession_LoadSkipsBadAndBlankLines(t *testing.T) {
 		{Role: schema.RoleUser, Content: "第一问"},
 		{Role: schema.RoleAssistant, Content: "第一答"},
 	}
-	if !reflect.DeepEqual(loaded.messages, want) {
-		t.Fatalf("坏行/空行未被正确跳过:\n got: %#v\nwant: %#v", loaded.messages, want)
+	if !reflect.DeepEqual(loaded.Messages, want) {
+		t.Fatalf("坏行/空行未被正确跳过:\n got: %#v\nwant: %#v", loaded.Messages, want)
 	}
 }
 
@@ -64,8 +64,8 @@ func TestSession_LoadMissingFileIsEmpty(t *testing.T) {
 	workDir := t.TempDir()
 
 	loaded := loadSession(workDir, "never-exists")
-	if len(loaded.messages) != 0 {
-		t.Fatalf("文件不存在的 session 应为空历史，got %d 条", len(loaded.messages))
+	if len(loaded.Messages) != 0 {
+		t.Fatalf("文件不存在的 session 应为空历史，got %d 条", len(loaded.Messages))
 	}
 }
 
@@ -238,7 +238,7 @@ func TestSession_LoadIgnoresBrokenMeta(t *testing.T) {
 	if loaded.TokenUsed != (schema.TokenStatistics{TokenInput: 42, TokenOutput: 7}) {
 		t.Fatalf("meta.json 损坏时应以历史重放为准: %+v", loaded.TokenUsed)
 	}
-	if len(loaded.messages) != 1 {
-		t.Fatalf("坏 meta.json 不应阻断历史加载，got %d 条", len(loaded.messages))
+	if len(loaded.Messages) != 1 {
+		t.Fatalf("坏 meta.json 不应阻断历史加载，got %d 条", len(loaded.Messages))
 	}
 }

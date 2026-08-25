@@ -26,7 +26,7 @@ const metaFile = "meta.json"
 // 避免内存与磁盘失同步（View 是只读组装，不改变内部状态）。
 type Session struct {
 	id          string
-	messages    []schema.Message
+	Messages    []schema.Message
 	historyPath string
 	metaPath    string
 	// TokenUsed 是会话累计 token 消耗，恒等于全部消息 TokenUsed 的加和
@@ -48,7 +48,7 @@ type Session struct {
 // 缺失/损坏/滞后均不影响正确性。顶层对象 + version 保留扩展性，
 // 未来可挂 created_at、model 等不可推导的会话元数据。
 type SessionMeta struct {
-	Version     int                  `json:"version"`
+	Version     int                    `json:"version"`
 	TokenUsed   schema.TokenStatistics `json:"token_used"`
 	WindowToken schema.TokenStatistics `json:"window_token"`
 }
@@ -91,7 +91,7 @@ func loadSession(workDir, sessionID string) *Session {
 			warnHistoryBadLine(s.historyPath, lineNo, err)
 			continue
 		}
-		s.messages = append(s.messages, msg)
+		s.Messages = append(s.Messages, msg)
 		// 单遍重放恢复 token 统计：全量求和恢复累计消耗，
 		// 记住最后一条非零用量消息恢复窗口占用。meta.json 不参与
 		// 恢复--重放是权威，快照缺失/损坏/滞后一律以重放为准。
@@ -113,7 +113,7 @@ func loadSession(workDir, sessionID string) *Session {
 // token 统计在此单点维护：TokenUsed 累加保证加和不变式；
 // 携带非零用量的消息（assistant）刷新 WindowToken 并重写 meta.json 快照。
 func (s *Session) Append(msg schema.Message) {
-	s.messages = append(s.messages, msg)
+	s.Messages = append(s.Messages, msg)
 	s.TokenUsed.TokenInput += msg.TokenUsed.TokenInput
 	s.TokenUsed.TokenOutput += msg.TokenUsed.TokenOutput
 
@@ -189,10 +189,10 @@ func (s *Session) appendLine(line []byte) error {
 // View 组装发送给大模型的历史视图：头部为本次启动重建的 system prompt，
 // 其后为 session 当前历史。每次返回新拼切片且不修改内部状态——
 // 视图是廉价重拼，历史真相始终只有一份。
-func (s *Session) View(sysPrompt string) []schema.Message {
-	view := make([]schema.Message, 0, len(s.messages)+1)
+func (s *Session) View(sysPrompt string) {
+	view := make([]schema.Message, 0, len(s.Messages)+1)
 	view = append(view, schema.Message{Role: schema.RoleSystem, Content: sysPrompt})
-	return append(view, s.messages...)
+	s.Messages = append(view, s.Messages...)
 }
 
 // SessionDB 管理 session id 到 session 对象的映射。v1 以包级全局单例存在：

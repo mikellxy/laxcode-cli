@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	laxctx "github.com/mikellxy/laxcode/internal/context"
+	"github.com/mikellxy/laxcode/internal/env"
 	"github.com/mikellxy/laxcode/internal/provider"
 	"github.com/mikellxy/laxcode/internal/schema"
 	"github.com/mikellxy/laxcode/internal/tools"
@@ -32,7 +33,7 @@ func NewAgentEngine(toolRegistry tools.Registry, provider provider.Provider, wor
 	}
 }
 
-func (f *AgentEngine) Loop(ctx context.Context, sessionID string) error {
+func (f *AgentEngine) TerminalLoop(ctx context.Context, sessionID string) error {
 	sess := getSession(sessionID)
 	if sess == nil {
 		return fmt.Errorf("session %q not found in session db (InitSessionDB not called?)", sessionID)
@@ -42,6 +43,9 @@ func (f *AgentEngine) Loop(ctx context.Context, sessionID string) error {
 	// 技能索引随启动时加载一次并注入，会话内不刷新。system prompt 不落盘，
 	// 每次启动重建，续聊时模板/技能变更即时生效
 	sysPrompt := BuildSysPrompt(f.WorkingDir, laxctx.LoadSkills(f.WorkingDir))
+	if len(sess.Messages) == 0 || sess.Messages[0].Role != schema.RoleSystem {
+		sess.View(sysPrompt)
+	}
 
 	scanner := bufio.NewScanner(os.Stdin)
 	fmt.Println(">>> Agent ready, input your question, input exit to quit")
@@ -68,7 +72,7 @@ func (f *AgentEngine) Loop(ctx context.Context, sessionID string) error {
 			Content: userInput,
 		})
 
-		err := f.Run(ctx, sess, sysPrompt)
+		err := f.Run(ctx, sess)
 		if err != nil {
 			// warn too many turns
 			if errors.Is(err, errTooManyTurns) {
@@ -80,7 +84,7 @@ func (f *AgentEngine) Loop(ctx context.Context, sessionID string) error {
 	}
 }
 
-func (f *AgentEngine) Run(ctx context.Context, sess *Session, sysPrompt string) error {
+func (f *AgentEngine) Run(ctx context.Context, sess *Session) error {
 	turnCnt := 0
 
 	for {
@@ -88,9 +92,19 @@ func (f *AgentEngine) Run(ctx context.Context, sess *Session, sysPrompt string) 
 		if turnCnt > 50 {
 			return errTooManyTurns
 		}
+
+		// compress
+		msgs, compressRes := laxctx.SimpleCompactor.Compress(sess.Messages, env.MaxWinToken, sess.TokenUsed)
+		sess.Messages = msgs
+		if compressRes != nil && compressRes.Total() > 0 {
+			sess.WindowToken.TokenInput -= compressRes.InputTokenCompressed
+			sess.WindowToken.TokenOutput -= compressRes.OutputTokenCompressed
+			fmt.Printf("\033[33m[context compressed result] %d bytes input token, %d bytes output token\033[0m\n", compressRes.InputTokenCompressed, compressRes.OutputTokenCompressed)
+		}
+
 		// 历史唯一真相源是 session：Generate 前每轮重拼视图（system + 已有
 		// 历史 + 本轮新消息），产生的消息一律经 Append 写回，无 slice 别名回写
-		msgs, err := f.Provider.Generate(ctx, sess.View(sysPrompt), f.ToolRegistry.GetAvailableTools())
+		msgs, err := f.Provider.Generate(ctx, sess.Messages, f.ToolRegistry.GetAvailableTools())
 		if err != nil {
 			return fmt.Errorf("generating message: %w", err)
 		}

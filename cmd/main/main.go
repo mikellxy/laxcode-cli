@@ -35,7 +35,7 @@ func main() {
 
 	fmt.Printf("starting LaxCode... work_dir: %s, session: %s\n", env.WorkDir, id)
 
-	err := agentAgent.Loop(context.Background(), id)
+	err := agentAgent.TerminalLoop(context.Background(), id)
 	if err != nil {
 		panic(err)
 	}
