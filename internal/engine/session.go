@@ -17,6 +17,10 @@ import (
 // 每次启动重建，续聊时模板/技能变更即时生效。
 const historyFile = "history.jsonl"
 
+// metaFile 是 session token 统计的快照文件名，与 history.jsonl 同目录。
+// 重写式更新（tmp + rename），真值以 history.jsonl 重放为准。
+const metaFile = "meta.json"
+
 // Session 是对话历史的唯一真相源：内存消息列表与 history.jsonl 同步维护，
 // 每 Append 一条即落盘一行。messages 非导出，强制所有追加走 Append，
 // 避免内存与磁盘失同步（View 是只读组装，不改变内部状态）。
@@ -24,6 +28,29 @@ type Session struct {
 	id          string
 	messages    []schema.Message
 	historyPath string
+	metaPath    string
+	// TokenUsed 是会话累计 token 消耗，恒等于全部消息 TokenUsed 的加和
+	// （仅 assistant 消息携带非零值）。raw 计费口径：每次调用的完整 input
+	// （含 system prompt 与当时全部历史）都会重复计入，语义为真实账单累计。
+	// 只经 Append 累加，不存在绕过消息历史的更新路径，因此可从
+	// history.jsonl 单遍重放推导。
+	TokenUsed schema.TokenStatistics
+	// WindowToken 是上下文窗口占用快照，原样拷贝自最后一条携带非零用量的
+	// assistant 消息的 TokenUsed：TokenInput+TokenOutput 之和近似
+	// "system prompt + 全部历史"的当前窗口占用。其后追加 user/tool 消息到
+	// 下次调用之间，真实占用大于此值（新消息 token 数本地不可知），
+	// 属该口径固有滞后。旧会话恢复后为零值（未知态），下次调用刷新。
+	WindowToken schema.TokenStatistics
+}
+
+// SessionMeta 是 meta.json 的文件格式：token 统计的人类可读快照，
+// 供用户直接查看。统计真值始终从 history.jsonl 重放推导，本文件
+// 缺失/损坏/滞后均不影响正确性。顶层对象 + version 保留扩展性，
+// 未来可挂 created_at、model 等不可推导的会话元数据。
+type SessionMeta struct {
+	Version     int                  `json:"version"`
+	TokenUsed   schema.TokenStatistics `json:"token_used"`
+	WindowToken schema.TokenStatistics `json:"window_token"`
 }
 
 // newSession 以 sessionID 新建空 session；不创建任何目录或文件，
@@ -32,6 +59,7 @@ func newSession(workDir, sessionID string) *Session {
 	return &Session{
 		id:          sessionID,
 		historyPath: filepath.Join(workDir, ".laxcode", ".session", sessionID, historyFile),
+		metaPath:    filepath.Join(workDir, ".laxcode", ".session", sessionID, metaFile),
 	}
 }
 
@@ -64,6 +92,14 @@ func loadSession(workDir, sessionID string) *Session {
 			continue
 		}
 		s.messages = append(s.messages, msg)
+		// 单遍重放恢复 token 统计：全量求和恢复累计消耗，
+		// 记住最后一条非零用量消息恢复窗口占用。meta.json 不参与
+		// 恢复--重放是权威，快照缺失/损坏/滞后一律以重放为准。
+		s.TokenUsed.TokenInput += msg.TokenUsed.TokenInput
+		s.TokenUsed.TokenOutput += msg.TokenUsed.TokenOutput
+		if msg.TokenUsed != (schema.TokenStatistics{}) {
+			s.WindowToken = msg.TokenUsed
+		}
 	}
 	if err := scanner.Err(); err != nil {
 		warnHistoryRead(s.historyPath, err)
@@ -74,9 +110,15 @@ func loadSession(workDir, sessionID string) *Session {
 // Append 把一条消息追加进内存历史并以 O_APPEND 向 history.jsonl 追加一行 JSON，
 // 首次写入前按需创建会话目录。写盘失败输出显眼警告但不中断会话：
 // 内存历史仍然保留（仅磁盘缺一行），后续消息继续尝试落盘。
+// token 统计在此单点维护：TokenUsed 累加保证加和不变式；
+// 携带非零用量的消息（assistant）刷新 WindowToken 并重写 meta.json 快照。
 func (s *Session) Append(msg schema.Message) {
 	s.messages = append(s.messages, msg)
+	s.TokenUsed.TokenInput += msg.TokenUsed.TokenInput
+	s.TokenUsed.TokenOutput += msg.TokenUsed.TokenOutput
 
+	// 先写 history 行、后重写 meta：崩溃落在中间时 history 多一行而
+	// meta 滞后一条，下次加载重放自愈；反向超前不会发生。
 	line, err := json.Marshal(msg)
 	if err != nil {
 		// schema.Message 只含可序列化字段，marshal 失败仅剩理论可能
@@ -85,6 +127,49 @@ func (s *Session) Append(msg schema.Message) {
 	}
 	if err := s.appendLine(line); err != nil {
 		warnHistoryWrite(s.historyPath, err)
+	}
+
+	if msg.TokenUsed != (schema.TokenStatistics{}) {
+		s.WindowToken = msg.TokenUsed
+		s.writeMeta()
+	}
+}
+
+// writeMeta 以 tmp + rename 原子重写 meta.json 快照。失败仅警告不中断会话：
+// 快照本就是重放可推导的冗余数据，坏一个快照不影响正确性。
+func (s *Session) writeMeta() {
+	meta := SessionMeta{
+		Version:     1,
+		TokenUsed:   s.TokenUsed,
+		WindowToken: s.WindowToken,
+	}
+	data, err := json.MarshalIndent(meta, "", "  ")
+	if err != nil {
+		warnMetaWrite(s.metaPath, err)
+		return
+	}
+
+	dir := filepath.Dir(s.metaPath)
+	tmp, err := os.CreateTemp(dir, "meta.*.tmp")
+	if err != nil {
+		warnMetaWrite(s.metaPath, err)
+		return
+	}
+	tmpName := tmp.Name()
+	if _, err := tmp.Write(append(data, '\n')); err != nil {
+		tmp.Close()
+		os.Remove(tmpName)
+		warnMetaWrite(s.metaPath, err)
+		return
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmpName)
+		warnMetaWrite(s.metaPath, err)
+		return
+	}
+	if err := os.Rename(tmpName, s.metaPath); err != nil {
+		os.Remove(tmpName)
+		warnMetaWrite(s.metaPath, err)
 	}
 }
 
@@ -155,4 +240,10 @@ func warnHistoryRead(path string, err error) {
 func warnHistoryWrite(path string, err error) {
 	fmt.Printf("\033[31m[LaxCode][WARN] 会话历史写入 %s 失败，本条对话可能未被保存: %v\033[0m\n",
 		path, err)
+}
+
+// warnMetaWrite 输出 meta.json 写入失败警告：快照损坏不影响统计正确性
+// （真值由 history.jsonl 重放推导），故比历史写失败的警告轻（黄色）。
+func warnMetaWrite(path string, err error) {
+	fmt.Printf("\033[33m[LaxCode] 会话统计快照写入 %s 失败: %v\033[0m\n", path, err)
 }
