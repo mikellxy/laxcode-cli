@@ -1,6 +1,6 @@
 ## Context
 
-见 proposal.md（Why / What Changes）。现状约束：`internal/context` 为空包；system prompt 由 `internal/engine/sysprompt.go` 的 `BuildSysPrompt(workDir)` 静态生成，`Loop()` 开头一次性注入；`go.yaml.in/yaml/v4` 已作为 indirect 依赖存在于 go.sum（anthropic SDK 传递引入）；skill 正文读取可完全复用现有 `read_file` 工具（`.laxcode` 在工作目录内，`safeJoinWorkDir` 天然放行）。
+见 proposal.md（Why / What Changes）。现状约束：`internal/context` 为空包；system prompt 由 `../../../../internal/context/sysprompt.go` 的 `BuildSysPrompt(workDir)` 静态生成，`Loop()` 开头一次性注入；`go.yaml.in/yaml/v4` 已作为 indirect 依赖存在于 go.sum（anthropic SDK 传递引入）；skill 正文读取可完全复用现有 `read_file` 工具（`.laxcode` 在工作目录内，`safeJoinWorkDir` 天然放行）。
 
 ## Goals / Non-Goals
 

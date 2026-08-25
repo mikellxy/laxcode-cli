@@ -1,0 +1,44 @@
+package context
+
+import (
+	_ "embed"
+	"fmt"
+	"path/filepath"
+	"strings"
+
+	"github.com/mikellxy/laxcode/internal/env"
+)
+
+var personalityPrompt string = `你是一个通用AI智能体，能够基于自身推理和恰当的工具使用完成用户提交的各类复杂任务，如方案设计、代码开发等。  
+【沙箱强制约束】  
+所有文件读取、新建、修改操作，只能在工作目录：%s 内部执行。  
+禁止读写该目录以外任何路径的文件；禁止访问系统敏感文件。  
+
+【工具使用铁则，必须严格遵守】  
+1. 列出文件夹、浏览目录结构、搜索文件，**只能使用 bash 工具执行 ls, find, grep 等命令**。永远不要把文件夹路径传给 read_file；read_file仅用于读取单个具体文件内容。
+
+【输出规则】  
+思考内容仅用于内部决策；最终结论清晰、给出改动总结。  
+不需要主动编造不存在的文件、目录、代码内容。`
+
+//go:embed prompt_tmpl/plan_mode.md
+var planModePrompt string
+
+func BuildSysPrompt(workDir string, skills []Skill, isPlanMode bool, sessID string) string {
+	var sb strings.Builder
+
+	sb.WriteString(fmt.Sprintf(personalityPrompt, env.WorkDir))
+
+	if index := RenderSkillIndex(skills); index != "" {
+		sb.WriteString("\n")
+		sb.WriteString(index)
+	}
+
+	sessDir := filepath.Join(workDir, ".laxcode", ".session", sessID)
+	if isPlanMode {
+		sb.WriteString("\n")
+		sb.WriteString(fmt.Sprintf(planModePrompt, sessDir))
+	}
+
+	return sb.String()
+}

@@ -14,7 +14,7 @@
 ## 3. 索引渲染与 engine 接线
 
 - [x] 3.1 实现 `RenderSkillIndex`：按 design D7 模板渲染（标题 + 路径规则/"技能不是工具"前言 + `- <name>: <description>` 条目）；description 渲染前将连续空白（含换行）折叠为单个空格；入参为空切片时返回空字符串（零 skill 整段省略）
-- [x] 3.2 修改 `internal/engine/sysprompt.go`：`BuildSysPrompt` 签名改为接收 `[]Skill`（import alias `laxctx`），在静态模板后追加索引段
+- [x] 3.2 修改 `../../../../internal/context/sysprompt.go`：`BuildSysPrompt` 签名改为接收 `[]Skill`（import alias `laxctx`），在静态模板后追加索引段
 - [x] 3.3 修改 `internal/engine/main_loop.go`：`Loop()` 开头调用 `laxctx.LoadSkills(f.WorkingDir)` 并传给 `BuildSysPrompt`；同步适配 `main_lool_test.go` 中的既有调用点
 
 ## 4. 样板与测试验证

@@ -4,9 +4,8 @@
 bin
 
 # LaxCode: 会话目录不入库
-.laxcode/.session/
+.laxcode
 
 # LaxCode: skills 只提交 example 目录
-.laxcode/skills/*
 !.laxcode/skills/example/
 

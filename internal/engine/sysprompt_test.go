@@ -11,7 +11,7 @@ func TestBuildSysPrompt(t *testing.T) {
 	t.Parallel()
 
 	t.Run("零技能时不含技能索引段", func(t *testing.T) {
-		got := BuildSysPrompt("/w", nil)
+		got := laxctx.BuildSysPrompt("/w", nil)
 		if !strings.Contains(got, "工作目录: /w") {
 			t.Errorf("应包含静态基础模板段: %q", got)
 		}
@@ -21,7 +21,7 @@ func TestBuildSysPrompt(t *testing.T) {
 	})
 
 	t.Run("有技能时在静态模板后追加索引段", func(t *testing.T) {
-		got := BuildSysPrompt("/w", []laxctx.Skill{{Name: "example", Description: "示例技能"}})
+		got := laxctx.BuildSysPrompt("/w", []laxctx.Skill{{Name: "example", Description: "示例技能"}})
 		if !strings.Contains(got, "工作目录: /w") {
 			t.Errorf("应包含静态基础模板段: %q", got)
 		}
