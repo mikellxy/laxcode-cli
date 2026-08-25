@@ -42,7 +42,7 @@ func (f *AgentEngine) TerminalLoop(ctx context.Context, sessionID string) error 
 	// 初始化system prompt，只做一次！后续多轮用户输入不再重复加system；
 	// 技能索引随启动时加载一次并注入，会话内不刷新。system prompt 不落盘，
 	// 每次启动重建，续聊时模板/技能变更即时生效
-	sysPrompt := BuildSysPrompt(f.WorkingDir, laxctx.LoadSkills(f.WorkingDir))
+	sysPrompt := BuildSysPrompt(f.WorkingDir, laxctx.LoadSkills(f.WorkingDir), env.IsPlanMode, sessionID)
 	if len(sess.Messages) == 0 || sess.Messages[0].Role != schema.RoleSystem {
 		sess.View(sysPrompt)
 	}
@@ -99,7 +99,7 @@ func (f *AgentEngine) Run(ctx context.Context, sess *Session) error {
 		if compressRes != nil && compressRes.Total() > 0 {
 			sess.WindowToken.TokenInput -= compressRes.InputTokenCompressed
 			sess.WindowToken.TokenOutput -= compressRes.OutputTokenCompressed
-			fmt.Printf("\033[33m[context compressed result] %d bytes input token, %d bytes output token\033[0m\n", compressRes.InputTokenCompressed, compressRes.OutputTokenCompressed)
+			fmt.Printf("\033[33m[context compressed result] %d input tokens, %d output tokens\033[0m\n", compressRes.InputTokenCompressed, compressRes.OutputTokenCompressed)
 		}
 
 		// 历史唯一真相源是 session：Generate 前每轮重拼视图（system + 已有

@@ -1,6 +1,7 @@
 .qoder/
 .idea
 .DS_Store
+bin
 
 # LaxCode: 会话目录不入库
 .laxcode/.session/
