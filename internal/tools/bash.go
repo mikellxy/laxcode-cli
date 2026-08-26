@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"time"
 
 	laxctx "github.com/mikellxy/laxcode/internal/context"
 	"github.com/mikellxy/laxcode/internal/env"
@@ -73,24 +74,42 @@ func (b BashTool) Execute(ctx context.Context, args json.RawMessage) (string, er
 		return "", laxctx.NewErrorWithPrompt(&laxctx.ParamError{}, errors.New("command required"))
 	}
 
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
 	cmd := exec.CommandContext(ctx, "bash", "-c", command)
 	cmd.Dir = env.WorkDir
 	output, err := cmd.CombinedOutput()
 	result := &ExecResult{Desc: "命令执行成功", Stdout: string(output)}
+
+	if ctx.Err() != nil {
+		return "", laxctx.NewErrorWithPrompt(&laxctx.BashExecuteError{},
+			fmt.Errorf("bash执行超时或被取消: %w", ctx.Err()))
+	}
+
 	if err != nil {
 		result.Desc = "命令执行失败: " + err.Error()
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) {
 			result.ExitCode = exitErr.ExitCode()
+		} else {
+			return "", laxctx.NewErrorWithPrompt(&laxctx.BashExecuteError{}, err)
 		}
 	}
 
-	const maxLen = 8000
-	if len(result.Stdout) > maxLen {
-		result.Desc = "命令执行成功. bash输出过长以截断至前:" + strconv.Itoa(maxLen) + "字节"
-		result.Truncated = true
-		result.Stdout = result.Stdout[:maxLen]
+	const maxRune = 8000
+	result.Stdout, result.Truncated = safeTruncateUTF8(result.Stdout, maxRune)
+	if result.Truncated {
+		result.Desc += " ;bash输出过长已截断至前:" + strconv.Itoa(maxRune) + "字符"
 	}
 
 	return result.String(), nil
+}
+
+func safeTruncateUTF8(s string, maxRune int) (out string, truncated bool) {
+	r := []rune(s)
+	if len(r) <= maxRune {
+		return s, false
+	}
+	return string(r[:maxRune]), true
 }

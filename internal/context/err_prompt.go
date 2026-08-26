@@ -4,7 +4,7 @@ import "fmt"
 
 const (
 	errTypeTool = "tool"
-	errType     = "os"
+	errTypeOs   = "os"
 )
 
 type ErrorWithPrompt interface {
@@ -123,8 +123,30 @@ func (f *FileIOError) AsPrompt() (string, bool) {
 	if f.Err == nil {
 		return "", false
 	}
-	return buildErrPrompt(errType,
+	return buildErrPrompt(errTypeOs,
 		f.Err.Error(),
 		"文件读写失败，可能是权限、磁盘或文件被占用等系统问题，请检查文件权限与状态，不要盲目重试相同操作",
+	), true
+}
+
+type BashExecuteError struct {
+	errWithPromptBase
+}
+
+// AsPrompt 生成给到LLM的纠错提示
+func (f *BashExecuteError) AsPrompt() (string, bool) {
+	if f.Err == nil {
+		return "", false
+	}
+
+	return buildErrPrompt(
+		errTypeTool,
+		f.Err.Error(),
+		`Bash进程执行发生系统故障。
+排查方向：
+1.命令执行超时，可拆分任务或者延长超时时间；
+2.工作目录不存在、权限不足；
+3.命令语法错误、可执行文件找不到；
+不要反复原样重试，先检查命令与工作环境。`,
 	), true
 }
