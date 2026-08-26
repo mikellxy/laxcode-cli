@@ -136,8 +136,9 @@ func (f *AgentEngine) Run(ctx context.Context, sess *Session) error {
 							sb.WriteString(prompt)
 						}
 					}
+					// 工具报错时若仍有输出（如 shell 的 stderr/stdout），一并附上供模型定位问题
 					if len(toolResult.Output) > 0 {
-						sb.WriteString("工具的其他输出内容:\n")
+						sb.WriteString("\n以下为工具执行时的原始输出，供定位错误参考:\n")
 						sb.WriteString(toolResult.Output)
 					}
 					content = sb.String()
