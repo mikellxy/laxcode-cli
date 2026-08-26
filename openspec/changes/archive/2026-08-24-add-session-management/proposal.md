@@ -8,7 +8,7 @@ AgentEngine 的对话历史目前只存在于内存字段 `contextHis` 中，进
   - `Session` 结构体：持有 `[]schema.Message` 对话历史，提供 `Append`（内存追加 + 追加一行 JSON 落盘）与 `View`（组装 `[system] + Messages` 新切片供 provider 消费）
   - `SessionDB` 结构体：session id 到 session 对象的映射，以包级全局变量形式存在（非导出 + Init 函数收口）
   - load 流程：读取指定 session 的 `history.jsonl`，逐行 JSON 反序列化为历史消息；坏行/空行跳过并警告，不阻断启动
-- 改造 `internal/engine/main_loop.go`：
+- 改造 `../../../../internal/engine/engine.go`：
   - 移除 `AgentEngine.contextHis` 字段及其 defer 回写逻辑，历史唯一真相源变为 Session
   - `Loop` 签名改为接收 `session_id`，从全局 SessionDB 查询 session；system prompt 仍在启动时构建（不落盘、每次重建）
   - `Run` 接收 session 对象，本轮产生的用户输入、assistant 回复、工具结果均通过 `Session.Append` 记录到 history.jsonl
@@ -29,8 +29,8 @@ AgentEngine 的对话历史目前只存在于内存字段 `contextHis` 中，进
 ## Impact
 
 - `internal/engine/session.go`：新增（Session / SessionDB / 全局 db 初始化与查询入口）
-- `internal/engine/main_loop.go`：改造（移除 contextHis、Loop/Run 签名变更、defer 回写逻辑删除）
+- `../../../../internal/engine/engine.go`：改造（移除 contextHis、Loop/Run 签名变更、defer 回写逻辑删除）
 - `cmd/main/main.go`：改造（session id 命令行参数、SessionDB 初始化）
-- `internal/engine/main_lool_test.go`：适配（不再直接操作 contextHis，改走 session 构造）
+- `../../../../internal/engine/engine_test.go`：适配（不再直接操作 contextHis，改走 session 构造）
 - 存储约定：新增 `.laxcode/.session/<session_id>/history.jsonl`（目录已存在，为空）
 - 无外部依赖变化；provider / tools / context 包零改动

@@ -93,7 +93,7 @@ func RenderSkillIndex(skills []Skill) string // 纯函数，零 skill 返回 ""
 - description 渲染前把连续空白折叠为单个空格（含换行），保证条目单行
 - 注入点：`engine.Loop()` 中 `BuildSysPrompt` 之前先 `LoadSkills`；`BuildSysPrompt` 签名改为接收索引文本（或 skills 切片）——倾向 `BuildSysPrompt(workDir string, skills []laxctx.Skill)`，让模板拼接职责留在 engine（静态模板归 engine，动态数据归 context）
 - engine 侧 import alias：`laxctx "github.com/mikellxy/laxcode/internal/context"`（与 stdlib `context.Context` 冲突）
-- `main_lool_test.go` 中 `BuildSysPrompt(e.WorkingDir)` 调用点同步适配
+- `engine_test.go` 中 `BuildSysPrompt(e.WorkingDir)` 调用点同步适配
 
 ### D8: 警告输出惯例
 

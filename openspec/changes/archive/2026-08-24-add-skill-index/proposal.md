@@ -25,7 +25,7 @@ LaxCode 目前无法扩展领域技能：system prompt 是静态模板，模型�
 ## Impact
 
 - **新增代码**：`internal/context/`（skill 加载、校验、索引渲染 + table-driven 测试及 `test_resource/` fixtures）
-- **修改代码**：`../../../../internal/context/sysprompt.go`（BuildSysPrompt 拼接索引段）、`internal/engine/main_loop.go`（Loop 中触发加载，预计仅数行）；engine 需为 `internal/context` 包加 import alias（与 stdlib `context` 冲突）
+- **修改代码**：`../../../../internal/context/sysprompt.go`（BuildSysPrompt 拼接索引段）、`../../../../internal/engine/engine.go`（Loop 中触发加载，预计仅数行）；engine 需为 `internal/context` 包加 import alias（与 stdlib `context` 冲突）
 - **依赖**：`go.yaml.in/yaml/v4` 提升为 direct（已在依赖图中，无新增下载）
 - **运行时行为**：启动时若存在非法 SKILL.md 会输出 `[LaxCode]` 前缀警告；`.laxcode/skills` 不存在时静默
 - **不受影响**：provider、tools、Run 工具循环、消息 schema 均不动

@@ -7,7 +7,7 @@
 - `schema.Message` 的 json tag 完整、`ToolCall.Arguments` 为 `json.RawMessage`（round-trip 安全）、Content 换行被 JSON 转义——一行一消息的 jsonl 格式天然成立。
 - 项目容错哲学（见 `context/skill-index` spec）：加载类失败一律警告跳过，绝不阻断启动。
 - `.laxcode/.session/` 目录已存在（空），与 `skills/` 并列。
-- 现有测试 `main_lool_test.go` 直接操作 `e.contextHis`（包内访问），需要同步适配。
+- 现有测试 `engine_test.go` 直接操作 `e.contextHis`（包内访问），需要同步适配。
 
 ## Goals / Non-Goals
 

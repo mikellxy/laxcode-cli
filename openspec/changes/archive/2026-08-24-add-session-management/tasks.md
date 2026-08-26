@@ -25,7 +25,7 @@
 ## 5. 测试
 
 - [x] 5.1 新增 session 单测（临时目录、纯函数路径，不碰全局）：load/append round-trip（写入若干消息后重新加载，历史一致且顺序不变）、坏行与空行跳过、不存在的 id 新建空 session、`View` 头部为 system 且不影响后续追加
-- [x] 5.2 适配 `main_lool_test.go`：不再直接操作 `contextHis`，改为构造 session 并经 Append 注入 system prompt 与用户问题
+- [x] 5.2 适配 `engine_test.go`：不再直接操作 `contextHis`，改为构造 session 并经 Append 注入 system prompt 与用户问题
 - [x] 5.3 `go build ./...`、`go vet ./...`、`go test ./...` 全部通过
 
 ## 6. 端到端验证
