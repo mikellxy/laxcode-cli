@@ -3,9 +3,12 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os/exec"
+	"strings"
 
+	laxctx "github.com/mikellxy/laxcode/internal/context"
 	"github.com/mikellxy/laxcode/internal/env"
 	"github.com/mikellxy/laxcode/internal/schema"
 )
@@ -50,11 +53,11 @@ func (b BashTool) Execute(ctx context.Context, args json.RawMessage) (string, er
 
 	argsMap := make(map[string]string)
 	if err := json.Unmarshal(args, &argsMap); err != nil {
-		return "", err
+		return "", laxctx.NewErrorWithPrompt(&laxctx.ParamError{}, err)
 	}
 	command, ok := argsMap["command"]
-	if !ok {
-		return "", fmt.Errorf("command required")
+	if !ok || strings.TrimSpace(command) == "" {
+		return "", laxctx.NewErrorWithPrompt(&laxctx.ParamError{}, errors.New("command required"))
 	}
 
 	cmd := exec.CommandContext(ctx, "bash", "-c", command)

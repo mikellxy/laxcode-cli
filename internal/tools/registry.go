@@ -3,6 +3,7 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 
 	"github.com/mikellxy/laxcode/internal/schema"
@@ -50,6 +51,7 @@ func (d DefaultRegistry) Execute(ctx context.Context, toolCall *schema.ToolCall)
 	tool, ok := d.db[toolCall.Name]
 	if !ok {
 		return &schema.ToolResult{
+			Error:      errors.New("tool not found"),
 			Output:     fmt.Sprintf("tool %s not exists", toolCall.Name),
 			IsError:    true,
 			ToolCallID: toolCall.ID,
@@ -61,7 +63,8 @@ func (d DefaultRegistry) Execute(ctx context.Context, toolCall *schema.ToolCall)
 	output, err := tool.Execute(ctx, toolCall.Arguments)
 	if err != nil {
 		return &schema.ToolResult{
-			Output:     fmt.Sprintf("error executing tool %s: %s", toolCall.Name, err),
+			Error:      err,
+			Output:     output,
 			IsError:    true,
 			ToolCallID: toolCall.ID,
 		}

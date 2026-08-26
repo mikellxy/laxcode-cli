@@ -124,9 +124,27 @@ func (f *AgentEngine) Run(ctx context.Context, sess *Session) error {
 
 			for _, toolCall := range msg.ToolCalls {
 				toolResult := f.ToolRegistry.Execute(ctx, &toolCall)
+				content := toolResult.Output
+				if toolResult.Error != nil {
+					var sb strings.Builder
+					sb.WriteString(fmt.Sprintf("error executing tool %s: %s", toolCall.Name, toolResult.Error))
+					// 错误携带指引提示词时附到工具返回末尾，引导模型按 suggestion 修正
+					var promptErr laxctx.ErrorWithPrompt
+					if errors.As(toolResult.Error, &promptErr) {
+						if prompt, ok := promptErr.AsPrompt(); ok {
+							sb.WriteString("\n")
+							sb.WriteString(prompt)
+						}
+					}
+					if len(toolResult.Output) > 0 {
+						sb.WriteString("工具的其他输出内容:\n")
+						sb.WriteString(toolResult.Output)
+					}
+					content = sb.String()
+				}
 				sess.Append(schema.Message{
 					Role:       schema.RoleUser,
-					Content:    toolResult.Output,
+					Content:    content,
 					ToolCallID: toolResult.ToolCallID,
 				})
 			}

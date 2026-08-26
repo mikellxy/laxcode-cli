@@ -53,6 +53,7 @@ const (
 )
 
 type ToolResult struct {
+	Error      error  `json:"error"`
 	ToolCallID string `json:"tool_call_id"`
 	Output     string `json:"output"`
 	IsError    bool   `json:"is_error"`
