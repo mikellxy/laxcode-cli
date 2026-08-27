@@ -8,8 +8,8 @@ import (
 	"os"
 	"strings"
 
+	"github.com/mikellxy/laxcode/internal/config"
 	laxctx "github.com/mikellxy/laxcode/internal/context"
-	"github.com/mikellxy/laxcode/internal/env"
 	"github.com/mikellxy/laxcode/internal/provider"
 	"github.com/mikellxy/laxcode/internal/schema"
 	"github.com/mikellxy/laxcode/internal/tools"
@@ -93,7 +93,7 @@ func (f *AgentEngine) Run(ctx context.Context, sess *Session) (string, error) {
 		}
 
 		// compress
-		msgs, compressRes := laxctx.SimpleCompactor.Compress(sess.Messages, env.MaxWinToken, sess.TokenUsed)
+		msgs, compressRes := laxctx.SimpleCompactor.Compress(sess.Messages, config.MaxWinToken, sess.TokenUsed)
 		sess.Messages = msgs
 		if compressRes != nil && compressRes.Total() > 0 {
 			sess.WindowToken.TokenInput -= compressRes.InputTokenCompressed

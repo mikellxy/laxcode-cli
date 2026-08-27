@@ -3,13 +3,20 @@ package provider
 import (
 	"context"
 	"encoding/json"
-	"os"
 
-	"github.com/mikellxy/laxcode/internal/env"
+	"github.com/mikellxy/laxcode/internal/config"
 	"github.com/mikellxy/laxcode/internal/schema"
 	"github.com/openai/openai-go/v3"
 	"github.com/openai/openai-go/v3/option"
 	"github.com/openai/openai-go/v3/responses"
+)
+
+// 包级声明保证命令行参数在 main 的 config.Parse() 之前完成注册；
+// 三个配置项均支持 命令行参数 > 环境变量 > ~/.laxcode/settings.json
+var (
+	apiKey  = config.String(config.Item{Flag: "OPENAI_API_KEY", Env: "OPENAI_API_KEY", Key: "OPENAI_API_KEY", Usage: "OpenAI API key"})
+	baseURL = config.String(config.Item{Flag: "OPENAI_BASE_URL", Env: "OPENAI_BASE_URL", Key: "OPENAI_BASE_URL", Usage: "OpenAI base URL"})
+	model   = config.String(config.Item{Flag: "OPENAI_MODEL", Env: "OPENAI_MODEL", Key: "OPENAI_MODEL", Usage: "OpenAI model"})
 )
 
 type OpenApiProvider struct {
@@ -19,13 +26,13 @@ type OpenApiProvider struct {
 }
 
 func NewOpenApiProvider(info Info) *OpenApiProvider {
-	apiKey := os.Getenv("OPENAI_API_KEY")
-	baseUrl := os.Getenv("OPENAI_BASE_URL")
-	model := os.Getenv("OPENAI_MODEL")
-
+	// Name 缺省用实际使用的模型名，日志里看到的永远是真实模型
+	if info.Name == "" {
+		info.Name = model.Get()
+	}
 	return &OpenApiProvider{
-		client: openai.NewClient(option.WithAPIKey(apiKey), option.WithBaseURL(baseUrl)),
-		model:  model,
+		client: openai.NewClient(option.WithAPIKey(apiKey.Get()), option.WithBaseURL(baseURL.Get())),
+		model:  model.Get(),
 		info:   info,
 	}
 }
@@ -63,7 +70,7 @@ func (p *OpenApiProvider) Generate(ctx context.Context, msgs []schema.Message, t
 						},
 					},
 				})
-				env.Debugf("reasoning replayed: id=%q len=%d", msg.ReasoningID, len(msg.ReasoningContent))
+				config.Debugf("reasoning replayed: id=%q len=%d", msg.ReasoningID, len(msg.ReasoningContent))
 			}
 			if len(msg.Content) > 0 {
 				item := responses.ResponseInputItemParamOfMessage(msg.Content, responses.EasyInputMessageRoleAssistant)
@@ -114,7 +121,7 @@ func (p *OpenApiProvider) Generate(ctx context.Context, msgs []schema.Message, t
 			for _, c := range r.Content {
 				msg.ReasoningContent += c.Text
 			}
-			env.Debugf("reasoning parsed: id=%q len=%d", r.ID, len(msg.ReasoningContent))
+			config.Debugf("reasoning parsed: id=%q len=%d", r.ID, len(msg.ReasoningContent))
 		case "function_call":
 			c := output.AsFunctionCall()
 			msg.ToolCalls = append(msg.ToolCalls, schema.ToolCall{

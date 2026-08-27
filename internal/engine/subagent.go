@@ -76,7 +76,7 @@ func (s *SubAgent) Execute(ctx context.Context, args json.RawMessage) (string, e
 	reg.Register(tools.NewBashTool(workDir))
 	reg.Register(tools.NewReadFileTool(workDir))
 	agentEngine := NewAgentEngine(reg,
-		provider.NewOpenApiProvider(provider.Info{Name: "deepseek"}),
+		provider.NewOpenApiProvider(provider.Info{}),
 		workDir,
 		false,
 		id,
