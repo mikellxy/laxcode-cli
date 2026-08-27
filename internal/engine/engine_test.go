@@ -21,8 +21,8 @@ func TestMianLoop_GenerateWithTool(t *testing.T) {
 			name:         "user ask the weather of beijing",
 			toolRegistry: tools.NewDefaultRegistry(),
 			engines: []*AgentEngine{
-				NewAgentEngine(tools.NewDefaultRegistry(), provider.NewOpenApiProvider(provider.Info{Name: "deepseek openai"}), "."),
-				NewAgentEngine(tools.NewDefaultRegistry(), provider.NewAnthropicProvider(provider.Info{Name: "deepseek anthropic"}), "."),
+				NewAgentEngine(tools.NewDefaultRegistry(), provider.NewOpenApiProvider(provider.Info{Name: "deepseek openai"}), ".", false, "test-session"),
+				NewAgentEngine(tools.NewDefaultRegistry(), provider.NewAnthropicProvider(provider.Info{Name: "deepseek anthropic"}), ".", false, "test-session"),
 			},
 		},
 	}
@@ -37,7 +37,7 @@ func TestMianLoop_GenerateWithTool(t *testing.T) {
 
 				sysPrompt := laxctx.BuildSysPrompt(e.WorkDir, laxctx.LoadSkills(e.WorkDir), false, "test-session")
 				sess.View(sysPrompt)
-				if err := e.Run(context.Background(), sess); err != nil {
+				if _, err := e.Run(context.Background(), sess); err != nil {
 					t.Fatal(err)
 				}
 				t.Logf("[%v] generate done", e.Provider.Info())

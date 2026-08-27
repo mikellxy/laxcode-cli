@@ -33,19 +33,17 @@ func TestOpenAIProvider_GenerateWithTool(t *testing.T) {
 		for _, p := range test.providers {
 			t.Run(test.name, func(t *testing.T) {
 				msgs := test.msgs
-				respMsgs, err := p.Generate(context.Background(), msgs, test.toolRegistry.GetAvailableTools())
+				respMsg, err := p.Generate(context.Background(), msgs, test.toolRegistry.GetAvailableTools())
 				if err != nil {
 					t.Fatalf("Generate() error = %v", err)
 				}
-				msgs = append(msgs, respMsgs...)
+				msgs = append(msgs, *respMsg)
 
 				var toolCalls []schema.ToolCall
-				for _, m := range respMsgs {
-					if m.Role != schema.RoleAssistant {
-						t.Errorf("Generate() role = %q, want %q", m.Role, schema.RoleAssistant)
-					}
-					toolCalls = append(toolCalls, m.ToolCalls...)
+				if respMsg.Role != schema.RoleAssistant {
+					t.Errorf("Generate() role = %q, want %q", respMsg.Role, schema.RoleAssistant)
 				}
+				toolCalls = append(toolCalls, respMsg.ToolCalls...)
 				if len(toolCalls) == 0 {
 					t.Errorf("Generate() tool calls = %v, want at least one tool call", toolCalls)
 				}
@@ -58,16 +56,14 @@ func TestOpenAIProvider_GenerateWithTool(t *testing.T) {
 					})
 				}
 
-				respMsgs, err = p.Generate(context.Background(), msgs, test.toolRegistry.GetAvailableTools())
+				respMsg, err = p.Generate(context.Background(), msgs, test.toolRegistry.GetAvailableTools())
 				if err != nil {
 					t.Fatalf("Generate() error = %v", err)
 				}
-				for _, m := range respMsgs {
-					if m.Role != schema.RoleAssistant {
-						t.Errorf("Generate() role = %q, want %q", m.Role, schema.RoleAssistant)
-					}
-					t.Logf("[%v] Generate() response = %q\n", p.Info(), m.Content)
+				if respMsg.Role != schema.RoleAssistant {
+					t.Errorf("Generate() role = %q, want %q", respMsg.Role, schema.RoleAssistant)
 				}
+				t.Logf("[%v] Generate() response = %q\n", p.Info(), respMsg.Content)
 			})
 		}
 	}

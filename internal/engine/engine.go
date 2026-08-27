@@ -65,8 +65,7 @@ func TerminalLoop(ctx context.Context, agentEngine *AgentEngine) error {
 			Content: userInput,
 		})
 
-		err := agentEngine.Run(ctx, sess, nil)
-		if err != nil {
+		if _, err := agentEngine.Run(ctx, sess); err != nil {
 			// warn too many turns
 			if errors.Is(err, errTooManyTurns) {
 				fmt.Printf("[warn] %v\n", err)
@@ -77,13 +76,16 @@ func TerminalLoop(ctx context.Context, agentEngine *AgentEngine) error {
 	}
 }
 
-func (f *AgentEngine) Run(ctx context.Context, sess *Session, outCh chan<- string) error {
+// Run 执行一轮"生成-工具"循环直到模型给出无工具调用的最终回答，
+// 返回该回答的文本内容。子 Agent 直接以返回值拿结果--
+// 经无缓冲 channel 回传会在"发送等待接收、接收等待函数返回"间自死锁。
+func (f *AgentEngine) Run(ctx context.Context, sess *Session) (string, error) {
 	turnCnt := 0
 
 	for {
 		turnCnt++
 		if turnCnt > 50 {
-			return errTooManyTurns
+			return "", errTooManyTurns
 		}
 
 		// compress
@@ -99,7 +101,7 @@ func (f *AgentEngine) Run(ctx context.Context, sess *Session, outCh chan<- strin
 		// 历史 + 本轮新消息），产生的消息一律经 Append 写回，无 slice 别名回写
 		msg, err := f.Provider.Generate(ctx, sess.Messages, f.ToolRegistry.GetAvailableTools())
 		if err != nil {
-			return fmt.Errorf("generating message: %w", err)
+			return "", fmt.Errorf("generating message: %w", err)
 		}
 
 		toolCallCnt := len(msg.ToolCalls)
@@ -140,12 +142,7 @@ func (f *AgentEngine) Run(ctx context.Context, sess *Session, outCh chan<- strin
 			})
 		}
 		if toolCallCnt == 0 {
-			if outCh != nil {
-				outCh <- msg.Content
-			}
-			break
+			return msg.Content, nil
 		}
 	}
-
-	return nil
 }

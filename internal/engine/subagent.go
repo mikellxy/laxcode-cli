@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"time"
 
 	laxctx "github.com/mikellxy/laxcode/internal/context"
@@ -14,13 +15,11 @@ import (
 
 type SubAgent struct {
 	Parent *AgentEngine
-	OutCh  chan string
 }
 
 func NewSubAgent(parent *AgentEngine) *SubAgent {
 	return &SubAgent{
 		Parent: parent,
-		OutCh:  make(chan string),
 	}
 }
 
@@ -88,11 +87,12 @@ func (s *SubAgent) Execute(ctx context.Context, args json.RawMessage) (string, e
 		Content: argsObj.Task,
 	})
 
-	if err := agentEngine.Run(ctx, sess, s.OutCh); err != nil {
-		return "", nil
+	result, err := agentEngine.Run(ctx, sess)
+	if err != nil {
+		// 子 Agent 失败也要把已产出的部分结果交还父 Agent，供其判断补救方向
+		return fmt.Sprintf("sub agent failed: %v", err), nil
 	}
-
-	return <-s.OutCh, nil
+	return result, nil
 }
 
 func (s *SubAgent) BeforeExecInfo(message json.RawMessage) string {
