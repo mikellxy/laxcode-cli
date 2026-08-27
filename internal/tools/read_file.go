@@ -42,14 +42,14 @@ func (r *ReadFileTool) BeforeExecInfo(args json.RawMessage) string {
 		return "read_file()"
 	}
 	if argsObj.Path == "" {
-		return "read_file()"
+		return ToolReadFile + "()"
 	}
 
-	return fmt.Sprintf("read_file(path=%s, start_line_no=%d, start_bytes=%d)", argsObj.Path, argsObj.StartLineNo, argsObj.StartBytes)
+	return fmt.Sprintf("%s(path=%s, start_line_no=%d, start_bytes=%d)", ToolReadFile, argsObj.Path, argsObj.StartLineNo, argsObj.StartBytes)
 }
 
 func (r *ReadFileTool) Name() string {
-	return "read_file"
+	return ToolReadFile
 }
 
 func (r *ReadFileTool) Definition() schema.ToolDefinition {

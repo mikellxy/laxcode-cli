@@ -29,18 +29,18 @@ func (b *BashTool) AfterExecInfo(message json.RawMessage) string {
 func (b *BashTool) BeforeExecInfo(args json.RawMessage) string {
 	argsMap := make(map[string]string)
 	if err := json.Unmarshal(args, &argsMap); err != nil {
-		return "bash()"
+		return ToolBash + "()"
 	}
 	command, ok := argsMap["command"]
 	if !ok {
-		return "bash()"
+		return ToolBash + "()"
 	}
 
-	return fmt.Sprintf("bash(%s)", command)
+	return fmt.Sprintf("%s(%s)", ToolBash, command)
 }
 
 func (b *BashTool) Name() string {
-	return "bash"
+	return ToolBash
 }
 
 func (b *BashTool) Definition() schema.ToolDefinition {

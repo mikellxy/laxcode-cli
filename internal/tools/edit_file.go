@@ -29,18 +29,18 @@ func (e *EditFileTool) AfterExecInfo(message json.RawMessage) string {
 func (e *EditFileTool) BeforeExecInfo(args json.RawMessage) string {
 	argsMap := make(map[string]string)
 	if err := json.Unmarshal(args, &argsMap); err != nil {
-		return "edit_file()"
+		return ToolEditFile + "()"
 	}
 	path, ok := argsMap["path"]
 	if !ok {
-		return "edit_file()"
+		return ToolEditFile + "()"
 	}
 
-	return fmt.Sprintf("edit_file(%s)", path)
+	return fmt.Sprintf("%s(%s)", ToolEditFile, path)
 }
 
 func (e *EditFileTool) Name() string {
-	return "edit_file"
+	return ToolEditFile
 }
 
 func (e *EditFileTool) Definition() schema.ToolDefinition {

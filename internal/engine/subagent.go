@@ -24,7 +24,7 @@ func NewSubAgent(parent *AgentEngine) *SubAgent {
 }
 
 func (s *SubAgent) Name() string {
-	return "run_sub_agent"
+	return tools.ToolRunSubAgent
 }
 
 func (s *SubAgent) Definition() schema.ToolDefinition {

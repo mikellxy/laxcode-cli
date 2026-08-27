@@ -28,18 +28,18 @@ func (w *WriteFileTool) AfterExecInfo(message json.RawMessage) string {
 func (w *WriteFileTool) BeforeExecInfo(args json.RawMessage) string {
 	argsMap := make(map[string]string)
 	if err := json.Unmarshal(args, &argsMap); err != nil {
-		return "write_file()"
+		return ToolWriteFile + "()"
 	}
 	path, ok := argsMap["path"]
 	if !ok {
-		return "write_file()"
+		return ToolWriteFile + "()"
 	}
 
-	return fmt.Sprintf("write_file(%s)", path)
+	return fmt.Sprintf("%s(%s)", ToolWriteFile, path)
 }
 
 func (w *WriteFileTool) Name() string {
-	return "write_file"
+	return ToolWriteFile
 }
 
 func (w *WriteFileTool) Definition() schema.ToolDefinition {

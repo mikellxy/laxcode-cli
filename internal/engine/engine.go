@@ -113,30 +113,13 @@ func (f *AgentEngine) Run(ctx context.Context, sess *Session) (string, error) {
 
 		sess.Append(*msg)
 
-		for _, toolCall := range msg.ToolCalls {
-			toolResult := f.ToolRegistry.Execute(ctx, &toolCall)
-			content := toolResult.Output
-			if toolResult.Error != nil {
-				var sb strings.Builder
-				sb.WriteString(fmt.Sprintf("error executing tool %s: %s", toolCall.Name, toolResult.Error))
-				// 错误携带指引提示词时附到工具返回末尾，引导模型按 suggestion 修正
-				var promptErr laxctx.ErrorWithPrompt
-				if errors.As(toolResult.Error, &promptErr) {
-					if prompt, ok := promptErr.AsPrompt(); ok {
-						sb.WriteString("\n")
-						sb.WriteString(prompt)
-					}
-				}
-				// 工具报错时若仍有输出（如 shell 的 stderr/stdout），一并附上供模型定位问题
-				if len(toolResult.Output) > 0 {
-					sb.WriteString("\n以下为工具执行时的原始输出，供定位错误参考:\n")
-					sb.WriteString(toolResult.Output)
-				}
-				content = sb.String()
-			}
+		// 并行策略见 executeToolCalls：多 read_file 调用 goroutine+channel
+		// fork-join 并发执行，其余顺序执行；结果按原始调用顺序归位。
+		results := f.executeToolCalls(ctx, msg.ToolCalls)
+		for i, toolResult := range results {
 			sess.Append(schema.Message{
 				Role:       schema.RoleUser,
-				Content:    content,
+				Content:    buildToolResultContent(msg.ToolCalls[i].Name, toolResult),
 				ToolCallID: toolResult.ToolCallID,
 			})
 		}
