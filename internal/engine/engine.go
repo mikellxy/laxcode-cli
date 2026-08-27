@@ -24,25 +24,28 @@ type AgentEngine struct {
 	Provider     provider.Provider
 	WorkDir      string
 	PlanMode     bool
-	SessionID    string
+	// Session 是本引擎持有的会话：主 Agent 由 main 在启动期装配
+	// （GetSession），子 Agent 在 Execute 时按需新建。Run 直接使用，
+	// 不再逐轮传参。
+	Session *Session
 	// PrintLLM 打印 assistant 消息（thinking + 正文），构造时默认主 Agent
 	// 配色，子 Agent 覆盖为紫色；Run 只经它输出，与展示样式解耦。
 	PrintLLM func(msg *schema.Message)
 }
 
-func NewAgentEngine(toolRegistry tools.Registry, provider provider.Provider, workDir string, planMode bool, sessID string) *AgentEngine {
+func NewAgentEngine(toolRegistry tools.Registry, provider provider.Provider, workDir string, planMode bool, sess *Session) *AgentEngine {
 	return &AgentEngine{
 		ToolRegistry: toolRegistry,
 		Provider:     provider,
 		WorkDir:      workDir,
 		PlanMode:     planMode,
-		SessionID:    sessID,
+		Session:      sess,
 		PrintLLM:     PrintMainLLM,
 	}
 }
 
 func TerminalLoop(ctx context.Context, agentEngine *AgentEngine) error {
-	sess := getSession(agentEngine.SessionID, agentEngine.WorkDir, agentEngine.PlanMode)
+	sess := agentEngine.Session
 
 	scanner := bufio.NewScanner(os.Stdin)
 	fmt.Println(">>> Agent ready, input your question, input exit to quit")
@@ -69,7 +72,7 @@ func TerminalLoop(ctx context.Context, agentEngine *AgentEngine) error {
 			Content: userInput,
 		})
 
-		if _, err := agentEngine.Run(ctx, sess); err != nil {
+		if _, err := agentEngine.Run(ctx); err != nil {
 			// warn too many turns
 			if errors.Is(err, errTooManyTurns) {
 				fmt.Printf("[warn] %v\n", err)
@@ -83,7 +86,8 @@ func TerminalLoop(ctx context.Context, agentEngine *AgentEngine) error {
 // Run 执行一轮"生成-工具"循环直到模型给出无工具调用的最终回答，
 // 返回该回答的文本内容。子 Agent 直接以返回值拿结果--
 // 经无缓冲 channel 回传会在"发送等待接收、接收等待函数返回"间自死锁。
-func (f *AgentEngine) Run(ctx context.Context, sess *Session) (string, error) {
+func (f *AgentEngine) Run(ctx context.Context) (string, error) {
+	sess := f.Session
 	turnCnt := 0
 
 	for {

@@ -34,18 +34,20 @@ func main() {
 		id = time.Now().Format("20060102-150405.000")
 	}
 
-	engine.InitSessionDB()
-
 	reg := tools.NewDefaultRegistry()
 	reg.Register(tools.NewBashTool(workDir))
 	reg.Register(tools.NewWriteFileTool(workDir))
 	reg.Register(tools.NewReadFileTool(workDir))
 	reg.Register(tools.NewEditFileTool(workDir))
+	// 装配会话：续聊则重放历史，否则起空会话并注入 system prompt。
+	// session 由 main 持有并注入引擎与监控 provider，各 loop
+	// （TerminalLoop/未来 httpLoop 等）共享同一对象，不再各自获取。
+	sess := engine.GetSession(workDir, id, planMode.Get())
 	agentEngine := engine.NewAgentEngine(reg,
-		provider.NewOpenApiProvider(provider.Info{}),
+		engine.NewMonitoredProvider(provider.NewOpenApiProvider(provider.Info{}), sess),
 		workDir,
 		planMode.Get(),
-		id,
+		sess,
 	)
 	reg.Register(engine.NewSubAgent(agentEngine))
 

@@ -51,7 +51,7 @@ func TestExecuteToolCalls_ParallelReadFile(t *testing.T) {
 
 	reg := &trackingRegistry{Registry: tools.NewDefaultRegistry()}
 	reg.Register(tools.NewReadFileTool(workDir))
-	eng := NewAgentEngine(reg, nil, workDir, false, "test-session")
+	eng := NewAgentEngine(reg, nil, workDir, false, newSession(t.TempDir(), "test-session"))
 
 	calls := make([]schema.ToolCall, 0, len(files))
 	for name := range files {
@@ -99,7 +99,7 @@ func TestExecuteToolCalls_SequentialForMixedCalls(t *testing.T) {
 
 	reg := &trackingRegistry{Registry: tools.NewDefaultRegistry()}
 	reg.Register(tools.NewReadFileTool(workDir))
-	eng := NewAgentEngine(reg, nil, workDir, false, "test-session")
+	eng := NewAgentEngine(reg, nil, workDir, false, newSession(t.TempDir(), "test-session"))
 
 	// 混入非 read_file 调用，应退化为顺序执行
 	calls := []schema.ToolCall{

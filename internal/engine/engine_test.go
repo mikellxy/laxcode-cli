@@ -12,36 +12,24 @@ import (
 
 func TestMianLoop_GenerateWithTool(t *testing.T) {
 	t.Parallel()
-	testSet := []struct {
-		name         string
-		toolRegistry tools.Registry
-		engines      []*AgentEngine
-	}{
-		{
-			name:         "user ask the weather of beijing",
-			toolRegistry: tools.NewDefaultRegistry(),
-			engines: []*AgentEngine{
-				NewAgentEngine(tools.NewDefaultRegistry(), provider.NewOpenApiProvider(provider.Info{Name: "deepseek openai"}), ".", false, "test-session"),
-				NewAgentEngine(tools.NewDefaultRegistry(), provider.NewAnthropicProvider(provider.Info{Name: "deepseek anthropic"}), ".", false, "test-session"),
-			},
-		},
+	providers := []provider.Provider{
+		provider.NewOpenApiProvider(provider.Info{Name: "deepseek openai"}),
+		provider.NewAnthropicProvider(provider.Info{Name: "deepseek anthropic"}),
 	}
 
-	for _, test := range testSet {
-		for _, e := range test.engines {
-			t.Run(test.name, func(t *testing.T) {
-				// 模拟 Loop 的会话历史：system prompt 由 Run 内 View 组装注入（不落盘），
-				// 这里只经 Append 注入用户问题
-				sess := newSession(t.TempDir(), "test-session")
-				sess.Append(schema.Message{Role: schema.RoleUser, Content: "main_loop.go文件中实现了什么功能"})
+	for _, p := range providers {
+		t.Run("user ask the weather of beijing", func(t *testing.T) {
+			// 模拟 main 的装配顺序：先构造会话（注入 system prompt 与用户
+			// 问题），再以会话构造引擎并运行
+			sess := newSession(t.TempDir(), "test-session")
+			sess.Append(schema.Message{Role: schema.RoleUser, Content: "main_loop.go文件中实现了什么功能"})
+			sess.View(laxctx.BuildSysPrompt(".", laxctx.LoadSkills("."), false, "test-session"))
 
-				sysPrompt := laxctx.BuildSysPrompt(e.WorkDir, laxctx.LoadSkills(e.WorkDir), false, "test-session")
-				sess.View(sysPrompt)
-				if _, err := e.Run(context.Background(), sess); err != nil {
-					t.Fatal(err)
-				}
-				t.Logf("[%v] generate done", e.Provider.Info())
-			})
-		}
+			e := NewAgentEngine(tools.NewDefaultRegistry(), p, ".", false, sess)
+			if _, err := e.Run(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			t.Logf("[%v] generate done", e.Provider.Info())
+		})
 	}
 }

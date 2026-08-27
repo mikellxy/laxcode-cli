@@ -5,13 +5,14 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/mikellxy/laxcode/internal/schema"
 )
 
-// session 测试全部走纯函数路径（显式传临时目录构造），
-// 不触碰包级全局 sessionDB，避免用例间共享状态。
+// session 测试尽量走纯函数路径（显式传临时目录构造）；
+// 仅 GetSession 缓存用例触碰全局 sessionDB，以独立 session id 隔离。
 
 func TestSession_AppendLoadRoundTrip(t *testing.T) {
 	t.Parallel()
@@ -69,6 +70,42 @@ func TestSession_LoadMissingFileIsEmpty(t *testing.T) {
 	}
 }
 
+func TestGetSession_CacheHitSkipsReload(t *testing.T) {
+	// 不 Parallel：触碰全局 sessionDB。其余用例不经过 GetSession，无竞争
+	workDir := t.TempDir()
+	sessID := "cache-hit"
+
+	// 首次未命中：磁盘装配（注入 system prompt）并写入缓存
+	first := GetSession(workDir, sessID, false)
+	if len(first.Messages) != 1 || first.Messages[0].Role != schema.RoleSystem {
+		t.Fatalf("首次装配应注入 system prompt: %#v", first.Messages)
+	}
+	first.Append(schema.Message{Role: schema.RoleUser, Content: "内存里的问题"})
+
+	// 绕过内存直接向 history.jsonl 追加一行，使磁盘比内存新
+	line, err := json.Marshal(schema.Message{Role: schema.RoleUser, Content: "磁盘上的新问题"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.OpenFile(first.historyPath, os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Write(append(line, '\n')); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+
+	// 第二次命中缓存：返回同一对象，不感知磁盘新增行
+	second := GetSession(workDir, sessID, false)
+	if second != first {
+		t.Fatalf("缓存命中应返回同一 session 对象")
+	}
+	if len(second.Messages) != 2 {
+		t.Fatalf("缓存命中不应重新加载磁盘: got %d 条消息, want 2", len(second.Messages))
+	}
+}
+
 func TestSession_View(t *testing.T) {
 	t.Parallel()
 	sess := newSession(t.TempDir(), "view")
@@ -103,64 +140,67 @@ func TestSession_AppendCreatesDirLazily(t *testing.T) {
 	}
 }
 
-func TestSession_AppendAccumulatesTokenUsed(t *testing.T) {
+func TestSession_AppendDoesNotAccountTokens(t *testing.T) {
 	t.Parallel()
-	sess := newSession(t.TempDir(), "token-acc")
+	sess := newSession(t.TempDir(), "append-no-account")
 
-	// 零用量消息（用户输入）不影响统计，也不产生 meta.json 快照
+	// Append 不再承担记账：即使消息携带用量，统计也不变、不落 meta.json
 	sess.Append(schema.Message{Role: schema.RoleUser, Content: "第一问"})
-	if sess.TokenUsed != (schema.TokenStatistics{}) || sess.WindowToken != (schema.TokenStatistics{}) {
-		t.Fatalf("零用量消息不应改变统计: TokenUsed=%+v WindowToken=%+v", sess.TokenUsed, sess.WindowToken)
-	}
-	if _, err := os.Stat(sess.metaPath); !os.IsNotExist(err) {
-		t.Fatalf("零用量消息不应触发 meta.json 写入")
-	}
-
 	sess.Append(schema.Message{
 		Role:      schema.RoleAssistant,
 		Content:   "第一答",
 		TokenUsed: schema.TokenStatistics{TokenInput: 70, TokenOutput: 5},
 	})
-	if sess.TokenUsed != (schema.TokenStatistics{TokenInput: 70, TokenOutput: 5}) {
-		t.Fatalf("累计消耗应累加 assistant 用量: %+v", sess.TokenUsed)
+	if sess.TokenUsed != (schema.TokenStatistics{}) || sess.WindowToken != (schema.TokenStatistics{}) {
+		t.Fatalf("Append 不应改变统计: TokenUsed=%+v WindowToken=%+v", sess.TokenUsed, sess.WindowToken)
 	}
-	if sess.WindowToken != (schema.TokenStatistics{TokenInput: 70, TokenOutput: 5}) {
-		t.Fatalf("窗口占用应刷新为该消息用量原值: %+v", sess.WindowToken)
+	if len(sess.Rounds) != 0 {
+		t.Fatalf("Append 不应产生观测记录: %+v", sess.Rounds)
 	}
-
-	// 其后的 user 消息不刷新窗口快照
-	sess.Append(schema.Message{Role: schema.RoleUser, Content: "第二问", ToolCallID: "call_1"})
-	if sess.WindowToken != (schema.TokenStatistics{TokenInput: 70, TokenOutput: 5}) {
-		t.Fatalf("零用量消息不应刷新窗口占用: %+v", sess.WindowToken)
-	}
-
-	sess.Append(schema.Message{
-		Role:      schema.RoleAssistant,
-		Content:   "第二答",
-		TokenUsed: schema.TokenStatistics{TokenInput: 100, TokenOutput: 8},
-	})
-	wantUsed := schema.TokenStatistics{TokenInput: 170, TokenOutput: 13}
-	if sess.TokenUsed != wantUsed {
-		t.Fatalf("累计消耗应为全部消息用量加和: got %+v want %+v", sess.TokenUsed, wantUsed)
-	}
-	if sess.WindowToken != (schema.TokenStatistics{TokenInput: 100, TokenOutput: 8}) {
-		t.Fatalf("窗口占用应为最后一条非零用量消息原值: %+v", sess.WindowToken)
+	if _, err := os.Stat(sess.metaPath); !os.IsNotExist(err) {
+		t.Fatalf("Append 不应触发 meta.json 写入")
 	}
 }
 
-func TestSession_MetaSnapshotWrittenOnUsageChange(t *testing.T) {
+func TestSession_RecordGenerateAccountsAndRounds(t *testing.T) {
+	t.Parallel()
+	sess := newSession(t.TempDir(), "record-generate")
+
+	sess.RecordGenerate(RoundStat{TimeUsed: 120, TokenInput: 70, TokenOutput: 5})
+	if sess.TokenUsed != (schema.TokenStatistics{TokenInput: 70, TokenOutput: 5}) {
+		t.Fatalf("累计消耗应累加本轮用量: %+v", sess.TokenUsed)
+	}
+	if sess.WindowToken != (schema.TokenStatistics{TokenInput: 70, TokenOutput: 5}) {
+		t.Fatalf("窗口占用应刷新为本轮用量原值: %+v", sess.WindowToken)
+	}
+
+	sess.RecordGenerate(RoundStat{TimeUsed: 230, TokenInput: 100, TokenOutput: 8})
+	wantUsed := schema.TokenStatistics{TokenInput: 170, TokenOutput: 13}
+	if sess.TokenUsed != wantUsed {
+		t.Fatalf("累计消耗应为各轮用量加和: got %+v want %+v", sess.TokenUsed, wantUsed)
+	}
+	if sess.WindowToken != (schema.TokenStatistics{TokenInput: 100, TokenOutput: 8}) {
+		t.Fatalf("窗口占用应为最后一轮用量原值: %+v", sess.WindowToken)
+	}
+
+	wantRounds := []RoundStat{
+		{TimeUsed: 120, TokenInput: 70, TokenOutput: 5},
+		{TimeUsed: 230, TokenInput: 100, TokenOutput: 8},
+	}
+	if !reflect.DeepEqual(sess.Rounds, wantRounds) {
+		t.Fatalf("Rounds 应逐轮追加观测记录: got %+v want %+v", sess.Rounds, wantRounds)
+	}
+}
+
+func TestSession_MetaSnapshotWrittenOnRecordGenerate(t *testing.T) {
 	t.Parallel()
 	sess := newSession(t.TempDir(), "meta-snap")
 
-	sess.Append(schema.Message{
-		Role:      schema.RoleAssistant,
-		Content:   "答",
-		TokenUsed: schema.TokenStatistics{TokenInput: 70, TokenOutput: 5},
-	})
+	sess.RecordGenerate(RoundStat{TimeUsed: 120, TokenInput: 70, TokenOutput: 5})
 
 	data, err := os.ReadFile(sess.metaPath)
 	if err != nil {
-		t.Fatalf("携带用量的消息追加后 meta.json 应存在: %v", err)
+		t.Fatalf("RecordGenerate 后 meta.json 应存在: %v", err)
 	}
 	var meta SessionMeta
 	if err := json.Unmarshal(data, &meta); err != nil {
@@ -175,16 +215,31 @@ func TestSession_MetaSnapshotWrittenOnUsageChange(t *testing.T) {
 	if meta.WindowToken != (schema.TokenStatistics{TokenInput: 70, TokenOutput: 5}) {
 		t.Fatalf("meta.json window_token 应与窗口占用一致: %+v", meta.WindowToken)
 	}
+	wantRounds := []RoundStat{{TimeUsed: 120, TokenInput: 70, TokenOutput: 5}}
+	if !reflect.DeepEqual(meta.Rounds, wantRounds) {
+		t.Fatalf("meta.json rounds 应为最新每轮观测列表: got %+v want %+v", meta.Rounds, wantRounds)
+	}
+	// 列表元素的 JSON 键须为 time_used/token_input/token_output
+	if !strings.Contains(string(data), `"time_used"`) {
+		t.Fatalf("meta.json rounds 元素应含 time_used 键: %s", data)
+	}
 
-	// 后续零用量消息不重写快照：内容保持不变（user 输入与 tool 结果同）
+	// 新一轮上报后快照整体覆写：rounds 列表随之增长，Append 不改快照
 	sess.Append(schema.Message{Role: schema.RoleUser, Content: "追问"})
-	sess.Append(schema.Message{Role: schema.RoleUser, Content: "ls output...", ToolCallID: "call_1"})
+	sess.RecordGenerate(RoundStat{TimeUsed: 230, TokenInput: 100, TokenOutput: 8})
 	data2, err := os.ReadFile(sess.metaPath)
 	if err != nil {
 		t.Fatalf("meta.json 应仍存在: %v", err)
 	}
-	if string(data) != string(data2) {
-		t.Fatalf("零用量消息不应重写 meta.json:\n before: %s\n after:  %s", data, data2)
+	var meta2 SessionMeta
+	if err := json.Unmarshal(data2, &meta2); err != nil {
+		t.Fatalf("meta.json 应为合法 JSON: %v\n内容: %s", err, data2)
+	}
+	if len(meta2.Rounds) != 2 || meta2.Rounds[1] != (RoundStat{TimeUsed: 230, TokenInput: 100, TokenOutput: 8}) {
+		t.Fatalf("覆写后的 rounds 应含两轮观测: %+v", meta2.Rounds)
+	}
+	if meta2.TokenUsed != (schema.TokenStatistics{TokenInput: 170, TokenOutput: 13}) {
+		t.Fatalf("覆写后的 token_used 应为两轮加和: %+v", meta2.TokenUsed)
 	}
 }
 

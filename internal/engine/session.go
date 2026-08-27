@@ -25,6 +25,8 @@ const metaFile = "meta.json"
 // Session 是对话历史的唯一真相源：内存消息列表与 history.jsonl 同步维护，
 // 每 Append 一条即落盘一行。messages 非导出，强制所有追加走 Append，
 // 避免内存与磁盘失同步（View 是只读组装，不改变内部状态）。
+// Session 非并发安全：当前 REPL 为单 goroutine 串行访问；未来 http/sse
+// 等并发前端共享同一 session 时，需在 loop 层加锁或串行化。
 type Session struct {
 	id          string
 	Messages    []schema.Message
@@ -33,15 +35,21 @@ type Session struct {
 	// TokenUsed 是会话累计 token 消耗，恒等于全部消息 TokenUsed 的加和
 	// （仅 assistant 消息携带非零值）。raw 计费口径：每次调用的完整 input
 	// （含 system prompt 与当时全部历史）都会重复计入，语义为真实账单累计。
-	// 只经 Append 累加，不存在绕过消息历史的更新路径，因此可从
-	// history.jsonl 单遍重放推导。
+	// 运行期只经 RecordGenerate 累加（MonitoredProvider 在每次成功调用后
+	// 上报），不存在绕过消息历史的更新路径，因此可从 history.jsonl
+	// 单遍重放推导。
 	TokenUsed schema.TokenStatistics
-	// WindowToken 是上下文窗口占用快照，原样拷贝自最后一条携带非零用量的
-	// assistant 消息的 TokenUsed：TokenInput+TokenOutput 之和近似
+	// WindowToken 是上下文窗口占用快照，原样拷贝自最后一轮 generate 上报的
+	// 用量原值（即最后一条携带非零用量的 assistant 消息的 TokenUsed）：
+	// TokenInput+TokenOutput 之和近似
 	// "system prompt + 全部历史"的当前窗口占用。其后追加 user/tool 消息到
 	// 下次调用之间，真实占用大于此值（新消息 token 数本地不可知），
 	// 属该口径固有滞后。旧会话恢复后为零值（未知态），下次调用刷新。
 	WindowToken schema.TokenStatistics
+	// Rounds 是每轮 generate 的耗时与用量列表，由 MonitoredProvider 经
+	// RecordGenerate 逐轮上报。耗时属本地观测数据、不写入 history.jsonl，
+	// 旧会话恢复后列表从空重新累计（meta.json 快照不参与恢复）。
+	Rounds []RoundStat
 }
 
 // SessionMeta 是 meta.json 的文件格式：token 统计的人类可读快照，
@@ -52,6 +60,18 @@ type SessionMeta struct {
 	Version     int                    `json:"version"`
 	TokenUsed   schema.TokenStatistics `json:"token_used"`
 	WindowToken schema.TokenStatistics `json:"window_token"`
+	// Rounds 是最新的每轮 generate 耗时与用量列表，随快照整体覆写
+	Rounds []RoundStat `json:"rounds"`
+}
+
+// RoundStat 是一轮 generate 调用的观测记录：TimeUsed 为本次调用耗时
+// （毫秒），token 用量为 raw 计费口径（同 Message.TokenUsed 语义：
+// 输入含 system prompt 与当时全部历史）。由 MonitoredProvider 在
+// Generate 成功后上报给 session。
+type RoundStat struct {
+	TimeUsed    int64 `json:"time_used"`
+	TokenInput  int   `json:"token_input"`
+	TokenOutput int   `json:"token_output"`
 }
 
 // newSession 以 sessionID 新建空 session；不创建任何目录或文件，
@@ -111,15 +131,11 @@ func loadSession(workDir, sessionID string) *Session {
 // Append 把一条消息追加进内存历史并以 O_APPEND 向 history.jsonl 追加一行 JSON，
 // 首次写入前按需创建会话目录。写盘失败输出显眼警告但不中断会话：
 // 内存历史仍然保留（仅磁盘缺一行），后续消息继续尝试落盘。
-// token 统计在此单点维护：TokenUsed 累加保证加和不变式；
-// 携带非零用量的消息（assistant）刷新 WindowToken 并重写 meta.json 快照。
+// Append 只维护消息历史、不做 token 记账：用量统计由 MonitoredProvider
+// 在 Generate 成功后经 RecordGenerate 单点上报。
 func (s *Session) Append(msg schema.Message) {
 	s.Messages = append(s.Messages, msg)
-	s.TokenUsed.TokenInput += msg.TokenUsed.TokenInput
-	s.TokenUsed.TokenOutput += msg.TokenUsed.TokenOutput
 
-	// 先写 history 行、后重写 meta：崩溃落在中间时 history 多一行而
-	// meta 滞后一条，下次加载重放自愈；反向超前不会发生。
 	line, err := json.Marshal(msg)
 	if err != nil {
 		// schema.Message 只含可序列化字段，marshal 失败仅剩理论可能
@@ -129,11 +145,20 @@ func (s *Session) Append(msg schema.Message) {
 	if err := s.appendLine(line); err != nil {
 		warnHistoryWrite(s.historyPath, err)
 	}
+}
 
-	if msg.TokenUsed != (schema.TokenStatistics{}) {
-		s.WindowToken = msg.TokenUsed
-		s.writeMeta()
-	}
+// RecordGenerate 记录一轮成功 generate 的观测数据，是 token 记账的唯一入口：
+// 本轮用量累加进 TokenUsed 维持加和不变式、原值刷新 WindowToken，
+// 本轮观测追加进 Rounds 列表，最后整体重写 meta.json 快照。
+// 上报发生在 Generate 返回后、assistant 消息 Append 前，崩溃落在中间时
+// meta 可能超前 history 一条；meta 本就是重放可推导的冗余快照，
+// 下次加载以 history.jsonl 重放为准自愈。
+func (s *Session) RecordGenerate(round RoundStat) {
+	s.TokenUsed.TokenInput += round.TokenInput
+	s.TokenUsed.TokenOutput += round.TokenOutput
+	s.WindowToken = schema.TokenStatistics{TokenInput: round.TokenInput, TokenOutput: round.TokenOutput}
+	s.Rounds = append(s.Rounds, round)
+	s.writeMeta()
 }
 
 // writeMeta 以 tmp + rename 原子重写 meta.json 快照。失败仅警告不中断会话：
@@ -143,6 +168,7 @@ func (s *Session) writeMeta() {
 		Version:     1,
 		TokenUsed:   s.TokenUsed,
 		WindowToken: s.WindowToken,
+		Rounds:      s.Rounds,
 	}
 	data, err := json.MarshalIndent(meta, "", "  ")
 	if err != nil {
@@ -151,6 +177,12 @@ func (s *Session) writeMeta() {
 	}
 
 	dir := filepath.Dir(s.metaPath)
+	// RecordGenerate 可能先于任何 Append 触发（Generate 返回即记账），
+	// 会话目录尚不存在，此处与 appendLine 一样按需创建
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		warnMetaWrite(s.metaPath, err)
+		return
+	}
 	tmp, err := os.CreateTemp(dir, "meta.*.tmp")
 	if err != nil {
 		warnMetaWrite(s.metaPath, err)
@@ -196,28 +228,22 @@ func (s *Session) View(sysPrompt string) {
 	s.Messages = append(view, s.Messages...)
 }
 
-// SessionDB 管理 session id 到 session 对象的映射。v1 以包级全局单例存在：
-// main.go 启动时经 InitSessionDB 初始化并仅加载指定的一个 session，
-// 全量扫描/懒加载留待未来演进（演进时只改 InitSessionDB 内部，不动调用方）。
+// SessionDB 是 session id 到 session 对象的内存缓存：命中即返回内存对象，
+// 免去 history.jsonl 的逐行重放——未来 httpLoop/sseLoop 每次请求复用同一
+// session 时不必逐次从文件加载。与 Session 一样非并发安全，并发控制留待
+// 并发前端落地时一并处理。
 type SessionDB struct {
 	sessions map[string]*Session
 }
 
-// sessionDB 是全局会话库：仅经 InitSessionDB 写入、getSession 读取，
-// 不对外导出（参照 env.WorkDir 的包级全局先例，但收口访问路径）。
-var sessionDB *SessionDB
+// sessionDB 是全局会话库：仅经 GetSession 读写，不对外导出
+var sessionDB = &SessionDB{sessions: make(map[string]*Session)}
 
-// InitSessionDB 初始化全局会话库并仅加载 sessionID 对应的一个 session：
-// 其 history.jsonl 存在则恢复历史（续聊），否则以该 id 新建空 session。
-// 本版不扫描、不加载其他任何 session。
-func InitSessionDB() {
-	db := &SessionDB{sessions: make(map[string]*Session)}
-	sessionDB = db
-}
-
-// getSession 按 id 从全局会话库查询 session，供 Loop 使用；
-// 库未初始化或 id 不存在时返回 nil，由调用方决定如何处置。
-func getSession(sessionID string, workDir string, isPlanMode bool) *Session {
+// GetSession 按 id 获取 session：缓存命中直接返回内存对象；未命中则
+// 从磁盘重放历史与 token 统计（history.jsonl 存在即续聊，否则起空会话）、
+// 注入本次启动重建的 system prompt，再写入缓存。会话装配逻辑收口在此，
+// 调用方（main / SubAgent / 各 loop）不感知加载细节。
+func GetSession(workDir, sessionID string, isPlanMode bool) *Session {
 	sess, ok := sessionDB.sessions[sessionID]
 	if !ok {
 		sess = loadSession(workDir, sessionID)
@@ -225,10 +251,13 @@ func getSession(sessionID string, workDir string, isPlanMode bool) *Session {
 		if len(sess.Messages) == 0 || sess.Messages[0].Role != schema.RoleSystem {
 			sess.View(sysPrompt)
 		}
+		sessionDB.sessions[sessionID] = sess
 	}
-	sessionDB.sessions[sessionID] = sess
 	return sess
 }
+
+// ID 返回会话 id，即 .laxcode/.session 下的目录名。
+func (s *Session) ID() string { return s.id }
 
 // warnHistoryBadLine 输出跳过坏行的警告，沿用项目控制台惯例（黄色 [LaxCode] 前缀）。
 func warnHistoryBadLine(path string, lineNo int, err error) {

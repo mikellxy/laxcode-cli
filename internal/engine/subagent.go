@@ -71,24 +71,24 @@ func (s *SubAgent) Execute(ctx context.Context, args json.RawMessage) (string, e
 		workDir = argsObj.WorkDir
 	}
 
-	id := "sub:" + time.Now().Format("20060102-150405.000") + "-" + s.Parent.SessionID
+	id := "sub:" + time.Now().Format("20060102-150405.000") + "-" + s.Parent.Session.ID()
 	reg := tools.NewDefaultRegistry()
 	reg.Register(tools.NewBashTool(workDir))
 	reg.Register(tools.NewReadFileTool(workDir))
-	agentEngine := NewAgentEngine(reg,
-		provider.NewOpenApiProvider(provider.Info{}),
-		workDir,
-		false,
-		id,
-	)
-	agentEngine.PrintLLM = PrintSubLLM
-	sess := getSession(id, workDir, false)
+	sess := GetSession(workDir, id, false)
 	sess.Append(schema.Message{
 		Role:    schema.RoleUser,
 		Content: argsObj.Task,
 	})
+	agentEngine := NewAgentEngine(reg,
+		NewMonitoredProvider(provider.NewOpenApiProvider(provider.Info{}), sess),
+		workDir,
+		false,
+		sess,
+	)
+	agentEngine.PrintLLM = PrintSubLLM
 
-	result, err := agentEngine.Run(ctx, sess)
+	result, err := agentEngine.Run(ctx)
 	if err != nil {
 		// 子 Agent 失败也要把已产出的部分结果交还父 Agent，供其判断补救方向
 		return fmt.Sprintf("sub agent failed: %v", err), nil
