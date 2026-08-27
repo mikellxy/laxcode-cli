@@ -6,12 +6,10 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
-
-	"github.com/mikellxy/laxcode/internal/env"
 )
 
 func TestWriteFileTool(t *testing.T) {
-	env.WorkDir = t.TempDir()
+	workDir := t.TempDir()
 	ctx := context.Background()
 	w := WriteFileTool{}
 
@@ -20,7 +18,7 @@ func TestWriteFileTool(t *testing.T) {
 		if _, err := w.Execute(ctx, args); err != nil {
 			t.Fatalf("create: %v", err)
 		}
-		b, err := os.ReadFile(filepath.Join(env.WorkDir, "a", "b", "c.txt"))
+		b, err := os.ReadFile(filepath.Join(workDir, "a", "b", "c.txt"))
 		if err != nil {
 			t.Fatalf("read back: %v", err)
 		}
@@ -30,7 +28,7 @@ func TestWriteFileTool(t *testing.T) {
 	})
 
 	t.Run("覆写已有文件", func(t *testing.T) {
-		target := filepath.Join(env.WorkDir, "exist.txt")
+		target := filepath.Join(workDir, "exist.txt")
 		if err := os.WriteFile(target, []byte("old"), 0o644); err != nil {
 			t.Fatalf("seed file: %v", err)
 		}

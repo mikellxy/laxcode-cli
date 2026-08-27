@@ -10,13 +10,22 @@ import (
 	"strings"
 
 	laxctx "github.com/mikellxy/laxcode/internal/context"
-	"github.com/mikellxy/laxcode/internal/env"
 	"github.com/mikellxy/laxcode/internal/schema"
 )
 
-type WriteFileTool struct{}
+type WriteFileTool struct {
+	WorkDir string
+}
 
-func (w WriteFileTool) Info(args json.RawMessage) string {
+func NewWriteFileTool(workDir string) *WriteFileTool {
+	return &WriteFileTool{WorkDir: workDir}
+}
+
+func (w *WriteFileTool) AfterExecInfo(message json.RawMessage) string {
+	return ""
+}
+
+func (w *WriteFileTool) BeforeExecInfo(args json.RawMessage) string {
 	argsMap := make(map[string]string)
 	if err := json.Unmarshal(args, &argsMap); err != nil {
 		return "write_file()"
@@ -29,13 +38,13 @@ func (w WriteFileTool) Info(args json.RawMessage) string {
 	return fmt.Sprintf("write_file(%s)", path)
 }
 
-func (w WriteFileTool) Name() string {
+func (w *WriteFileTool) Name() string {
 	return "write_file"
 }
 
-func (w WriteFileTool) Definition() schema.ToolDefinition {
+func (w *WriteFileTool) Definition() schema.ToolDefinition {
 	return schema.ToolDefinition{
-		Name:        "write_file",
+		Name:        w.Name(),
 		Description: "写入完整文件内容，创建新文件或覆写已有文件。**严格限制**只写入你的工作目录下的文件，提供文件在工作目录的相对路径；若父目录不存在会自动创建",
 		Parameters: map[string]any{
 			"type": "object",
@@ -54,7 +63,7 @@ func (w WriteFileTool) Definition() schema.ToolDefinition {
 	}
 }
 
-func (w WriteFileTool) Execute(ctx context.Context, args json.RawMessage) (string, error) {
+func (w *WriteFileTool) Execute(ctx context.Context, args json.RawMessage) (string, error) {
 	argsMap := make(map[string]string)
 	if err := json.Unmarshal(args, &argsMap); err != nil {
 		return "", laxctx.NewErrorWithPrompt(&laxctx.ParamError{}, err)
@@ -70,7 +79,7 @@ func (w WriteFileTool) Execute(ctx context.Context, args json.RawMessage) (strin
 		return "", laxctx.NewErrorWithPrompt(&laxctx.ParamError{}, errors.New("content required"))
 	}
 
-	target, err := safeJoinWorkDir(path)
+	target, err := safeJoinWorkDir(path, w.WorkDir)
 	if err != nil {
 		return "", laxctx.NewErrorWithPrompt(&laxctx.FilePathError{}, err)
 	}
@@ -85,7 +94,7 @@ func (w WriteFileTool) Execute(ctx context.Context, args json.RawMessage) (strin
 	}
 
 	// 返回相对工作目录的路径，便于模型确认
-	rel, err := filepath.Rel(env.WorkDir, target)
+	rel, err := filepath.Rel(w.WorkDir, target)
 	if err != nil {
 		rel = target
 	}

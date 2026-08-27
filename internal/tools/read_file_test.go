@@ -10,18 +10,16 @@ import (
 	"strconv"
 	"strings"
 	"testing"
-
-	"github.com/mikellxy/laxcode/internal/env"
 )
 
 func TestReadFileTool(t *testing.T) {
-	env.WorkDir = t.TempDir()
+	workDir := t.TempDir()
 	ctx := context.Background()
 	r := ReadFileTool{}
 
 	seed := func(rel, content string) string {
 		t.Helper()
-		target := filepath.Join(env.WorkDir, filepath.FromSlash(rel))
+		target := filepath.Join(workDir, filepath.FromSlash(rel))
 		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
 			t.Fatalf("seed mkdir: %v", err)
 		}

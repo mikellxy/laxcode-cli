@@ -34,7 +34,7 @@ func (p *OpenApiProvider) Info() *Info {
 	return &p.info
 }
 
-func (p *OpenApiProvider) Generate(ctx context.Context, msgs []schema.Message, toolsDefs []schema.ToolDefinition) ([]schema.Message, error) {
+func (p *OpenApiProvider) Generate(ctx context.Context, msgs []schema.Message, toolsDefs []schema.ToolDefinition) (*schema.Message, error) {
 	var inputParams responses.ResponseNewParamsInputUnion
 
 	for _, msg := range msgs {
@@ -97,9 +97,8 @@ func (p *OpenApiProvider) Generate(ctx context.Context, msgs []schema.Message, t
 	if err != nil {
 		return nil, err
 	}
-	var respMsgs []schema.Message
 
-	msg := schema.Message{
+	msg := &schema.Message{
 		Role:    schema.RoleAssistant,
 		Content: resp.OutputText(),
 		TokenUsed: schema.TokenStatistics{
@@ -125,7 +124,6 @@ func (p *OpenApiProvider) Generate(ctx context.Context, msgs []schema.Message, t
 			})
 		}
 	}
-	respMsgs = append(respMsgs, msg)
 
-	return respMsgs, nil
+	return msg, nil
 }

@@ -11,13 +11,22 @@ import (
 	"time"
 
 	laxctx "github.com/mikellxy/laxcode/internal/context"
-	"github.com/mikellxy/laxcode/internal/env"
 	"github.com/mikellxy/laxcode/internal/schema"
 )
 
-type BashTool struct{}
+type BashTool struct {
+	WorkDir string
+}
 
-func (b BashTool) Info(args json.RawMessage) string {
+func NewBashTool(workDir string) *BashTool {
+	return &BashTool{WorkDir: workDir}
+}
+
+func (b *BashTool) AfterExecInfo(message json.RawMessage) string {
+	return ""
+}
+
+func (b *BashTool) BeforeExecInfo(args json.RawMessage) string {
 	argsMap := make(map[string]string)
 	if err := json.Unmarshal(args, &argsMap); err != nil {
 		return "bash()"
@@ -30,13 +39,13 @@ func (b BashTool) Info(args json.RawMessage) string {
 	return fmt.Sprintf("bash(%s)", command)
 }
 
-func (b BashTool) Name() string {
+func (b *BashTool) Name() string {
 	return "bash"
 }
 
-func (b BashTool) Definition() schema.ToolDefinition {
+func (b *BashTool) Definition() schema.ToolDefinition {
 	return schema.ToolDefinition{
-		Name:        "bash",
+		Name:        b.Name(),
 		Description: "在工作目录执行 bash 命令",
 		Parameters: map[string]any{
 			"type": "object",
@@ -63,7 +72,7 @@ func (e *ExecResult) String() string {
 	return fmt.Sprintf(s, e.Desc, e.ExitCode, e.Truncated, e.Stdout)
 }
 
-func (b BashTool) Execute(ctx context.Context, args json.RawMessage) (string, error) {
+func (b *BashTool) Execute(ctx context.Context, args json.RawMessage) (string, error) {
 
 	argsMap := make(map[string]string)
 	if err := json.Unmarshal(args, &argsMap); err != nil {
@@ -78,7 +87,7 @@ func (b BashTool) Execute(ctx context.Context, args json.RawMessage) (string, er
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, "bash", "-c", command)
-	cmd.Dir = env.WorkDir
+	cmd.Dir = b.WorkDir
 	output, err := cmd.CombinedOutput()
 	result := &ExecResult{Desc: "命令执行成功", Stdout: string(output)}
 

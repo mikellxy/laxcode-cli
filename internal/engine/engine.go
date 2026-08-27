@@ -22,30 +22,23 @@ var errTooManyTurns = errors.New("too many turns")
 type AgentEngine struct {
 	ToolRegistry tools.Registry
 	Provider     provider.Provider
-	WorkingDir   string
+	WorkDir      string
+	PlanMode     bool
+	SessionID    string
 }
 
-func NewAgentEngine(toolRegistry tools.Registry, provider provider.Provider, workDir string) *AgentEngine {
+func NewAgentEngine(toolRegistry tools.Registry, provider provider.Provider, workDir string, planMode bool, sessID string) *AgentEngine {
 	return &AgentEngine{
 		ToolRegistry: toolRegistry,
 		Provider:     provider,
-		WorkingDir:   workDir,
+		WorkDir:      workDir,
+		PlanMode:     planMode,
+		SessionID:    sessID,
 	}
 }
 
-func (f *AgentEngine) TerminalLoop(ctx context.Context, sessionID string) error {
-	sess := getSession(sessionID)
-	if sess == nil {
-		return fmt.Errorf("session %q not found in session db (InitSessionDB not called?)", sessionID)
-	}
-
-	// 初始化system prompt，只做一次！后续多轮用户输入不再重复加system；
-	// 技能索引随启动时加载一次并注入，会话内不刷新。system prompt 不落盘，
-	// 每次启动重建，续聊时模板/技能变更即时生效
-	sysPrompt := laxctx.BuildSysPrompt(f.WorkingDir, laxctx.LoadSkills(f.WorkingDir), env.IsPlanMode, sessionID)
-	if len(sess.Messages) == 0 || sess.Messages[0].Role != schema.RoleSystem {
-		sess.View(sysPrompt)
-	}
+func TerminalLoop(ctx context.Context, agentEngine *AgentEngine) error {
+	sess := getSession(agentEngine.SessionID, agentEngine.WorkDir, agentEngine.PlanMode)
 
 	scanner := bufio.NewScanner(os.Stdin)
 	fmt.Println(">>> Agent ready, input your question, input exit to quit")
@@ -72,7 +65,7 @@ func (f *AgentEngine) TerminalLoop(ctx context.Context, sessionID string) error 
 			Content: userInput,
 		})
 
-		err := f.Run(ctx, sess)
+		err := agentEngine.Run(ctx, sess, nil)
 		if err != nil {
 			// warn too many turns
 			if errors.Is(err, errTooManyTurns) {
@@ -84,7 +77,7 @@ func (f *AgentEngine) TerminalLoop(ctx context.Context, sessionID string) error 
 	}
 }
 
-func (f *AgentEngine) Run(ctx context.Context, sess *Session) error {
+func (f *AgentEngine) Run(ctx context.Context, sess *Session, outCh chan<- string) error {
 	turnCnt := 0
 
 	for {
@@ -104,53 +97,52 @@ func (f *AgentEngine) Run(ctx context.Context, sess *Session) error {
 
 		// 历史唯一真相源是 session：Generate 前每轮重拼视图（system + 已有
 		// 历史 + 本轮新消息），产生的消息一律经 Append 写回，无 slice 别名回写
-		msgs, err := f.Provider.Generate(ctx, sess.Messages, f.ToolRegistry.GetAvailableTools())
+		msg, err := f.Provider.Generate(ctx, sess.Messages, f.ToolRegistry.GetAvailableTools())
 		if err != nil {
 			return fmt.Errorf("generating message: %w", err)
 		}
 
-		var toolCallCnt int
-		for _, msg := range msgs {
-			if msg.ReasoningContent != "" {
-				fmt.Printf("\033[90m[LaxCode] thinking: %s\033[0m\n", msg.ReasoningContent)
-			}
-			if len(msg.Content) > 0 {
-				fmt.Printf("\033[32m[LaxCode] LLM generates: %s\033[0m\n", msg.Content)
-			}
+		toolCallCnt := len(msg.ToolCalls)
+		if msg.ReasoningContent != "" {
+			fmt.Printf("\033[90m[LaxCode] thinking: %s\033[0m\n", msg.ReasoningContent)
+		}
+		if len(msg.Content) > 0 {
+			fmt.Printf("\033[32m[LaxCode] LLM generates: %s\033[0m\n", msg.Content)
+		}
 
-			toolCallCnt += len(msg.ToolCalls)
+		sess.Append(*msg)
 
-			sess.Append(msg)
-
-			for _, toolCall := range msg.ToolCalls {
-				toolResult := f.ToolRegistry.Execute(ctx, &toolCall)
-				content := toolResult.Output
-				if toolResult.Error != nil {
-					var sb strings.Builder
-					sb.WriteString(fmt.Sprintf("error executing tool %s: %s", toolCall.Name, toolResult.Error))
-					// 错误携带指引提示词时附到工具返回末尾，引导模型按 suggestion 修正
-					var promptErr laxctx.ErrorWithPrompt
-					if errors.As(toolResult.Error, &promptErr) {
-						if prompt, ok := promptErr.AsPrompt(); ok {
-							sb.WriteString("\n")
-							sb.WriteString(prompt)
-						}
+		for _, toolCall := range msg.ToolCalls {
+			toolResult := f.ToolRegistry.Execute(ctx, &toolCall)
+			content := toolResult.Output
+			if toolResult.Error != nil {
+				var sb strings.Builder
+				sb.WriteString(fmt.Sprintf("error executing tool %s: %s", toolCall.Name, toolResult.Error))
+				// 错误携带指引提示词时附到工具返回末尾，引导模型按 suggestion 修正
+				var promptErr laxctx.ErrorWithPrompt
+				if errors.As(toolResult.Error, &promptErr) {
+					if prompt, ok := promptErr.AsPrompt(); ok {
+						sb.WriteString("\n")
+						sb.WriteString(prompt)
 					}
-					// 工具报错时若仍有输出（如 shell 的 stderr/stdout），一并附上供模型定位问题
-					if len(toolResult.Output) > 0 {
-						sb.WriteString("\n以下为工具执行时的原始输出，供定位错误参考:\n")
-						sb.WriteString(toolResult.Output)
-					}
-					content = sb.String()
 				}
-				sess.Append(schema.Message{
-					Role:       schema.RoleUser,
-					Content:    content,
-					ToolCallID: toolResult.ToolCallID,
-				})
+				// 工具报错时若仍有输出（如 shell 的 stderr/stdout），一并附上供模型定位问题
+				if len(toolResult.Output) > 0 {
+					sb.WriteString("\n以下为工具执行时的原始输出，供定位错误参考:\n")
+					sb.WriteString(toolResult.Output)
+				}
+				content = sb.String()
 			}
+			sess.Append(schema.Message{
+				Role:       schema.RoleUser,
+				Content:    content,
+				ToolCallID: toolResult.ToolCallID,
+			})
 		}
 		if toolCallCnt == 0 {
+			if outCh != nil {
+				outCh <- msg.Content
+			}
 			break
 		}
 	}

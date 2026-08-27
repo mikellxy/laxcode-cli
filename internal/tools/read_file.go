@@ -25,9 +25,18 @@ const (
 )
 
 type ReadFileTool struct {
+	WorkDir string `json:"work_dir"`
 }
 
-func (r ReadFileTool) Info(args json.RawMessage) string {
+func NewReadFileTool(workDir string) *ReadFileTool {
+	return &ReadFileTool{WorkDir: workDir}
+}
+
+func (r *ReadFileTool) AfterExecInfo(message json.RawMessage) string {
+	return ""
+}
+
+func (r *ReadFileTool) BeforeExecInfo(args json.RawMessage) string {
 	var argsObj readFileToolArgs
 	if err := json.Unmarshal(args, &argsObj); err != nil {
 		return "read_file()"
@@ -39,13 +48,13 @@ func (r ReadFileTool) Info(args json.RawMessage) string {
 	return fmt.Sprintf("read_file(path=%s, start_line_no=%d, start_bytes=%d)", argsObj.Path, argsObj.StartLineNo, argsObj.StartBytes)
 }
 
-func (r ReadFileTool) Name() string {
+func (r *ReadFileTool) Name() string {
 	return "read_file"
 }
 
-func (r ReadFileTool) Definition() schema.ToolDefinition {
+func (r *ReadFileTool) Definition() schema.ToolDefinition {
 	return schema.ToolDefinition{
-		Name:        "read_file",
+		Name:        r.Name(),
 		Description: "读取文件内容。 **严格限制**只读取你的工作目录下的文件，提供文件在工作目录的相对路径。单次最多返回 2000 行且内容不超过 50KB，输出末尾以 (...) 标注是否读完、最后一行行号及续读参数，未读完时按标注的 start_line_no/start_bytes 续读",
 		Parameters: map[string]any{
 			"type": "object",
@@ -70,7 +79,7 @@ func (r ReadFileTool) Definition() schema.ToolDefinition {
 	}
 }
 
-func (r ReadFileTool) Execute(ctx context.Context, args json.RawMessage) (string, error) {
+func (r *ReadFileTool) Execute(ctx context.Context, args json.RawMessage) (string, error) {
 	var argsObj readFileToolArgs
 	if err := json.Unmarshal(args, &argsObj); err != nil {
 		return "", laxctx.NewErrorWithPrompt(&laxctx.ParamError{}, err)
@@ -80,7 +89,7 @@ func (r ReadFileTool) Execute(ctx context.Context, args json.RawMessage) (string
 		return "", laxctx.NewErrorWithPrompt(&laxctx.ParamError{}, errors.New("path required"))
 	}
 
-	pathSafe, err := safeJoinWorkDir(argsObj.Path)
+	pathSafe, err := safeJoinWorkDir(argsObj.Path, r.WorkDir)
 	if err != nil {
 		return "", laxctx.NewErrorWithPrompt(&laxctx.FilePathError{}, err)
 	}

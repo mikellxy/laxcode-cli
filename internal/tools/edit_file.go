@@ -11,13 +11,22 @@ import (
 	"strings"
 
 	laxctx "github.com/mikellxy/laxcode/internal/context"
-	"github.com/mikellxy/laxcode/internal/env"
 	"github.com/mikellxy/laxcode/internal/schema"
 )
 
-type EditFileTool struct{}
+type EditFileTool struct {
+	WorkDir string
+}
 
-func (e EditFileTool) Info(args json.RawMessage) string {
+func NewEditFileTool(workDir string) *EditFileTool {
+	return &EditFileTool{WorkDir: workDir}
+}
+
+func (e *EditFileTool) AfterExecInfo(message json.RawMessage) string {
+	return ""
+}
+
+func (e *EditFileTool) BeforeExecInfo(args json.RawMessage) string {
 	argsMap := make(map[string]string)
 	if err := json.Unmarshal(args, &argsMap); err != nil {
 		return "edit_file()"
@@ -30,13 +39,13 @@ func (e EditFileTool) Info(args json.RawMessage) string {
 	return fmt.Sprintf("edit_file(%s)", path)
 }
 
-func (e EditFileTool) Name() string {
+func (e *EditFileTool) Name() string {
 	return "edit_file"
 }
 
-func (e EditFileTool) Definition() schema.ToolDefinition {
+func (e *EditFileTool) Definition() schema.ToolDefinition {
 	return schema.ToolDefinition{
-		Name:        "edit_file",
+		Name:        e.Name(),
 		Description: "替换文件中已有的文本片段。old_text 必须与文件内容精确一致且在文件中唯一；若报错多处匹配请扩大 old_text 加入上下文行，若未匹配请重新 read_file 确认内容。文件必须已存在，新建文件请使用 write_file。**严格限制**只编辑工作目录内的文件，提供相对路径",
 		Parameters: map[string]any{
 			"type": "object",
@@ -59,7 +68,7 @@ func (e EditFileTool) Definition() schema.ToolDefinition {
 	}
 }
 
-func (e EditFileTool) Execute(ctx context.Context, args json.RawMessage) (string, error) {
+func (e *EditFileTool) Execute(ctx context.Context, args json.RawMessage) (string, error) {
 	argsMap := make(map[string]string)
 	if err := json.Unmarshal(args, &argsMap); err != nil {
 		return "", err
@@ -78,7 +87,7 @@ func (e EditFileTool) Execute(ctx context.Context, args json.RawMessage) (string
 		return "", laxctx.NewErrorWithPrompt(&laxctx.ParamError{}, errors.New("new_text required"))
 	}
 
-	target, err := safeJoinWorkDir(path)
+	target, err := safeJoinWorkDir(path, e.WorkDir)
 	if err != nil {
 		return "", err
 	}
@@ -101,7 +110,7 @@ func (e EditFileTool) Execute(ctx context.Context, args json.RawMessage) (string
 		return "", laxctx.NewErrorWithPrompt(&laxctx.FileIOError{}, err)
 	}
 
-	rel, err := filepath.Rel(env.WorkDir, target)
+	rel, err := filepath.Rel(e.WorkDir, target)
 	if err != nil {
 		rel = target
 	}
@@ -111,8 +120,8 @@ func (e EditFileTool) Execute(ctx context.Context, args json.RawMessage) (string
 
 // safeJoinWorkDir 将用户提供的相对路径安全地解析到工作目录内，
 // 防止 ../ 路径穿越或绝对路径逃逸到工作目录之外。
-func safeJoinWorkDir(rel string) (string, error) {
-	workDirAbs, err := filepath.Abs(env.WorkDir)
+func safeJoinWorkDir(rel string, workDir string) (string, error) {
+	workDirAbs, err := filepath.Abs(workDir)
 	if err != nil {
 		return "", fmt.Errorf("resolve work dir: %w", err)
 	}

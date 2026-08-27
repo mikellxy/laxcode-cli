@@ -1,0 +1,109 @@
+package engine
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"time"
+
+	laxctx "github.com/mikellxy/laxcode/internal/context"
+	"github.com/mikellxy/laxcode/internal/provider"
+	"github.com/mikellxy/laxcode/internal/schema"
+	"github.com/mikellxy/laxcode/internal/tools"
+)
+
+type SubAgent struct {
+	Parent *AgentEngine
+	OutCh  chan string
+}
+
+func NewSubAgent(parent *AgentEngine) *SubAgent {
+	return &SubAgent{
+		Parent: parent,
+		OutCh:  make(chan string),
+	}
+}
+
+func (s *SubAgent) Name() string {
+	return "run_sub_agent"
+}
+
+func (s *SubAgent) Definition() schema.ToolDefinition {
+	return schema.ToolDefinition{
+		Name:        s.Name(),
+		Description: "启动一个独立子Agent去完成一项子任务。适合复杂、耗时、可以拆分出去的独立工作。不要用来执行简短命令。子Agent会自动生成报告，完成后返回结果。不要传入父对话全部历史。",
+		Parameters: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"task": map[string]any{
+					"type":        "string",
+					"description": "清晰、完整、独立的子任务描述。不要引用父对话模糊代词。任务必须不需要依赖父Agent上下文即可执行。",
+				},
+				"work_dir": map[string]any{
+					"type":        "string",
+					"description": "子Agent工作目录，不传默认继承父Agent工作目录",
+				},
+				"abstract": map[string]any{
+					"type":        "string",
+					"description": "一句话的子任务描述的摘要，50字以内",
+				},
+			},
+			"required": []string{"task", "abstract"},
+		},
+	}
+}
+
+type SubAgentArgs struct {
+	Task     string `json:"task"`
+	WorkDir  string `json:"work_dir"`
+	Abstract string `json:"abstract"`
+}
+
+func (s *SubAgent) Execute(ctx context.Context, args json.RawMessage) (string, error) {
+	var argsObj SubAgentArgs
+	if err := json.Unmarshal(args, &argsObj); err != nil {
+		return "", laxctx.NewErrorWithPrompt(&laxctx.ParamError{}, err)
+	}
+	if argsObj.Task == "" {
+		return "", laxctx.NewErrorWithPrompt(&laxctx.ParamError{}, errors.New("task required"))
+	}
+	workDir := s.Parent.WorkDir
+	if argsObj.WorkDir != "" {
+		workDir = argsObj.WorkDir
+	}
+
+	id := "sub:" + time.Now().Format("20060102-150405.000") + "-" + s.Parent.SessionID
+	reg := tools.NewDefaultRegistry()
+	reg.Register(tools.NewBashTool(workDir))
+	reg.Register(tools.NewReadFileTool(workDir))
+	agentEngine := NewAgentEngine(reg,
+		provider.NewOpenApiProvider(provider.Info{Name: "deepseek"}),
+		workDir,
+		false,
+		id,
+	)
+	sess := getSession(id, workDir, false)
+	sess.Append(schema.Message{
+		Role:    schema.RoleUser,
+		Content: argsObj.Task,
+	})
+
+	if err := agentEngine.Run(ctx, sess, s.OutCh); err != nil {
+		return "", nil
+	}
+
+	return <-s.OutCh, nil
+}
+
+func (s *SubAgent) BeforeExecInfo(message json.RawMessage) string {
+	var argsObj SubAgentArgs
+	_ = json.Unmarshal(message, &argsObj)
+	if argsObj.Abstract == "" {
+		return "sub agent run to explore..."
+	}
+	return "sub agent run to explore: " + argsObj.Abstract
+}
+
+func (s *SubAgent) AfterExecInfo(message json.RawMessage) string {
+	return ""
+}

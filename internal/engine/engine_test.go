@@ -35,7 +35,7 @@ func TestMianLoop_GenerateWithTool(t *testing.T) {
 				sess := newSession(t.TempDir(), "test-session")
 				sess.Append(schema.Message{Role: schema.RoleUser, Content: "main_loop.go文件中实现了什么功能"})
 
-				sysPrompt := laxctx.BuildSysPrompt(e.WorkingDir, laxctx.LoadSkills(e.WorkingDir), false, "test-session")
+				sysPrompt := laxctx.BuildSysPrompt(e.WorkDir, laxctx.LoadSkills(e.WorkDir), false, "test-session")
 				sess.View(sysPrompt)
 				if err := e.Run(context.Background(), sess); err != nil {
 					t.Fatal(err)

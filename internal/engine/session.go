@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 
+	laxctx "github.com/mikellxy/laxcode/internal/context"
 	"github.com/mikellxy/laxcode/internal/schema"
 )
 
@@ -209,19 +210,24 @@ var sessionDB *SessionDB
 // InitSessionDB 初始化全局会话库并仅加载 sessionID 对应的一个 session：
 // 其 history.jsonl 存在则恢复历史（续聊），否则以该 id 新建空 session。
 // 本版不扫描、不加载其他任何 session。
-func InitSessionDB(workDir, sessionID string) {
+func InitSessionDB() {
 	db := &SessionDB{sessions: make(map[string]*Session)}
-	db.sessions[sessionID] = loadSession(workDir, sessionID)
 	sessionDB = db
 }
 
 // getSession 按 id 从全局会话库查询 session，供 Loop 使用；
 // 库未初始化或 id 不存在时返回 nil，由调用方决定如何处置。
-func getSession(sessionID string) *Session {
-	if sessionDB == nil {
-		return nil
+func getSession(sessionID string, workDir string, isPlanMode bool) *Session {
+	sess, ok := sessionDB.sessions[sessionID]
+	if !ok {
+		sess = loadSession(workDir, sessionID)
+		sysPrompt := laxctx.BuildSysPrompt(workDir, laxctx.LoadSkills(workDir), isPlanMode, sessionID)
+		if len(sess.Messages) == 0 || sess.Messages[0].Role != schema.RoleSystem {
+			sess.View(sysPrompt)
+		}
 	}
-	return sessionDB.sessions[sessionID]
+	sessionDB.sessions[sessionID] = sess
+	return sess
 }
 
 // warnHistoryBadLine 输出跳过坏行的警告，沿用项目控制台惯例（黄色 [LaxCode] 前缀）。
