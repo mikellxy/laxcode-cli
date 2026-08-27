@@ -81,6 +81,7 @@ func (s *SubAgent) Execute(ctx context.Context, args json.RawMessage) (string, e
 		false,
 		id,
 	)
+	agentEngine.PrintLLM = PrintSubLLM
 	sess := getSession(id, workDir, false)
 	sess.Append(schema.Message{
 		Role:    schema.RoleUser,

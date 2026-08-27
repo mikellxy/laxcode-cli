@@ -25,6 +25,9 @@ type AgentEngine struct {
 	WorkDir      string
 	PlanMode     bool
 	SessionID    string
+	// PrintLLM 打印 assistant 消息（thinking + 正文），构造时默认主 Agent
+	// 配色，子 Agent 覆盖为紫色；Run 只经它输出，与展示样式解耦。
+	PrintLLM func(msg *schema.Message)
 }
 
 func NewAgentEngine(toolRegistry tools.Registry, provider provider.Provider, workDir string, planMode bool, sessID string) *AgentEngine {
@@ -34,6 +37,7 @@ func NewAgentEngine(toolRegistry tools.Registry, provider provider.Provider, wor
 		WorkDir:      workDir,
 		PlanMode:     planMode,
 		SessionID:    sessID,
+		PrintLLM:     PrintMainLLM,
 	}
 }
 
@@ -105,12 +109,7 @@ func (f *AgentEngine) Run(ctx context.Context, sess *Session) (string, error) {
 		}
 
 		toolCallCnt := len(msg.ToolCalls)
-		if msg.ReasoningContent != "" {
-			fmt.Printf("\033[90m[LaxCode] thinking: %s\033[0m\n", msg.ReasoningContent)
-		}
-		if len(msg.Content) > 0 {
-			fmt.Printf("\033[32m[LaxCode] LLM generates: %s\033[0m\n", msg.Content)
-		}
+		f.PrintLLM(msg)
 
 		sess.Append(*msg)
 
