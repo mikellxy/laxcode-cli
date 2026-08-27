@@ -39,7 +39,7 @@ func (r *ReadFileTool) AfterExecInfo(message json.RawMessage) string {
 func (r *ReadFileTool) BeforeExecInfo(args json.RawMessage) string {
 	var argsObj readFileToolArgs
 	if err := json.Unmarshal(args, &argsObj); err != nil {
-		return "read_file()"
+		return ToolReadFile + "()"
 	}
 	if argsObj.Path == "" {
 		return ToolReadFile + "()"

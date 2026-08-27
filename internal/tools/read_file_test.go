@@ -15,7 +15,7 @@ import (
 func TestReadFileTool(t *testing.T) {
 	workDir := t.TempDir()
 	ctx := context.Background()
-	r := ReadFileTool{}
+	r := NewReadFileTool(workDir)
 
 	seed := func(rel, content string) string {
 		t.Helper()

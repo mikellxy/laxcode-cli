@@ -11,7 +11,7 @@ import (
 func TestWriteFileTool(t *testing.T) {
 	workDir := t.TempDir()
 	ctx := context.Background()
-	w := WriteFileTool{}
+	w := NewWriteFileTool(workDir)
 
 	t.Run("创建新文件并自动创建父目录", func(t *testing.T) {
 		args, _ := json.Marshal(map[string]string{"path": "a/b/c.txt", "content": "hello"})

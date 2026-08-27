@@ -174,7 +174,7 @@ func TestMatchLines(t *testing.T) {
 func TestEditFileTool(t *testing.T) {
 	workDir := t.TempDir()
 	ctx := context.Background()
-	e := EditFileTool{}
+	e := NewEditFileTool(workDir)
 
 	seed := func(rel, content string) string {
 		t.Helper()
