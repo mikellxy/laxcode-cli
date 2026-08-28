@@ -5,6 +5,9 @@
 </div>
 
 # LaxCode
+
+[![Tests](https://github.com/mikellxy/laxcode/actions/workflows/test.yml/badge.svg)](https://github.com/mikellxy/laxcode/actions/workflows/test.yml)
+
 LaxCode 是一个用 Go 实现的轻量 AI Agent。它不依赖任何第三方 Agent 框架。基于 ReAct 推理循环，支持**工具调用、子 Agent 委派、上下文压缩、会话持久化与断点续聊、tracing 监控扩展**。
 
 ## 目录

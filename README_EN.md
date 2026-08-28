@@ -5,6 +5,9 @@
 </div>
 
 # LaxCode
+
+[![Tests](https://github.com/mikellxy/laxcode/actions/workflows/test.yml/badge.svg)](https://github.com/mikellxy/laxcode/actions/workflows/test.yml)
+
 LaxCode is a lightweight AI Agent implemented in Go. It does not depend on any third-party agent framework. Built on the ReAct reasoning loop, it supports **tool calling, sub-agent delegation, context compaction, session persistence & resume, and tracing extensions**.
 
 ## Table of Contents

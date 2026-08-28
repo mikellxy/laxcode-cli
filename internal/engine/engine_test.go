@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"os"
 	"testing"
 
 	laxctx "github.com/mikellxy/laxcode/internal/context"
@@ -11,6 +12,11 @@ import (
 )
 
 func TestMianLoop_GenerateWithTool(t *testing.T) {
+	// 集成测试：真实调用 LLM API，需本地配置 API 凭证后通过
+	// LAXCODE_INTEGRATION=1 显式开启，默认跳过（如 CI 环境）
+	if os.Getenv("LAXCODE_INTEGRATION") == "" {
+		t.Skip("skipping integration test; set LAXCODE_INTEGRATION=1 to run")
+	}
 	t.Parallel()
 	providers := []provider.Provider{
 		provider.NewOpenApiProvider(provider.Info{Name: "deepseek openai"}),

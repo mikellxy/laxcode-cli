@@ -2,6 +2,7 @@ package provider
 
 import (
 	"context"
+	"os"
 	"testing"
 
 	"github.com/mikellxy/laxcode/internal/schema"
@@ -9,6 +10,11 @@ import (
 )
 
 func TestOpenAIProvider_GenerateWithTool(t *testing.T) {
+	// 集成测试：真实调用 LLM API，需本地配置 API 凭证后通过
+	// LAXCODE_INTEGRATION=1 显式开启，默认跳过（如 CI 环境）
+	if os.Getenv("LAXCODE_INTEGRATION") == "" {
+		t.Skip("skipping integration test; set LAXCODE_INTEGRATION=1 to run")
+	}
 	t.Parallel()
 	testSet := []struct {
 		name         string
