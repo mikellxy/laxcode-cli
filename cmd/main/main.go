@@ -14,6 +14,7 @@ import (
 	"github.com/mikellxy/laxcode/internal/provider"
 	"github.com/mikellxy/laxcode/internal/tools"
 	"github.com/mikellxy/laxcode/internal/tracing"
+	_ "github.com/mikellxy/laxcode/internal/tracing/custom"
 	"github.com/mikellxy/laxcode/internal/tracing/filetrace"
 	"go.opentelemetry.io/otel/trace"
 )
@@ -31,6 +32,7 @@ func main() {
 	taskFile := config.String(config.Item{Flag: "TASK-FILE", Usage: "one-shot task prompt file path; takes precedence over -task"})
 	workdir := config.String(config.Item{Flag: "WORKDIR", Usage: "working directory; required in one-shot mode, defaults to cwd otherwise"})
 	verbose := config.Bool(config.Item{Flag: "VERBOSE", Usage: "one-shot mode: print intermediate progress to stderr"})
+	traceHandleName := config.String(config.Item{Flag: "trace_hanle_name", Usage: "one-shot task prompt file path; takes precedence over -task"})
 	if err := config.Parse(); err != nil {
 		panic(err)
 	}
@@ -53,6 +55,9 @@ func main() {
 	// 若文件无法创建则回退到 noop，并在 stderr 提示。
 	logPath := filepath.Join(workDir, ".laxcode", ".session", sessID, "log", "tracing.log")
 	traceHandle := newTraceHandle(logPath)
+	if h, ok := tracing.HandleDB[traceHandleName.Get()]; ok {
+		traceHandle = h
+	}
 	defer func() { _ = traceHandle.Shutdown(context.Background()) }()
 
 	agentEngine, err := assembleEngine(workDir, sessID, planMode.Get(), traceHandle.Tracer)
