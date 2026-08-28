@@ -1,6 +1,15 @@
 # LaxCode
 LaxCode 是一个用 Go 实现的轻量 AI Agent。它不依赖任何第三方 Agent 框架。基于 ReAct 推理循环，支持**工具调用、子 Agent 委派、上下文压缩、会话持久化与断点续聊、tracing 监控扩展**。
 
+## 目录
+- [1. 使用](#1-使用)
+- [2. session 管理](#2-session-管理)
+- [3. 工具](#3-工具)
+- [4. 上下文压缩](#4-上下文压缩)
+- [5. Plan Mode](#5-plan-mode)
+- [6. Tracing 扩展](#6-tracing-扩展)
+- [7. 架构](#7-架构)
+
 ## 1. 使用
 ### 1.1 Go 版本
 * **Go version**: LaxCode requires Go version 1.26 or above
@@ -157,7 +166,17 @@ LaxCode 在 ReAct 循环中完整实现 openai function call 协议。启动时�
 3. 逐条执行，**真正完成一条才能打钩**，禁止提前打钩、虚构完成；
 4. 全部完成后将两份文档归档到 `archive/<任务名>/`。
 
-## 6. 架构
+## 6. Tracing 扩展
+laxcode 只依赖 OpenTelemetry API 模块，本体不提供真实上报后端的实现。默认由内置 filetrace 把 span 以 JSON Lines 落盘到 `${workdir}/.laxcode/.session/${session_id}/log/tracing.log`（见 2.1 节）。如需把 trace 上报到自建监控后端，按以下规范实现自定义 Handle：
+
+1. 实现 `trace.TracerProvider` / `trace.Tracer` / `trace.Span` 三个接口。接口是密封的（含未导出标记方法），须内嵌 `go.opentelemetry.io/otel/trace/embedded` 包中的对应接口来满足。`Span.End()` 是上报触发点——每次 span 结束被同步调用一次，实现内不要做阻塞 IO（建议只入队，后台 goroutine 批量发送）。
+2. 入口文件放入 `internal/tracing/custom/` 包，在 `func init()` 中调用 `tracing.Register("<name>", tracing.New(provider))` 注册——main.go 已空导入该包，init 随进程启动自动执行。
+3. provider 实现 `Shutdown(context.Context) error` 方法时，进程退出前会被自动探测调用，用于 flush 尾部 span（one-shot 进程存活时间可能短于批量导出周期，必须靠它兜底）。
+4. 启动时加 `-trace_hanle_name=<name>` 选用注册的实现；缺省为 filetrace 本地落盘（当前仅终端交互模式支持该参数选用）。
+
+完整可编译示例（OTLP/HTTP JSON 批量上报至 Jaeger / Tempo / otel-collector 等协议兼容后端）见 [examples/tracing/](examples/tracing/)：拷入 `internal/tracing/custom/` 重新编译即可用。
+
+## 7. 架构
 ```
 LaxCode/
 ├── cmd/main/              # 入口：装配 registry、provider、engine
