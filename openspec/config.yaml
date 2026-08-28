@@ -11,5 +11,6 @@ context: |
     memory   = 基于文件系统的记忆存取
     feishu   = 飞书机器人交互回调
     printer  = 人类可读输出统一收口（Printer 接口 + 实例注入）
+    tracing  = OTel 埋点语义约定、Tracer 注入与生命周期钩子
   Convention: 新功能必须归入上述 internal 子包，不新增顶层目录
   Full details: README.md

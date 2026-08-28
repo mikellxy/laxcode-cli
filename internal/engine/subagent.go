@@ -12,6 +12,7 @@ import (
 	"github.com/mikellxy/laxcode/internal/provider"
 	"github.com/mikellxy/laxcode/internal/schema"
 	"github.com/mikellxy/laxcode/internal/tools"
+	"github.com/mikellxy/laxcode/internal/tracing"
 )
 
 type SubAgent struct {
@@ -73,7 +74,9 @@ func (s *SubAgent) Execute(ctx context.Context, args json.RawMessage) (string, e
 	}
 
 	id := "sub:" + time.Now().Format("20060102-150405.000") + "-" + s.Parent.Session.ID()
-	reg := tools.NewDefaultRegistry(s.Parent.Printer)
+	// 子 Agent 继承父引擎的 Tracer：子 run 的 span 树经 ctx 嵌套在
+	// 本次 sub_agent 的 tool-exec span 下，保持同一 trace
+	reg := tools.NewDefaultRegistry(s.Parent.Printer, s.Parent.Tracer)
 	reg.Register(tools.NewBashTool(workDir))
 	reg.Register(tools.NewReadFileTool(workDir))
 	sess := GetSession(workDir, id, false)
@@ -86,7 +89,9 @@ func (s *SubAgent) Execute(ctx context.Context, args json.RawMessage) (string, e
 		workDir,
 		false,
 		sess,
+		s.Parent.Tracer,
 	)
+	agentEngine.Role = tracing.AgentRoleSub
 	// 子 Agent 配色统一紫色，目的地继承父实例（one-shot 下随之静默/进 stderr）
 	agentEngine.Printer = s.Parent.Printer.WithColors(printer.ColorPurple, printer.ColorPurple)
 

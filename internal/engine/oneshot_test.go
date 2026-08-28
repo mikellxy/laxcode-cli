@@ -36,7 +36,7 @@ func (m *mockProvider) Info() *provider.Info { return &provider.Info{Name: "mock
 // 均走 DiscardPrinter，避免测试输出被中间过程污染。
 func newOneShotEngine(t *testing.T, sess *Session, p provider.Provider) *AgentEngine {
 	t.Helper()
-	eng := NewAgentEngine(tools.NewDefaultRegistry(printer.DiscardPrinter{}), p, t.TempDir(), false, sess)
+	eng := NewAgentEngine(tools.NewDefaultRegistry(printer.DiscardPrinter{}, nil), p, t.TempDir(), false, sess, nil)
 	eng.Printer = printer.DiscardPrinter{}
 	return eng
 }

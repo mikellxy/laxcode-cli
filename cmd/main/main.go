@@ -13,6 +13,8 @@ import (
 	"github.com/mikellxy/laxcode/internal/printer"
 	"github.com/mikellxy/laxcode/internal/provider"
 	"github.com/mikellxy/laxcode/internal/tools"
+	"github.com/mikellxy/laxcode/internal/tracing"
+	"go.opentelemetry.io/otel/trace"
 )
 
 func main() {
@@ -41,7 +43,13 @@ func main() {
 		workDir, _ = os.Getwd()
 	}
 
-	agentEngine, id, err := assembleEngine(workDir, sessionID.Get(), planMode.Get())
+	// 追踪默认 noop（零开销无输出）；接入真实后端时以自定义
+	// TracerProvider 替换 tracing.New(nil)。defer 保证主循环返回后、
+	// 进程退出前 flush 尾部 span。
+	traceHandle := tracing.New(nil)
+	defer func() { _ = traceHandle.Shutdown(context.Background()) }()
+
+	agentEngine, id, err := assembleEngine(workDir, sessionID.Get(), planMode.Get(), traceHandle.Tracer)
 	if err != nil {
 		panic(err)
 	}
@@ -58,6 +66,12 @@ func main() {
 // 0 成功；1 运行失败（generate/too_many_turns）；2 用法错误。
 // 错误一律走 stdout 的结构化 JSON + exit code，不 panic。
 func runOneShot(taskText, taskFilePath, workDirFlag, sessionID string, planMode, verbose bool) int {
+	// one-shot 进程存活时间可能短于批量导出间隔：defer 保证 Shutdown
+	// 在 runOneShot 返回（结果 JSON 已写出）后、os.Exit 前执行，
+	// 强制 flush 尾部 span；默认 noop 下为空操作。
+	traceHandle := tracing.New(nil)
+	defer func() { _ = traceHandle.Shutdown(context.Background()) }()
+
 	// 输出闸门必须先于引擎装配：随后 NewAgentEngine/NewDefaultRegistry
 	// 默认取 printer.Default()，散点警告同源，中间过程整体静默或进 stderr，
 	// stdout 只剩 OneShotLoop 直写的契约 JSON。
@@ -83,7 +97,7 @@ func runOneShot(taskText, taskFilePath, workDirFlag, sessionID string, planMode,
 		return usageFail("one-shot mode requires a non-empty prompt from -task or -task-file")
 	}
 
-	agentEngine, _, err := assembleEngine(workDirFlag, sessionID, planMode)
+	agentEngine, _, err := assembleEngine(workDirFlag, sessionID, planMode, traceHandle.Tracer)
 	if err != nil {
 		return usageFail("init engine in %s failed: %v", workDirFlag, err)
 	}
@@ -110,8 +124,9 @@ func loadTaskPrompt(taskText, taskFilePath string) (string, error) {
 
 // assembleEngine 完成两个前端 loop（TerminalLoop/OneShotLoop）共用的装配：
 // session 目录创建、session id 决定、工具注册（含 sub agent）、会话加载
-// （GetSession 重放历史，天然支持 -session 续聊）与监控 provider。
-func assembleEngine(workDir, sessionID string, planMode bool) (*engine.AgentEngine, string, error) {
+// （GetSession 重放历史，天然支持 -session 续聊）、监控 provider 与追踪
+// 注入（tracer 为 nil 时引擎与注册表内部缺省 noop）。
+func assembleEngine(workDir, sessionID string, planMode bool, tracer trace.Tracer) (*engine.AgentEngine, string, error) {
 	if err := os.MkdirAll(filepath.Join(workDir, ".laxcode", ".session"), 0755); err != nil {
 		return nil, "", err
 	}
@@ -121,7 +136,7 @@ func assembleEngine(workDir, sessionID string, planMode bool) (*engine.AgentEngi
 		id = time.Now().Format("20060102-150405.000")
 	}
 
-	reg := tools.NewDefaultRegistry(nil)
+	reg := tools.NewDefaultRegistry(nil, tracer)
 	reg.Register(tools.NewBashTool(workDir))
 	reg.Register(tools.NewWriteFileTool(workDir))
 	reg.Register(tools.NewReadFileTool(workDir))
@@ -132,6 +147,7 @@ func assembleEngine(workDir, sessionID string, planMode bool) (*engine.AgentEngi
 		workDir,
 		planMode,
 		sess,
+		tracer,
 	)
 	reg.Register(engine.NewSubAgent(agentEngine))
 	return agentEngine, id, nil
