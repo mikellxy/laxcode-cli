@@ -8,6 +8,7 @@ import (
 	"time"
 
 	laxctx "github.com/mikellxy/laxcode/internal/context"
+	"github.com/mikellxy/laxcode/internal/printer"
 	"github.com/mikellxy/laxcode/internal/provider"
 	"github.com/mikellxy/laxcode/internal/schema"
 	"github.com/mikellxy/laxcode/internal/tools"
@@ -72,7 +73,7 @@ func (s *SubAgent) Execute(ctx context.Context, args json.RawMessage) (string, e
 	}
 
 	id := "sub:" + time.Now().Format("20060102-150405.000") + "-" + s.Parent.Session.ID()
-	reg := tools.NewDefaultRegistry()
+	reg := tools.NewDefaultRegistry(s.Parent.Printer)
 	reg.Register(tools.NewBashTool(workDir))
 	reg.Register(tools.NewReadFileTool(workDir))
 	sess := GetSession(workDir, id, false)
@@ -86,7 +87,8 @@ func (s *SubAgent) Execute(ctx context.Context, args json.RawMessage) (string, e
 		false,
 		sess,
 	)
-	agentEngine.PrintLLM = PrintSubLLM
+	// 子 Agent 配色统一紫色，目的地继承父实例（one-shot 下随之静默/进 stderr）
+	agentEngine.Printer = s.Parent.Printer.WithColors(printer.ColorPurple, printer.ColorPurple)
 
 	result, err := agentEngine.Run(ctx)
 	if err != nil {

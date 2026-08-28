@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/mikellxy/laxcode/internal/printer"
 	"github.com/mikellxy/laxcode/internal/schema"
 )
 
@@ -25,11 +26,19 @@ type BaseTool interface {
 
 type DefaultRegistry struct {
 	db map[string]BaseTool
+	// printer 输出工具执行前提示；工具调用提示的宿主是 registry
+	// （BeforeExecInfo 是 tool 的方法、tool 查找在此进行，engine 拿不到
+	// tool 实例），故经构造注入输出实例。nil 时取包级默认实例。
+	printer printer.Printer
 }
 
-func NewDefaultRegistry() *DefaultRegistry {
+func NewDefaultRegistry(p printer.Printer) *DefaultRegistry {
+	if p == nil {
+		p = printer.Default()
+	}
 	return &DefaultRegistry{
-		db: make(map[string]BaseTool),
+		db:      make(map[string]BaseTool),
+		printer: p,
 	}
 }
 
@@ -52,7 +61,7 @@ func (d *DefaultRegistry) Execute(ctx context.Context, toolCall *schema.ToolCall
 		}
 	}
 
-	fmt.Printf("\033[33m[LaxCode] tool execute... %s\033[0m\n", tool.BeforeExecInfo(toolCall.Arguments))
+	d.printer.PrintToolCall(tool.BeforeExecInfo(toolCall.Arguments))
 
 	output, err := tool.Execute(ctx, toolCall.Arguments)
 	if err != nil {

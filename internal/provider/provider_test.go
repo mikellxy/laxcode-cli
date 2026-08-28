@@ -21,7 +21,7 @@ func TestOpenAIProvider_GenerateWithTool(t *testing.T) {
 			msgs: []schema.Message{
 				{Role: schema.RoleUser, Content: "internal/tools/read_file.go文件实现了什么功能"},
 			},
-			toolRegistry: tools.NewDefaultRegistry(),
+			toolRegistry: tools.NewDefaultRegistry(nil),
 			providers: []Provider{
 				//NewOpenApiProvider(Info{Name: "deepseek anthropic"}),
 				NewAnthropicProvider(Info{Name: "deepseek openai"}),

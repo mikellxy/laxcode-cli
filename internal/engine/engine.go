@@ -10,6 +10,7 @@ import (
 
 	"github.com/mikellxy/laxcode/internal/config"
 	laxctx "github.com/mikellxy/laxcode/internal/context"
+	"github.com/mikellxy/laxcode/internal/printer"
 	"github.com/mikellxy/laxcode/internal/provider"
 	"github.com/mikellxy/laxcode/internal/schema"
 	"github.com/mikellxy/laxcode/internal/tools"
@@ -28,9 +29,11 @@ type AgentEngine struct {
 	// （GetSession），子 Agent 在 Execute 时按需新建。Run 直接使用，
 	// 不再逐轮传参。
 	Session *Session
-	// PrintLLM 打印 assistant 消息（thinking + 正文），构造时默认主 Agent
-	// 配色，子 Agent 覆盖为紫色；Run 只经它输出，与展示样式解耦。
-	PrintLLM func(msg *schema.Message)
+	// Printer 是本引擎的输出实例：主 Agent 默认取包级默认实例
+	// （交互模式即 stdout + 主配色），子 Agent 用 WithColors 派生紫色
+	// 实例；one-shot 模式由 main 先 SetDefault(Discard/stderr) 再装配，
+	// 引擎随之静默。Run 与 TerminalLoop 的全部打印经它。
+	Printer printer.Printer
 }
 
 func NewAgentEngine(toolRegistry tools.Registry, provider provider.Provider, workDir string, planMode bool, sess *Session) *AgentEngine {
@@ -40,21 +43,22 @@ func NewAgentEngine(toolRegistry tools.Registry, provider provider.Provider, wor
 		WorkDir:      workDir,
 		PlanMode:     planMode,
 		Session:      sess,
-		PrintLLM:     PrintMainLLM,
+		Printer:      printer.Default(),
 	}
 }
 
 func TerminalLoop(ctx context.Context, agentEngine *AgentEngine) error {
 	sess := agentEngine.Session
+	prn := agentEngine.Printer
 
 	scanner := bufio.NewScanner(os.Stdin)
-	fmt.Println(">>> Agent ready, input your question, input exit to quit")
+	prn.Printf(">>> Agent ready, input your question, input exit to quit\n")
 
 	for {
-		fmt.Print("\033[34m> \033[0m")
+		prn.Printf("%s> %s", printer.ColorBlue, printer.ColorReset)
 		if !scanner.Scan() {
 			// EOF
-			fmt.Println("\nreceive EOF, exit")
+			prn.Printf("\nreceive EOF, exit\n")
 			return nil
 		}
 		userInput := strings.TrimSpace(scanner.Text())
@@ -62,7 +66,7 @@ func TerminalLoop(ctx context.Context, agentEngine *AgentEngine) error {
 			continue
 		}
 		if strings.ToLower(userInput) == "exit" {
-			fmt.Println("quit agent")
+			prn.Printf("quit agent\n")
 			return nil
 		}
 
@@ -75,7 +79,7 @@ func TerminalLoop(ctx context.Context, agentEngine *AgentEngine) error {
 		if _, err := agentEngine.Run(ctx); err != nil {
 			// warn too many turns
 			if errors.Is(err, errTooManyTurns) {
-				fmt.Printf("[warn] %v\n", err)
+				prn.Printf("[warn] %v\n", err)
 			} else {
 				return fmt.Errorf("run llm tool loop: %w", err)
 			}
@@ -102,7 +106,7 @@ func (f *AgentEngine) Run(ctx context.Context) (string, error) {
 		if compressRes != nil && compressRes.Total() > 0 {
 			sess.WindowToken.TokenInput -= compressRes.InputTokenCompressed
 			sess.WindowToken.TokenOutput -= compressRes.OutputTokenCompressed
-			fmt.Printf("\033[33m[context compressed result] %d input tokens, %d output tokens\033[0m\n", compressRes.InputTokenCompressed, compressRes.OutputTokenCompressed)
+			f.Printer.PrintCompressResult(compressRes.InputTokenCompressed, compressRes.OutputTokenCompressed)
 		}
 
 		// 历史唯一真相源是 session：Generate 前每轮重拼视图（system + 已有
@@ -113,7 +117,7 @@ func (f *AgentEngine) Run(ctx context.Context) (string, error) {
 		}
 
 		toolCallCnt := len(msg.ToolCalls)
-		f.PrintLLM(msg)
+		f.Printer.PrintLLM(msg)
 
 		sess.Append(*msg)
 

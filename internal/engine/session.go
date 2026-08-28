@@ -4,11 +4,11 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
-	"fmt"
 	"os"
 	"path/filepath"
 
 	laxctx "github.com/mikellxy/laxcode/internal/context"
+	"github.com/mikellxy/laxcode/internal/printer"
 	"github.com/mikellxy/laxcode/internal/schema"
 )
 
@@ -261,24 +261,22 @@ func (s *Session) ID() string { return s.id }
 
 // warnHistoryBadLine 输出跳过坏行的警告，沿用项目控制台惯例（黄色 [LaxCode] 前缀）。
 func warnHistoryBadLine(path string, lineNo int, err error) {
-	fmt.Printf("\033[33m[LaxCode] 跳过会话历史 %s 第 %d 行（无法反序列化为消息）: %v\033[0m\n",
-		path, lineNo, err)
+	printer.Warnf("跳过会话历史 %s 第 %d 行（无法反序列化为消息）: %v", path, lineNo, err)
 }
 
 // warnHistoryRead 输出历史读取异常警告；不阻断启动，历史可能不完整。
 func warnHistoryRead(path string, err error) {
-	fmt.Printf("\033[33m[LaxCode] 读取会话历史 %s 异常，历史可能不完整: %v\033[0m\n", path, err)
+	printer.Warnf("读取会话历史 %s 异常，历史可能不完整: %v", path, err)
 }
 
 // warnHistoryWrite 输出历史写盘失败警告：数据可能未保存，须比普通警告更显眼
 // （红色 + WARN），但不中断会话——交互现场优先于磁盘故障。
 func warnHistoryWrite(path string, err error) {
-	fmt.Printf("\033[31m[LaxCode][WARN] 会话历史写入 %s 失败，本条对话可能未被保存: %v\033[0m\n",
-		path, err)
+	printer.Errorf("会话历史写入 %s 失败，本条对话可能未被保存: %v", path, err)
 }
 
 // warnMetaWrite 输出 meta.json 写入失败警告：快照损坏不影响统计正确性
 // （真值由 history.jsonl 重放推导），故比历史写失败的警告轻（黄色）。
 func warnMetaWrite(path string, err error) {
-	fmt.Printf("\033[33m[LaxCode] 会话统计快照写入 %s 失败: %v\033[0m\n", path, err)
+	printer.Warnf("会话统计快照写入 %s 失败: %v", path, err)
 }

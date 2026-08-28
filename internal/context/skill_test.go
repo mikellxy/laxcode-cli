@@ -8,6 +8,8 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+
+	"github.com/mikellxy/laxcode/internal/printer"
 )
 
 // writeSkillFile 在 root/.laxcode/skills/<dirName>/ 下写入 SKILL.md，父目录自动创建。
@@ -233,17 +235,19 @@ func TestLoadSkills(t *testing.T) {
 	}
 }
 
-// captureStdout 捕获 fn 执行期间写到 os.Stdout 的内容
-// （LoadSkills 的警告直接走 fmt.Printf）。
+// captureStdout 捕获 fn 执行期间经 printer 默认实例输出的内容
+// （LoadSkills 的警告走 printer 包级 Warnf 委托默认实例落笔）。
 func captureStdout(t *testing.T, fn func()) string {
 	t.Helper()
 	r, w, err := os.Pipe()
 	if err != nil {
 		t.Fatalf("创建管道失败: %v", err)
 	}
-	old := os.Stdout
-	os.Stdout = w
-	defer func() { os.Stdout = old }()
+	prev := printer.Default()
+	printer.SetDefault(printer.NewWriterPrinter(w, printer.ColorGray, printer.ColorGreen))
+	defer func() {
+		printer.SetDefault(prev)
+	}()
 
 	fn()
 

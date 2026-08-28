@@ -7,12 +7,13 @@ import (
 	"encoding/json"
 	"errors"
 	"flag"
-	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+
+	"github.com/mikellxy/laxcode/internal/printer"
 )
 
 // Item 描述一个配置项及其支持的来源；Flag、Env、Key 留空表示禁用对应来源。
@@ -129,10 +130,10 @@ func (v *BoolValue) Get() bool {
 // Debug 是调试日志开关，只支持命令行 -debug。
 var Debug = Bool(Item{Flag: "DEBUG", Usage: "enable debug mode"})
 
-// Debugf 仅在 Debug 开启时打印。
+// Debugf 仅在 Debug 开启时打印（灰 [debug] 前缀经 printer 包级默认实例落笔）。
 func Debugf(format string, args ...any) {
 	if Debug.Get() {
-		fmt.Printf("\033[90m[debug] "+format+"\033[0m\n", args...)
+		printer.Debugf(format, args...)
 	}
 }
 

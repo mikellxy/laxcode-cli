@@ -25,7 +25,7 @@ func TestMianLoop_GenerateWithTool(t *testing.T) {
 			sess.Append(schema.Message{Role: schema.RoleUser, Content: "main_loop.go文件中实现了什么功能"})
 			sess.View(laxctx.BuildSysPrompt(".", laxctx.LoadSkills("."), false, "test-session"))
 
-			e := NewAgentEngine(tools.NewDefaultRegistry(), p, ".", false, sess)
+			e := NewAgentEngine(tools.NewDefaultRegistry(nil), p, ".", false, sess)
 			if _, err := e.Run(context.Background()); err != nil {
 				t.Fatal(err)
 			}

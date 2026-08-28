@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/mikellxy/laxcode/internal/printer"
 	"go.yaml.in/yaml/v4"
 )
 
@@ -176,6 +177,6 @@ func collapseWhitespace(s string) string {
 // warnSkipSkill 输出跳过无效技能的警告，沿用项目控制台惯例（黄色 [LaxCode] 前缀）；
 // 校验失败一律本地化为警告，启动路径上零 error 传播。
 func warnSkipSkill(dirName, format string, args ...any) {
-	fmt.Printf("\033[33m[LaxCode] 跳过无效 skill %s: %s\033[0m\n",
+	printer.Warnf("跳过无效 skill %s: %s",
 		filepath.Join(".laxcode", "skills", dirName, "SKILL.md"), fmt.Sprintf(format, args...))
 }

@@ -49,7 +49,7 @@ func TestExecuteToolCalls_ParallelReadFile(t *testing.T) {
 		}
 	}
 
-	reg := &trackingRegistry{Registry: tools.NewDefaultRegistry()}
+	reg := &trackingRegistry{Registry: tools.NewDefaultRegistry(nil)}
 	reg.Register(tools.NewReadFileTool(workDir))
 	eng := NewAgentEngine(reg, nil, workDir, false, newSession(t.TempDir(), "test-session"))
 
@@ -97,7 +97,7 @@ func TestExecuteToolCalls_SequentialForMixedCalls(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	reg := &trackingRegistry{Registry: tools.NewDefaultRegistry()}
+	reg := &trackingRegistry{Registry: tools.NewDefaultRegistry(nil)}
 	reg.Register(tools.NewReadFileTool(workDir))
 	eng := NewAgentEngine(reg, nil, workDir, false, newSession(t.TempDir(), "test-session"))
 
