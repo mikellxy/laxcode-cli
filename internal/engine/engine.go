@@ -132,7 +132,7 @@ func (f *AgentEngine) Run(ctx context.Context) (string, error) {
 	// id 覆盖。agent-run 的父链由调用方 ctx 决定——交互模式是
 	// terminal-task，one-shot 为空 ctx，本 span 自动成为 root。
 	ctx = tracing.ContextWithSessionID(ctx, sess.ID())
-	ctx, runSpan := f.Tracer.Start(ctx, tracing.SpanAgentRun,
+	ctx, runSpan := f.Tracer.Start(ctx, tracing.ReactLoop,
 		trace.WithAttributes(
 			tracing.AttrSessionID.String(sess.ID()),
 			tracing.AttrAgentRole.String(f.Role),
@@ -157,7 +157,7 @@ func (f *AgentEngine) Run(ctx context.Context) (string, error) {
 		}
 
 		// 每轮外层 for 循环一个 react-loop span，序号即 turnCnt
-		loopCtx, loopSpan := f.Tracer.Start(ctx, tracing.SpanReactLoop,
+		loopCtx, loopSpan := f.Tracer.Start(ctx, tracing.LLMTurn,
 			trace.WithAttributes(tracing.AttrLoopSeq.Int(turnCnt)))
 
 		// compress

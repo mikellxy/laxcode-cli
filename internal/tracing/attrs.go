@@ -15,13 +15,13 @@ package tracing
 
 import "go.opentelemetry.io/otel/attribute"
 
-// span 名。调用树：terminal-task → agent-run → react-loop →
+// span 名。调用树：terminal-task → react-loop → llm-turn →
 // {llm-generate, tool-exec}；one-shot 模式无 terminal-task 层，
-// agent-run 直接作为 root。
+// react-loop 直接作为 root。
 const (
 	SpanTerminalTask = "terminal-task"
-	SpanAgentRun     = "agent-run"
-	SpanReactLoop    = "react-loop"
+	ReactLoop        = "react-loop"
+	LLMTurn          = "llm-turn"
 	SpanLLMGenerate  = "llm-generate"
 	SpanToolExec     = "tool-exec"
 )

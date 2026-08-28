@@ -217,8 +217,8 @@ func TestRunSpanTree(t *testing.T) {
 	}
 
 	spans := mp.tracer.snapshot()
-	run := requireSpan(t, spans, tracing.SpanAgentRun, 1)[0]
-	loops := requireSpan(t, spans, tracing.SpanReactLoop, 2)
+	run := requireSpan(t, spans, tracing.ReactLoop, 1)[0]
+	loops := requireSpan(t, spans, tracing.LLMTurn, 2)
 	gens := requireSpan(t, spans, tracing.SpanLLMGenerate, 2)
 	toolSpans := requireSpan(t, spans, tracing.SpanToolExec, 2)
 
@@ -328,7 +328,7 @@ func TestTerminalTaskRootSpan(t *testing.T) {
 
 	spans := mp.tracer.snapshot()
 	task := requireSpan(t, spans, tracing.SpanTerminalTask, 1)[0]
-	run := requireSpan(t, spans, tracing.SpanAgentRun, 1)[0]
+	run := requireSpan(t, spans, tracing.ReactLoop, 1)[0]
 
 	if task.parent != nil {
 		t.Error("terminal-task 应为 trace root")
@@ -397,7 +397,7 @@ func TestSubAgentNesting(t *testing.T) {
 	}
 
 	spans := mp.tracer.snapshot()
-	runs := requireSpan(t, spans, tracing.SpanAgentRun, 2)
+	runs := requireSpan(t, spans, tracing.ReactLoop, 2)
 	toolSpans := requireSpan(t, spans, tracing.SpanToolExec, 1)
 	subTool := toolSpans[0]
 
@@ -426,7 +426,7 @@ func TestSubAgentNesting(t *testing.T) {
 		t.Errorf("tool-exec session_id = %q, want s-main", got)
 	}
 	// 子树内部完整：子 run 下有自己的 react-loop 与 llm-generate
-	subLoops := spansNamed(spans, tracing.SpanReactLoop)
+	subLoops := spansNamed(spans, tracing.LLMTurn)
 	found := false
 	for _, l := range subLoops {
 		if l.parent == subRun {
@@ -462,10 +462,10 @@ func TestToolErrorSpanStatus(t *testing.T) {
 	if toolSpan.status != codes.Error || toolSpan.errCnt == 0 {
 		t.Error("tool-exec 应置错误状态并记录错误")
 	}
-	if run := requireSpan(t, spans, tracing.SpanAgentRun, 1)[0]; run.status == codes.Error {
+	if run := requireSpan(t, spans, tracing.ReactLoop, 1)[0]; run.status == codes.Error {
 		t.Error("工具可恢复错误不应使 agent-run 置错误")
 	}
-	for _, loop := range requireSpan(t, spans, tracing.SpanReactLoop, 2) {
+	for _, loop := range requireSpan(t, spans, tracing.LLMTurn, 2) {
 		if loop.status == codes.Error {
 			t.Error("工具可恢复错误不应使 react-loop 置错误")
 		}
@@ -491,7 +491,7 @@ func TestGenerateErrorSpanStatus(t *testing.T) {
 	if gen.status != codes.Error || gen.errCnt == 0 {
 		t.Error("llm-generate 应置错误状态并记录错误")
 	}
-	run := requireSpan(t, spans, tracing.SpanAgentRun, 1)[0]
+	run := requireSpan(t, spans, tracing.ReactLoop, 1)[0]
 	if run.status != codes.Error || run.errCnt == 0 {
 		t.Error("agent-run 应置错误状态并记录错误")
 	}

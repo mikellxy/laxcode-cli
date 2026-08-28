@@ -14,6 +14,7 @@ import (
 	"github.com/mikellxy/laxcode/internal/provider"
 	"github.com/mikellxy/laxcode/internal/tools"
 	"github.com/mikellxy/laxcode/internal/tracing"
+	"github.com/mikellxy/laxcode/internal/tracing/filetrace"
 	"go.opentelemetry.io/otel/trace"
 )
 
@@ -43,10 +44,9 @@ func main() {
 		workDir, _ = os.Getwd()
 	}
 
-	// 追踪默认 noop（零开销无输出）；接入真实后端时以自定义
-	// TracerProvider 替换 tracing.New(nil)。defer 保证主循环返回后、
-	// 进程退出前 flush 尾部 span。
-	traceHandle := tracing.New(nil)
+	// 追踪默认写入 ${work_dir}/.laxcode/.session/log/tracing.log；
+	// 若文件无法创建则回退到 noop，并在 stderr 提示。
+	traceHandle := newTraceHandle(workDir)
 	defer func() { _ = traceHandle.Shutdown(context.Background()) }()
 
 	agentEngine, id, err := assembleEngine(workDir, sessionID.Get(), planMode.Get(), traceHandle.Tracer)
@@ -68,8 +68,8 @@ func main() {
 func runOneShot(taskText, taskFilePath, workDirFlag, sessionID string, planMode, verbose bool) int {
 	// one-shot 进程存活时间可能短于批量导出间隔：defer 保证 Shutdown
 	// 在 runOneShot 返回（结果 JSON 已写出）后、os.Exit 前执行，
-	// 强制 flush 尾部 span；默认 noop 下为空操作。
-	traceHandle := tracing.New(nil)
+	// 强制 flush 尾部 span；创建失败则回退 noop。
+	traceHandle := newTraceHandle(workDirFlag)
 	defer func() { _ = traceHandle.Shutdown(context.Background()) }()
 
 	// 输出闸门必须先于引擎装配：随后 NewAgentEngine/NewDefaultRegistry
@@ -120,6 +120,19 @@ func loadTaskPrompt(taskText, taskFilePath string) (string, error) {
 		return strings.TrimSpace(string(data)), nil
 	}
 	return strings.TrimSpace(taskText), nil
+}
+
+// newTraceHandle 按 workDir 构造默认的 filetrace Provider；若日志文件无法
+// 创建（如目录无写权限），则回退到官方 noop 并在 stderr 提示。
+func newTraceHandle(workDir string) *tracing.Handle {
+	traceLogPath := filepath.Join(workDir, ".laxcode", ".session", "log", "tracing.log")
+	var tp trace.TracerProvider
+	if f, err := filetrace.New(traceLogPath); err == nil {
+		tp = f
+	} else {
+		fmt.Fprintf(os.Stderr, "filetrace: %v; tracing disabled\n", err)
+	}
+	return tracing.New(tp)
 }
 
 // assembleEngine 完成两个前端 loop（TerminalLoop/OneShotLoop）共用的装配：

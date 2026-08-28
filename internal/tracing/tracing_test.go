@@ -16,7 +16,7 @@ func TestNewNilProviderGivesNoop(t *testing.T) {
 		t.Fatal("New(nil) 应给出可用的 noop Tracer")
 	}
 	// noop span：可正常 Start/End 且不记录（IsRecording=false）
-	ctx, span := h.Tracer.Start(context.Background(), SpanAgentRun)
+	ctx, span := h.Tracer.Start(context.Background(), ReactLoop)
 	span.SetAttributes(AttrSessionID.String("s-1"))
 	span.End()
 	if span.IsRecording() {
