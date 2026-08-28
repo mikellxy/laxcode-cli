@@ -35,8 +35,13 @@ func main() {
 		panic(err)
 	}
 
+	sessID := sessionID.Get()
+	if sessID == "" {
+		sessID = time.Now().Format("20060102-150405.000")
+	}
+
 	if oneShot.Get() {
-		os.Exit(runOneShot(task.Get(), taskFile.Get(), workdir.Get(), sessionID.Get(), planMode.Get(), verbose.Get()))
+		os.Exit(runOneShot(task.Get(), taskFile.Get(), workdir.Get(), sessID, planMode.Get(), verbose.Get()))
 	}
 
 	workDir := workdir.Get()
@@ -44,17 +49,18 @@ func main() {
 		workDir, _ = os.Getwd()
 	}
 
-	// 追踪默认写入 ${work_dir}/.laxcode/.session/log/tracing.log；
+	// 追踪默认写入 ${work_dir}/.laxcode/.session/${session_id}/log/tracing.log；
 	// 若文件无法创建则回退到 noop，并在 stderr 提示。
-	traceHandle := newTraceHandle(workDir)
+	logPath := filepath.Join(workDir, ".laxcode", ".session", sessID, "log", "tracing.log")
+	traceHandle := newTraceHandle(logPath)
 	defer func() { _ = traceHandle.Shutdown(context.Background()) }()
 
-	agentEngine, id, err := assembleEngine(workDir, sessionID.Get(), planMode.Get(), traceHandle.Tracer)
+	agentEngine, err := assembleEngine(workDir, sessID, planMode.Get(), traceHandle.Tracer)
 	if err != nil {
 		panic(err)
 	}
 
-	printer.Printf("starting LaxCode... work_dir: %s, session: %s, plan_mode: %v, debug: %v\n", workDir, id, planMode.Get(), config.Debug.Get())
+	printer.Printf("starting LaxCode... work_dir: %s, session: %s, plan_mode: %v, debug: %v\n", workDir, sessID, planMode.Get(), config.Debug.Get())
 
 	if err := engine.TerminalLoop(context.Background(), agentEngine); err != nil {
 		panic(err)
@@ -66,10 +72,8 @@ func main() {
 // 0 成功；1 运行失败（generate/too_many_turns）；2 用法错误。
 // 错误一律走 stdout 的结构化 JSON + exit code，不 panic。
 func runOneShot(taskText, taskFilePath, workDirFlag, sessionID string, planMode, verbose bool) int {
-	// one-shot 进程存活时间可能短于批量导出间隔：defer 保证 Shutdown
-	// 在 runOneShot 返回（结果 JSON 已写出）后、os.Exit 前执行，
-	// 强制 flush 尾部 span；创建失败则回退 noop。
-	traceHandle := newTraceHandle(workDirFlag)
+	logPath := filepath.Join(workDirFlag, ".laxcode", ".session", sessionID, "log", "tracing.log")
+	traceHandle := newTraceHandle(logPath)
 	defer func() { _ = traceHandle.Shutdown(context.Background()) }()
 
 	// 输出闸门必须先于引擎装配：随后 NewAgentEngine/NewDefaultRegistry
@@ -97,7 +101,7 @@ func runOneShot(taskText, taskFilePath, workDirFlag, sessionID string, planMode,
 		return usageFail("one-shot mode requires a non-empty prompt from -task or -task-file")
 	}
 
-	agentEngine, _, err := assembleEngine(workDirFlag, sessionID, planMode, traceHandle.Tracer)
+	agentEngine, err := assembleEngine(workDirFlag, sessionID, planMode, traceHandle.Tracer)
 	if err != nil {
 		return usageFail("init engine in %s failed: %v", workDirFlag, err)
 	}
@@ -124,13 +128,12 @@ func loadTaskPrompt(taskText, taskFilePath string) (string, error) {
 
 // newTraceHandle 按 workDir 构造默认的 filetrace Provider；若日志文件无法
 // 创建（如目录无写权限），则回退到官方 noop 并在 stderr 提示。
-func newTraceHandle(workDir string) *tracing.Handle {
-	traceLogPath := filepath.Join(workDir, ".laxcode", ".session", "log", "tracing.log")
+func newTraceHandle(traceLogPath string) *tracing.Handle {
 	var tp trace.TracerProvider
 	if f, err := filetrace.New(traceLogPath); err == nil {
 		tp = f
 	} else {
-		fmt.Fprintf(os.Stderr, "filetrace: %v; tracing disabled\n", err)
+		printer.Printf("filetrace: %v; tracing disabled\n", err)
 	}
 	return tracing.New(tp)
 }
@@ -139,14 +142,9 @@ func newTraceHandle(workDir string) *tracing.Handle {
 // session 目录创建、session id 决定、工具注册（含 sub agent）、会话加载
 // （GetSession 重放历史，天然支持 -session 续聊）、监控 provider 与追踪
 // 注入（tracer 为 nil 时引擎与注册表内部缺省 noop）。
-func assembleEngine(workDir, sessionID string, planMode bool, tracer trace.Tracer) (*engine.AgentEngine, string, error) {
+func assembleEngine(workDir, sessionID string, planMode bool, tracer trace.Tracer) (*engine.AgentEngine, error) {
 	if err := os.MkdirAll(filepath.Join(workDir, ".laxcode", ".session"), 0755); err != nil {
-		return nil, "", err
-	}
-
-	id := sessionID
-	if id == "" {
-		id = time.Now().Format("20060102-150405.000")
+		return nil, err
 	}
 
 	reg := tools.NewDefaultRegistry(nil, tracer)
@@ -154,7 +152,7 @@ func assembleEngine(workDir, sessionID string, planMode bool, tracer trace.Trace
 	reg.Register(tools.NewWriteFileTool(workDir))
 	reg.Register(tools.NewReadFileTool(workDir))
 	reg.Register(tools.NewEditFileTool(workDir))
-	sess := engine.GetSession(workDir, id, planMode)
+	sess := engine.GetSession(workDir, sessionID, planMode)
 	agentEngine := engine.NewAgentEngine(reg,
 		engine.NewMonitoredProvider(provider.NewOpenApiProvider(provider.Info{}), sess),
 		workDir,
@@ -163,5 +161,5 @@ func assembleEngine(workDir, sessionID string, planMode bool, tracer trace.Trace
 		tracer,
 	)
 	reg.Register(engine.NewSubAgent(agentEngine))
-	return agentEngine, id, nil
+	return agentEngine, nil
 }
