@@ -81,6 +81,15 @@ Command-line arguments
 | `-task`         | empty   | Prompt text |
 | `-task-file`    | empty   | Prompt file, takes precedence over `-task` |
 
+### 1.5 workflow-agent Hybrid Architecture Example
+```shell
+make
+
+pip3 install langgraph langchain-openai python-dotenv
+
+python3 ./examples/workflow-agent-hybrid/example.py -workdir=/tmp/laxcode-example -session=xxxxx -task="how to use meta Class in python? Just give me a text answer first"
+```
+
 ## 2. Session Management
 Resuming a conversation from a previous run is supported by specifying a session id
 ```shell

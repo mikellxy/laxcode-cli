@@ -81,6 +81,15 @@ make build
 | `-task`         | 空    | prompt 文本                                    |
 | `-task-file`    | 空    | prompt 文件，优先级高于 `-task`                  |
 
+### 1.5 workflow-agent 混合架构示例
+```shell
+make
+
+pip3 install langgraph langchain-openai python-dotenv
+
+python3 ./examples/workflow-agent-hybrid/example.py -workdir=/tmp/laxcode-example -session=xxxxx -task="how to use meta Class in python? Just give me a text answer first"
+```
+
 ## 2. session 管理
 支持通过指定 session id 进行断点续聊
 ```shell
