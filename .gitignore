@@ -10,3 +10,6 @@ bin
 # LaxCode: skills 只提交 example 目录
 !.laxcode/skills/example/
 scripts
+
+# 站外分享文章草稿，不入库
+articles/
