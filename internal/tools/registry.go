@@ -5,12 +5,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/mikellxy/laxcode/internal/printer"
 	"github.com/mikellxy/laxcode/internal/schema"
 	"github.com/mikellxy/laxcode/internal/tracing"
 	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
 )
 
@@ -59,23 +59,26 @@ func (d *DefaultRegistry) GetAvailableTools() []schema.ToolDefinition {
 }
 
 func (d *DefaultRegistry) Execute(ctx context.Context, toolCall *schema.ToolCall) *schema.ToolResult {
-	// tool-exec span：记录工具名与耗时，不记 token。session_id 经 ctx
-	// 传播而来（Run 在循环开始时写入）；span 父子关系同样经 ctx——
-	// 并行 read_file 分支的 goroutine 沿用同一 ctx，自然成为兄弟 span。
+	timeStart := time.Now()
+	var execErr error
+
 	attrs := []attribute.KeyValue{tracing.AttrToolName.String(toolCall.Name)}
 	if sid := tracing.SessionIDFromContext(ctx); sid != "" {
 		attrs = append(attrs, tracing.AttrSessionID.String(sid))
 	}
 	ctx, span := d.tracer.Start(ctx, tracing.SpanToolExec, trace.WithAttributes(attrs...))
-	defer span.End()
+	defer func() {
+		tracing.CloseSpan(span,
+			tracing.WithTimeCostMs(time.Since(timeStart).Microseconds()),
+			tracing.WithErr(execErr),
+		)
+	}()
 
 	tool, ok := d.db[toolCall.Name]
 	if !ok {
-		err := errors.New("tool not found")
-		span.RecordError(err)
-		span.SetStatus(codes.Error, err.Error())
+		execErr = errors.New("tool not found")
 		return &schema.ToolResult{
-			Error:      err,
+			Error:      execErr,
 			Output:     fmt.Sprintf("tool %s not exists", toolCall.Name),
 			IsError:    true,
 			ToolCallID: toolCall.ID,
@@ -84,12 +87,10 @@ func (d *DefaultRegistry) Execute(ctx context.Context, toolCall *schema.ToolCall
 
 	d.printer.PrintToolCall(tool.BeforeExecInfo(toolCall.Arguments))
 
-	output, err := tool.Execute(ctx, toolCall.Arguments)
-	if err != nil {
-		span.RecordError(err)
-		span.SetStatus(codes.Error, err.Error())
+	output, execErr := tool.Execute(ctx, toolCall.Arguments)
+	if execErr != nil {
 		return &schema.ToolResult{
-			Error:      err,
+			Error:      execErr,
 			Output:     output,
 			IsError:    true,
 			ToolCallID: toolCall.ID,

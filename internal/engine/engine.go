@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/mikellxy/laxcode/internal/config"
 	laxctx "github.com/mikellxy/laxcode/internal/context"
@@ -84,9 +85,7 @@ func TerminalLoop(ctx context.Context, agentEngine *AgentEngine) error {
 			return nil
 		}
 
-		// 每次用户输入开启一条新 trace：terminal-task 为 root，记录
-		// 完成该次输入任务的耗时与 token 合计（Run 前后 session 累计
-		// 用量的差值）
+		startTime := time.Now()
 		taskSeq++
 		taskCtx, taskSpan := agentEngine.Tracer.Start(ctx, tracing.SpanTerminalTask,
 			trace.WithAttributes(
@@ -105,6 +104,7 @@ func TerminalLoop(ctx context.Context, agentEngine *AgentEngine) error {
 		taskSpan.SetAttributes(
 			tracing.AttrInputTokens.Int(sess.TokenUsed.TokenInput-tokenBefore.TokenInput),
 			tracing.AttrOutputTokens.Int(sess.TokenUsed.TokenOutput-tokenBefore.TokenOutput),
+			tracing.AttrTimeCostMs.Int64(time.Since(startTime).Milliseconds()),
 		)
 		if runErr != nil {
 			// warn too many turns
@@ -132,33 +132,40 @@ func (f *AgentEngine) Run(ctx context.Context) (string, error) {
 	// id 覆盖。agent-run 的父链由调用方 ctx 决定——交互模式是
 	// terminal-task，one-shot 为空 ctx，本 span 自动成为 root。
 	ctx = tracing.ContextWithSessionID(ctx, sess.ID())
-	ctx, runSpan := f.Tracer.Start(ctx, tracing.ReactLoop,
+	ctx, reActSpan := f.Tracer.Start(ctx, tracing.SpanReAct,
 		trace.WithAttributes(
 			tracing.AttrSessionID.String(sess.ID()),
 			tracing.AttrAgentRole.String(f.Role),
 		))
 	// run 级 token 合计在 defer 中统一落属性，各 return 路径共享
-	var runInput, runOutput int
+	var reActInput, reActOutput int
+	var reActErr error
+	startTime := time.Now()
 	defer func() {
-		runSpan.SetAttributes(
-			tracing.AttrInputTokens.Int(runInput),
-			tracing.AttrOutputTokens.Int(runOutput),
+		reActSpan.SetAttributes(
+			tracing.AttrInputTokens.Int(reActInput),
+			tracing.AttrOutputTokens.Int(reActOutput),
 		)
-		runSpan.End()
+		tracing.CloseSpan(reActSpan,
+			tracing.WithErr(reActErr),
+			tracing.WithTimeCostMs(time.Since(startTime).Milliseconds()),
+		)
 	}()
 	turnCnt := 0
 
 	for {
-		turnCnt++
-		if turnCnt > 50 {
-			runSpan.RecordError(errTooManyTurns)
-			runSpan.SetStatus(codes.Error, errTooManyTurns.Error())
-			return "", errTooManyTurns
-		}
+		//turnCnt++
+		//if turnCnt > 50 {
+		//	reActSpan.RecordError(errTooManyTurns)
+		//	reActSpan.SetStatus(codes.Error, errTooManyTurns.Error())
+		//	return "", errTooManyTurns
+		//}
 
-		// 每轮外层 for 循环一个 react-loop span，序号即 turnCnt
-		loopCtx, loopSpan := f.Tracer.Start(ctx, tracing.LLMTurn,
-			trace.WithAttributes(tracing.AttrLoopSeq.Int(turnCnt)))
+		timeStart := time.Now()
+
+		// each llm turn
+		turnCtx, turnSpan := f.Tracer.Start(ctx, tracing.LLMTurn,
+			trace.WithAttributes(tracing.AttrTurnSeq.Int(turnCnt)))
 
 		// compress
 		msgs, compressRes := laxctx.SimpleCompactor.Compress(sess.Messages, config.MaxWinToken, sess.TokenUsed)
@@ -171,16 +178,14 @@ func (f *AgentEngine) Run(ctx context.Context) (string, error) {
 
 		// 历史唯一真相源是 session：Generate 前每轮重拼视图（system + 已有
 		// 历史 + 本轮新消息），产生的消息一律经 Append 写回，无 slice 别名回写
-		genCtx, genSpan := f.Tracer.Start(loopCtx, tracing.SpanLLMGenerate)
+		genCtx, genSpan := f.Tracer.Start(turnCtx, tracing.SpanLLMGenerate)
 		msg, err := f.Provider.Generate(genCtx, sess.Messages, f.ToolRegistry.GetAvailableTools())
 		if err != nil {
 			err = fmt.Errorf("generating message: %w", err)
-			genSpan.RecordError(err)
-			genSpan.SetStatus(codes.Error, err.Error())
-			genSpan.End()
-			loopSpan.End()
-			runSpan.RecordError(err)
-			runSpan.SetStatus(codes.Error, err.Error())
+			ms := time.Since(timeStart).Milliseconds()
+			tracing.CloseSpan(genSpan, tracing.WithTimeCostMs(ms), tracing.WithErr(err))
+			tracing.CloseSpan(turnSpan, tracing.WithTimeCostMs(ms), tracing.WithErr(err))
+			reActErr = err
 			return "", err
 		}
 		genSpan.SetAttributes(
@@ -188,15 +193,13 @@ func (f *AgentEngine) Run(ctx context.Context) (string, error) {
 			tracing.AttrOutputTokens.Int(msg.TokenUsed.TokenOutput),
 			tracing.AttrToolCallCount.Int(len(msg.ToolCalls)),
 		)
-		genSpan.End()
-
-		// loop 级 token 即本轮 generate 用量；run 级逐轮累计
-		runInput += msg.TokenUsed.TokenInput
-		runOutput += msg.TokenUsed.TokenOutput
-		loopSpan.SetAttributes(
-			tracing.AttrInputTokens.Int(msg.TokenUsed.TokenInput),
-			tracing.AttrOutputTokens.Int(msg.TokenUsed.TokenOutput),
+		tracing.CloseSpan(genSpan,
+			tracing.WithTimeCostMs(time.Since(timeStart).Milliseconds()),
 		)
+
+		// reAct loop级token用量统计
+		reActInput += msg.TokenUsed.TokenInput
+		reActOutput += msg.TokenUsed.TokenOutput
 
 		toolCallCnt := len(msg.ToolCalls)
 		f.Printer.PrintLLM(msg)
@@ -206,7 +209,7 @@ func (f *AgentEngine) Run(ctx context.Context) (string, error) {
 		// 并行策略见 executeToolCalls：多 read_file 调用 goroutine+channel
 		// fork-join 并发执行，其余顺序执行；结果按原始调用顺序归位。
 		// loopCtx 携带 react-loop span，工具 span 经 Registry 挂到其下。
-		results := f.executeToolCalls(loopCtx, msg.ToolCalls)
+		results := f.executeToolCalls(turnCtx, msg.ToolCalls)
 		for i, toolResult := range results {
 			sess.Append(schema.Message{
 				Role:       schema.RoleUser,
@@ -214,7 +217,14 @@ func (f *AgentEngine) Run(ctx context.Context) (string, error) {
 				ToolCallID: toolResult.ToolCallID,
 			})
 		}
-		loopSpan.End()
+
+		turnSpan.SetAttributes(
+			tracing.AttrInputTokens.Int(msg.TokenUsed.TokenInput),
+			tracing.AttrOutputTokens.Int(msg.TokenUsed.TokenOutput),
+		)
+		tracing.CloseSpan(turnSpan,
+			tracing.WithTimeCostMs(time.Since(timeStart).Milliseconds()),
+		)
 		if toolCallCnt == 0 {
 			return msg.Content, nil
 		}

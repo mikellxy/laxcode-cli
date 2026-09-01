@@ -3,6 +3,7 @@ package tracing
 import (
 	"context"
 
+	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
 	"go.opentelemetry.io/otel/trace/noop"
 )
@@ -63,4 +64,38 @@ func ContextWithSessionID(ctx context.Context, sessionID string) context.Context
 func SessionIDFromContext(ctx context.Context) string {
 	sid, _ := ctx.Value(sessionIDKey{}).(string)
 	return sid
+}
+
+func CloseSpan(span trace.Span, opts ...opt) {
+	o := new(options)
+	for _, opt := range opts {
+		opt(o)
+	}
+	if o.timeCostMs > 0 {
+		span.SetAttributes(AttrTimeCostMs.Int64(o.timeCostMs))
+	}
+	if o.err != nil {
+		span.SetStatus(codes.Error, o.err.Error())
+		span.RecordError(o.err)
+	}
+	span.End()
+}
+
+type options struct {
+	timeCostMs int64
+	err        error
+}
+
+type opt func(o *options)
+
+func WithTimeCostMs(costMs int64) opt {
+	return func(o *options) {
+		o.timeCostMs = costMs
+	}
+}
+
+func WithErr(err error) opt {
+	return func(o *options) {
+		o.err = err
+	}
 }

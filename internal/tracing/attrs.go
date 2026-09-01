@@ -20,7 +20,7 @@ import "go.opentelemetry.io/otel/attribute"
 // react-loop 直接作为 root。
 const (
 	SpanTerminalTask = "terminal-task"
-	ReactLoop        = "react-loop"
+	SpanReAct        = "ReAct"
 	LLMTurn          = "llm-turn"
 	SpanLLMGenerate  = "llm-generate"
 	SpanToolExec     = "tool-exec"
@@ -31,9 +31,10 @@ const (
 	AttrSessionID     attribute.Key = "laxcode.session_id"
 	AttrToolName      attribute.Key = "laxcode.tool_name"
 	AttrAgentRole     attribute.Key = "laxcode.agent_role"
-	AttrLoopSeq       attribute.Key = "laxcode.loop_seq"
+	AttrTurnSeq       attribute.Key = "laxcode.loop_seq"
 	AttrTaskSeq       attribute.Key = "laxcode.task_seq"
 	AttrToolCallCount attribute.Key = "laxcode.tool_call_count"
+	AttrTimeCostMs    attribute.Key = "laxcode.time_cost_ms"
 )
 
 // AttrAgentRole 的取值
