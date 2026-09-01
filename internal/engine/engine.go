@@ -6,7 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/mikellxy/laxcode/internal/config"
@@ -66,6 +68,18 @@ func TerminalLoop(ctx context.Context, agentEngine *AgentEngine) error {
 	// taskSeq 标记本次启动以来第几轮用户输入，写入 terminal-task span
 	taskSeq := 0
 
+	// 会话退出时回收带生命周期的工具（bash 后台进程与临时文件）。
+	// Ctrl-C 直杀进程时 defer 不执行，由信号 goroutine 兜底
+	defer closeToolRegistry(agentEngine)
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
+	go func() {
+		<-sigCh
+		closeToolRegistry(agentEngine)
+		os.Exit(130)
+	}()
+
 	scanner := bufio.NewScanner(os.Stdin)
 	prn.Printf(">>> Agent ready, input your question, input exit to quit\n")
 
@@ -119,6 +133,15 @@ func TerminalLoop(ctx context.Context, agentEngine *AgentEngine) error {
 		} else {
 			taskSpan.End()
 		}
+	}
+}
+
+// closeToolRegistry 在前端 loop 退出时回收注册表中带生命周期的工具
+// （bash 工具的后台进程与临时文件）。Registry 接口不强制 Close，
+// 经类型断言按需调用
+func closeToolRegistry(agentEngine *AgentEngine) {
+	if c, ok := agentEngine.ToolRegistry.(interface{ Close() error }); ok {
+		_ = c.Close()
 	}
 }
 

@@ -55,6 +55,8 @@ func NewUsageResult(message string) OneShotResult {
 // nil 成功，非 nil 为运行失败（JSON 内已带 error 细节）。
 func OneShotLoop(ctx context.Context, agentEngine *AgentEngine, task string) error {
 	sess := agentEngine.Session
+	// 运行结束回收 bash 工具留下的后台进程与临时文件
+	defer closeToolRegistry(agentEngine)
 
 	sess.Append(schema.Message{
 		Role:    schema.RoleUser,

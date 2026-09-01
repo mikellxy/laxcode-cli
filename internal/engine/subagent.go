@@ -77,6 +77,8 @@ func (s *SubAgent) Execute(ctx context.Context, args json.RawMessage) (string, e
 	// 子 Agent 继承父引擎的 Tracer：子 run 的 span 树经 ctx 嵌套在
 	// 本次 sub_agent 的 tool-exec span 下，保持同一 trace
 	reg := tools.NewDefaultRegistry(s.Parent.Printer, s.Parent.Tracer)
+	// 子 Agent 运行结束即一次完整生命周期：回收 bash 后台进程与临时文件
+	defer reg.Close()
 	reg.Register(tools.NewBashTool(workDir))
 	reg.Register(tools.NewReadFileTool(workDir))
 	sess := GetSession(workDir, id, false)
