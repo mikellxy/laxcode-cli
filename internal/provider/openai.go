@@ -42,6 +42,46 @@ func (p *OpenApiProvider) Info() *Info {
 }
 
 func (p *OpenApiProvider) Generate(ctx context.Context, msgs []schema.Message, toolsDefs []schema.ToolDefinition) (*schema.Message, error) {
+	reqParams := p.buildResponseParams(msgs, toolsDefs)
+
+	resp, err := p.client.Responses.New(ctx, reqParams)
+	if err != nil {
+		return nil, err
+	}
+
+	msg := &schema.Message{
+		Role:    schema.RoleAssistant,
+		Content: resp.OutputText(),
+		TokenUsed: schema.TokenStatistics{
+			TokenInput:  int(resp.Usage.InputTokens),
+			TokenOutput: int(resp.Usage.OutputTokens),
+		},
+	}
+	for _, output := range resp.Output {
+		switch output.Type {
+		case "reasoning":
+			r := output.AsReasoning()
+			msg.ReasoningID = r.ID
+			for _, c := range r.Content {
+				msg.ReasoningContent += c.Text
+			}
+			config.Debugf("reasoning parsed: id=%q len=%d", r.ID, len(msg.ReasoningContent))
+		case "function_call":
+			c := output.AsFunctionCall()
+			msg.ToolCalls = append(msg.ToolCalls, schema.ToolCall{
+				ID:        c.CallID,
+				Name:      c.Name,
+				Arguments: json.RawMessage(c.Arguments),
+			})
+		}
+	}
+
+	return msg, nil
+}
+
+// buildResponseParams 把会话消息与工具定义组装为 Responses API 请求参数，
+// 供批式 Generate 与流式 GenerateStream 共用，保证两条路径的输入口径一致。
+func (p *OpenApiProvider) buildResponseParams(msgs []schema.Message, toolsDefs []schema.ToolDefinition) responses.ResponseNewParams {
 	var inputParams responses.ResponseNewParamsInputUnion
 
 	for _, msg := range msgs {
@@ -100,36 +140,89 @@ func (p *OpenApiProvider) Generate(ctx context.Context, msgs []schema.Message, t
 		}
 	}
 
-	resp, err := p.client.Responses.New(ctx, reqParams)
-	if err != nil {
-		return nil, err
-	}
+	return reqParams
+}
 
-	msg := &schema.Message{
-		Role:    schema.RoleAssistant,
-		Content: resp.OutputText(),
-		TokenUsed: schema.TokenStatistics{
-			TokenInput:  int(resp.Usage.InputTokens),
-			TokenOutput: int(resp.Usage.OutputTokens),
-		},
-	}
-	for _, output := range resp.Output {
-		switch output.Type {
-		case "reasoning":
-			r := output.AsReasoning()
-			msg.ReasoningID = r.ID
-			for _, c := range r.Content {
-				msg.ReasoningContent += c.Text
+// GenerateStream 是批式 Generate 的流式对应：用 Responses.NewStreaming 消费
+// SSE 事件，一边经 emit 实时推送领域级增量（正文 / reasoning 三段式、完整
+// 工具调用），一边累积出与批式 Generate 语义等价的完整消息返回。事件分派
+// 见 design 决策 5 的映射表。工具调用不流式：以 output_item.done 的完整 item
+// 为权威源取参数（与批式读 resp.Output 同源），故 function_call_arguments.delta
+// 不需处理；token 用量只在 response.completed 可得。
+func (p *OpenApiProvider) GenerateStream(ctx context.Context, msgs []schema.Message, toolsDefs []schema.ToolDefinition, emit func(StreamChunk)) (*schema.Message, error) {
+	reqParams := p.buildResponseParams(msgs, toolsDefs)
+
+	stream := p.client.Responses.NewStreaming(ctx, reqParams)
+	defer stream.Close()
+
+	msg := &schema.Message{Role: schema.RoleAssistant}
+	// 三段式边界：首个 delta 惰性触发 start，对应 done 事件触发 end
+	var textStarted, reasoningStarted bool
+
+	for stream.Next() {
+		ev := stream.Current()
+		switch ev.Type {
+		case "response.output_text.delta":
+			delta := ev.AsResponseOutputTextDelta().Delta
+			if !textStarted {
+				emit(StreamChunk{Kind: ChunkTextStart})
+				textStarted = true
 			}
-			config.Debugf("reasoning parsed: id=%q len=%d", r.ID, len(msg.ReasoningContent))
-		case "function_call":
-			c := output.AsFunctionCall()
-			msg.ToolCalls = append(msg.ToolCalls, schema.ToolCall{
-				ID:        c.CallID,
-				Name:      c.Name,
-				Arguments: json.RawMessage(c.Arguments),
-			})
+			msg.Content += delta
+			emit(StreamChunk{Kind: ChunkTextDelta, Delta: delta})
+		case "response.output_text.done":
+			if textStarted {
+				emit(StreamChunk{Kind: ChunkTextEnd})
+				textStarted = false
+			}
+		case "response.reasoning_text.delta":
+			delta := ev.AsResponseReasoningTextDelta().Delta
+			if !reasoningStarted {
+				emit(StreamChunk{Kind: ChunkReasoningStart})
+				reasoningStarted = true
+			}
+			emit(StreamChunk{Kind: ChunkReasoningDelta, Delta: delta})
+		case "response.reasoning_summary_text.delta":
+			delta := ev.AsResponseReasoningSummaryTextDelta().Delta
+			if !reasoningStarted {
+				emit(StreamChunk{Kind: ChunkReasoningStart})
+				reasoningStarted = true
+			}
+			emit(StreamChunk{Kind: ChunkReasoningDelta, Delta: delta})
+		case "response.output_item.done":
+			item := ev.AsResponseOutputItemDone().Item
+			switch item.Type {
+			case "reasoning":
+				r := item.AsReasoning()
+				msg.ReasoningID = r.ID
+				for _, c := range r.Content {
+					msg.ReasoningContent += c.Text
+				}
+				if reasoningStarted {
+					emit(StreamChunk{Kind: ChunkReasoningEnd})
+					reasoningStarted = false
+				}
+				config.Debugf("reasoning streamed: id=%q len=%d", r.ID, len(msg.ReasoningContent))
+			case "function_call":
+				c := item.AsFunctionCall()
+				tc := schema.ToolCall{
+					ID:        c.CallID,
+					Name:      c.Name,
+					Arguments: json.RawMessage(c.Arguments),
+				}
+				msg.ToolCalls = append(msg.ToolCalls, tc)
+				emit(StreamChunk{Kind: ChunkToolCall, ToolCall: &tc})
+			}
+		case "response.completed":
+			resp := ev.AsResponseCompleted().Response
+			msg.TokenUsed = schema.TokenStatistics{
+				TokenInput:  int(resp.Usage.InputTokens),
+				TokenOutput: int(resp.Usage.OutputTokens),
+			}
 		}
+	}
+	if err := stream.Err(); err != nil {
+		return nil, err
 	}
 
 	return msg, nil
