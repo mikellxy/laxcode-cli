@@ -14,6 +14,10 @@ import (
 	"go.opentelemetry.io/otel/trace"
 )
 
+type Closer interface {
+	Close() error
+}
+
 type Registry interface {
 	GetAvailableTools() []schema.ToolDefinition
 	Execute(ctx context.Context, toolCall *schema.ToolCall) *schema.ToolResult
@@ -108,14 +112,12 @@ func (d *DefaultRegistry) Register(tool BaseTool) {
 	d.db[tool.Name()] = tool
 }
 
-type closer interface{ Close() error }
-
 // Close 关闭实现了 closer 的已注册工具（如 bash 工具回收后台进程与
 // 临时文件），由前端 loop 在运行结束时调用；未实现者跳过
 func (d *DefaultRegistry) Close() error {
 	var errs []error
 	for _, tool := range d.db {
-		if c, ok := tool.(closer); ok {
+		if c, ok := tool.(Closer); ok {
 			if err := c.Close(); err != nil {
 				errs = append(errs, err)
 			}

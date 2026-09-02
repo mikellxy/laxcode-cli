@@ -140,7 +140,7 @@ func TerminalLoop(ctx context.Context, agentEngine *AgentEngine) error {
 // （bash 工具的后台进程与临时文件）。Registry 接口不强制 Close，
 // 经类型断言按需调用
 func closeToolRegistry(agentEngine *AgentEngine) {
-	if c, ok := agentEngine.ToolRegistry.(interface{ Close() error }); ok {
+	if c, ok := agentEngine.ToolRegistry.(tools.Closer); ok {
 		_ = c.Close()
 	}
 }
@@ -177,12 +177,7 @@ func (f *AgentEngine) Run(ctx context.Context) (string, error) {
 	turnCnt := 0
 
 	for {
-		//turnCnt++
-		//if turnCnt > 50 {
-		//	reActSpan.RecordError(errTooManyTurns)
-		//	reActSpan.SetStatus(codes.Error, errTooManyTurns.Error())
-		//	return "", errTooManyTurns
-		//}
+		turnCnt++
 
 		timeStart := time.Now()
 

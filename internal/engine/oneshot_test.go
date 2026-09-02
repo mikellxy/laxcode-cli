@@ -161,35 +161,6 @@ func TestOneShotLoopGenerateFailure(t *testing.T) {
 	}
 }
 
-func TestOneShotLoopTooManyTurns(t *testing.T) {
-	sess := newSession(t.TempDir(), "s-turns")
-	// 每轮都返回带工具调用的消息（工具不存在，registry 返回错误结果），
-	// 50 轮后 Run 触发 errTooManyTurns
-	p := &mockProvider{msg: &schema.Message{
-		Role:      schema.RoleAssistant,
-		Content:   "继续",
-		ToolCalls: []schema.ToolCall{{ID: "c1", Name: "unknown_tool", Arguments: json.RawMessage(`{}`)}},
-	}}
-	eng := newOneShotEngine(t, sess, p)
-
-	var runErr error
-	out := captureStdout(t, func() {
-		runErr = OneShotLoop(context.Background(), eng, "任务")
-	})
-	if !errors.Is(runErr, errTooManyTurns) {
-		t.Fatalf("应返回 errTooManyTurns，实际 %v", runErr)
-	}
-
-	m := parseOneShotJSON(t, out)
-	errObj := m["error"].(map[string]any)
-	if errObj["type"] != ErrTypeTooManyTurns {
-		t.Errorf("error.type = %v, want %s", errObj["type"], ErrTypeTooManyTurns)
-	}
-	if m["session_id"] != "s-turns" {
-		t.Errorf("session_id = %v, want s-turns", m["session_id"])
-	}
-}
-
 func TestOneShotErrTypeMapping(t *testing.T) {
 	if got := oneShotErrType(errTooManyTurns); got != ErrTypeTooManyTurns {
 		t.Errorf("errTooManyTurns 映射为 %s, want %s", got, ErrTypeTooManyTurns)

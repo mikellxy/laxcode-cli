@@ -121,16 +121,17 @@ func (b *BashTool) Execute(ctx context.Context, args json.RawMessage) (string, e
 	// 独立进程组：超时时收割整棵进程树（含后台派生），且不波及其他
 	// 命令留下的后台进程
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	// 覆盖 CommandContext 默认的"只杀直接子进程"，改为按负 pid 杀整组
-	cmd.Cancel = func() error {
-		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
-	}
 
 	if err := cmd.Start(); err != nil {
 		_ = tmp.Close()
 		_ = os.Remove(tmp.Name())
 		return "", laxctx.NewErrorWithPrompt(&laxctx.BashExecuteError{}, err)
 	}
+	// 覆盖 CommandContext 默认的"只杀直接子进程"，改为按负 pid 杀整组
+	cmd.Cancel = func() error {
+		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	}
+
 	b.track(cmd.Process.Pid, tmp.Name())
 	err = cmd.Wait()
 	_ = tmp.Close()
