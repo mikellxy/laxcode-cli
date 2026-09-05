@@ -80,7 +80,7 @@ func Run() {
 	if err := sess.Init(); err != nil {
 		printer.Fatal(err)
 	}
-	if err := sess.ReplaceSysPrompt(ctx, prompt.GetSysPrompt(workDir)); err != nil {
+	if err := sess.ReplaceSysPrompt(ctx, prompt.GetSysPrompt(workDir, sess.ID, config.CliConf.Plan)); err != nil {
 		printer.Fatal(err)
 	}
 

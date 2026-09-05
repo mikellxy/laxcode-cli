@@ -110,7 +110,7 @@ func Run() int {
 	if err := sess.Init(); err != nil {
 		return usageFail("init session failed: %v", err)
 	}
-	if err := sess.ReplaceSysPrompt(ctx, prompt.GetSysPrompt(workDir)); err != nil {
+	if err := sess.ReplaceSysPrompt(ctx, prompt.GetSysPrompt(workDir, sess.ID, cli.Plan)); err != nil {
 		return usageFail("replace sys prompt failed: %v", err)
 	}
 
