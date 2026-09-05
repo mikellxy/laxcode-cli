@@ -62,7 +62,7 @@ func main() {
 	if err := sess.Init(); err != nil {
 		printer.Fatal(err)
 	}
-	sess.ReplaceSysPrompt(ctx, prompt.GetSysPrompt())
+	sess.ReplaceSysPrompt(ctx, prompt.GetSysPrompt(workDir))
 
 	c := config.Config
 	llmProvider := llmprovider.NewOpenApiProvider(c.OpenaiApiKey, c.OpenaiBaseUrl, c.OpenaiModel)
