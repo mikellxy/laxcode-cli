@@ -36,13 +36,13 @@ const (
 )
 
 func checkConfig() error {
-	if config.Config.OpenaiApiKey == "" {
+	if config.EnvAndFileConf.OpenaiApiKey == "" {
 		return errors.New("openai_api_key is required")
 	}
-	if config.Config.OpenaiBaseUrl == "" {
+	if config.EnvAndFileConf.OpenaiBaseUrl == "" {
 		return errors.New("openai_base_url is required")
 	}
-	if config.Config.OpenaiModel == "" {
+	if config.EnvAndFileConf.OpenaiModel == "" {
 		return errors.New("openai_model is required")
 	}
 	return nil
@@ -82,7 +82,7 @@ func main() {
 	}
 	sess.ReplaceSysPrompt(ctx, prompt.GetSysPrompt(workDir))
 
-	c := config.Config
+	c := config.EnvAndFileConf
 	llmProvider := llmprovider.NewOpenApiProvider(c.OpenaiApiKey, c.OpenaiBaseUrl, c.OpenaiModel)
 
 	// tracer 装配：HandleDB 非空时优先用 custom 包 init 注册的 Handle；否则

@@ -3,9 +3,9 @@
 现状约束（详见 proposal.md 的 Why）：
 
 - 打印分散在 6 处：模型消息（`engine/printer.go`，经 `AgentEngine.PrintLLM` 注入）、工具调用提示（`tools/registry.go:55` 硬编码）、压缩提示（`engine.Run` 内硬编码）、session/skill 包级警告函数、`config.Debugf`、main 横幅与 REPL 交互
-- 依赖方向：`schema`/`config`/`context` 是叶子；`tools` 依赖 `context`；`engine` 依赖全部。printer 要同时被 engine 与 tools 使用，**不能住进 engine**（否则 tools→engine 成环）
+- 依赖方向：`schema`/`envAndFileConf`/`context` 是叶子；`tools` 依赖 `context`；`engine` 依赖全部。printer 要同时被 engine 与 tools 使用，**不能住进 engine**（否则 tools→engine 成环）
 - `AgentEngine.PrintLLM` 字段承载主/子 Agent 配色差异（主：灰/绿；子：紫），是 per-engine 关注
-- `config` 包的 `Item` 只填 `Flag`、留空 `Env`/`Key` 即天然忽略环境变量与 settings.json（`-session`/`-plan` 已有先例）
+- `envAndFileConf` 包的 `Item` 只填 `Flag`、留空 `Env`/`Key` 即天然忽略环境变量与 settings.json（`-session`/`-plan` 已有先例）
 - bash 工具经 `CombinedOutput()` 捕获子进程输出，子进程不直接写 stdout/stderr，输出面可控
 
 ## Goals / Non-Goals
