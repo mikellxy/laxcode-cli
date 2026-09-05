@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 
-	"github.com/mikellxy/laxcode/internal/config"
 	"github.com/mikellxy/laxcode/internal/domain/sharedkernel"
 	"github.com/openai/openai-go/v3"
 	"github.com/openai/openai-go/v3/option"
@@ -88,7 +87,6 @@ func (p *OpenApiProvider) buildResponseParams(msgs []sharedkernel.Message, tools
 						},
 					},
 				})
-				config.Debugf("reasoning replayed: id=%q len=%d", msg.ReasoningID, len(msg.ReasoningContent))
 			}
 			if len(msg.Content) > 0 {
 				item := responses.ResponseInputItemParamOfMessage(msg.Content, responses.EasyInputMessageRoleAssistant)
@@ -181,7 +179,6 @@ func (p *OpenApiProvider) GenerateStream(ctx context.Context, msgs []sharedkerne
 					emit(sharedkernel.StreamChunk{Kind: sharedkernel.ChunkReasoningEnd})
 					reasoningStarted = false
 				}
-				config.Debugf("reasoning streamed: id=%q len=%d", r.ID, len(msg.ReasoningContent))
 			case "function_call":
 				c := item.AsFunctionCall()
 				tc := sharedkernel.ToolCall{

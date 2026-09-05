@@ -188,24 +188,37 @@ Starting with `‑plan` injects an enforced serial workflow, and all planning st
 laxcode only depends on the OpenTelemetry API module and does not ship an implementation of a real reporting backend. By default the built-in filetrace persists spans as JSON Lines to `${workdir}/.laxcode/.session/${session_id}/log/tracing.log` (see section 2.1). To report traces to your own observability backend, implement a custom Handle following the conventions below:
 
 1. Implement the three interfaces `trace.TracerProvider` / `trace.Tracer` / `trace.Span`. The interfaces are sealed (they contain unexported marker methods) and must be satisfied by embedding the corresponding interfaces from the `go.opentelemetry.io/otel/trace/embedded` package. `Span.End()` is the reporting trigger — it is called synchronously once every time a span ends, so avoid blocking IO in the implementation (enqueue only, and batch-send from a background goroutine).
-2. Put the entry file in the `internal/tracing/custom/` package and register it in `func init()` by calling `tracing.Register("<name>", tracing.New(provider))` — main.go already blank-imports this package, so init runs automatically at process startup.
+2. Put the entry file in the `internal/infrastructure/tracing/custom/` package and register it in `func init()` by calling `tracing.Register("<name>", tracing.New(provider))` — the composition root cmd/agentasm already blank-imports this package, so init runs automatically at process startup.
 3. If the provider implements the `Shutdown(context.Context) error` method, it is auto-detected and invoked before process exit to flush trailing spans (a one-shot process may live shorter than the batch export interval, so this is the required safety net).
-4. Start with `-trace_hanle_name=<name>` to select a registered implementation; the default is local filetrace persistence (currently only interactive terminal mode supports selecting via this argument).
-
-A complete, compilable example (OTLP/HTTP JSON batch export to Jaeger / Tempo / otel-collector and other protocol-compatible backends) is in [examples/tracing/](examples/tracing/): copy it into `internal/tracing/custom/` and rebuild.
+4. A registered custom Handle is automatically preferred over the built-in filetrace (no startup argument needed); when nothing is registered, the default is local filetrace persistence.
 
 ## 7. Architecture
+The codebase follows DDD layering, with dependencies flowing `cmd → application → domain ← infrastructure` (domain depends on no other layer):
+
 ```
 LaxCode/
-├── cmd/main/              # entrypoint: assembles registry, provider, engine
+├── cmd/
+│   ├── main/              # entrypoint: parses config, dispatches interactive / one-shot mode
+│   ├── agentasm/          # composition root: assembles session/tracer/tools/provider/ReActService
+│   ├── run_cli/           # interactive-mode frontend (REPL loop, signal handling)
+│   └── run_oneshot/       # one-shot-mode frontend (result JSON contract, exit codes)
 ├── internal/
-│   ├── engine/            # ReAct loop, session management, tool dispatch, sub-agents
-│   ├── provider/          # LLM interface abstraction + OpenAI-compatible / Anthropic dual implementations
-│   ├── context/           # system prompt assembly, skill index, context compaction, error prompt protocol
-│   ├── tools/             # tool registry and read/write/edit/bash implementations
-│   ├── schema/            # neutral data structures: messages, tool definitions, etc.
-│   ├── utils/             # stateless infrastructure such as paginated reading
-│   └── config/               # configuration loading
+│   ├── application/
+│   │   └── reactservice/  # ReAct reasoning loop, sub-agent delegation
+│   ├── domain/
+│   │   ├── session/       # session aggregate, SessionRepository interface
+│   │   ├── tools/         # tool interfaces & registry, read/write/edit/bash implementations
+│   │   ├── llmprovider/   # LLM client interface
+│   │   ├── prompt/        # system prompt assembly (persona / skill index / Plan Mode)
+│   │   └── sharedkernel/  # shared types: messages, tool definitions, token stats
+│   ├── infrastructure/
+│   │   ├── llmprovider/   # OpenAI Responses protocol implementation
+│   │   ├── sessionrepo/   # filesystem session repository (JSONL persistence)
+│   │   ├── compactor/     # context compaction
+│   │   ├── config/        # configuration loading (env vars / config file / CLI flags)
+│   │   ├── cliprinter/    # terminal printing
+│   │   └── tracing/       # OTel wrapper, filetrace persistence, custom extension point
+│   └── utils/             # stateless infrastructure such as paginated reading
 └── openspec/              # change-management docs produced during development
 ```
 
@@ -220,7 +233,7 @@ flowchart TD
         direction TB
         compact["Context compaction<br/>triggered when window usage ≥ 80%"] --> gen["Call LLM"]
         gen --> judge{"Response carries<br/>tool calls?"}
-        judge -->|"Yes"| exec["Execute tools<br/>read_file batches run in parallel"]
+        judge -->|"Yes"| exec["Execute tools"]
         exec --> writeback["Write tool results back to session"]
         writeback --> compact
     end
