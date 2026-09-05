@@ -13,7 +13,6 @@ import (
 	"syscall"
 	"time"
 
-	laxctx "github.com/mikellxy/laxcode/internal/context"
 	"github.com/mikellxy/laxcode/internal/domain/sharedkernel"
 )
 
@@ -103,11 +102,11 @@ func (b *BashTool) Execute(ctx context.Context, args json.RawMessage) (string, e
 
 	argsMap := make(map[string]string)
 	if err := json.Unmarshal(args, &argsMap); err != nil {
-		return "", laxctx.NewErrorWithPrompt(&laxctx.ParamError{}, err)
+		return "", NewErrorWithPrompt(&ParamError{}, err)
 	}
 	command, ok := argsMap["command"]
 	if !ok || strings.TrimSpace(command) == "" {
-		return "", laxctx.NewErrorWithPrompt(&laxctx.ParamError{}, errors.New("command required"))
+		return "", NewErrorWithPrompt(&ParamError{}, errors.New("command required"))
 	}
 
 	ctx, cancel := context.WithTimeout(ctx, b.timeout())
@@ -118,7 +117,7 @@ func (b *BashTool) Execute(ctx context.Context, args json.RawMessage) (string, e
 	// 退出即可返回，后台进程还能继续安全写入
 	tmp, err := os.CreateTemp("", "laxbash-*")
 	if err != nil {
-		return "", laxctx.NewErrorWithPrompt(&laxctx.BashExecuteError{}, err)
+		return "", NewErrorWithPrompt(&BashExecuteError{}, err)
 	}
 
 	cmd := exec.CommandContext(ctx, "bash", "-c", command)
@@ -132,7 +131,7 @@ func (b *BashTool) Execute(ctx context.Context, args json.RawMessage) (string, e
 	if err := cmd.Start(); err != nil {
 		_ = tmp.Close()
 		_ = os.Remove(tmp.Name())
-		return "", laxctx.NewErrorWithPrompt(&laxctx.BashExecuteError{}, err)
+		return "", NewErrorWithPrompt(&BashExecuteError{}, err)
 	}
 	// 覆盖 CommandContext 默认的"只杀直接子进程"，改为按负 pid 杀整组
 	cmd.Cancel = func() error {
@@ -144,13 +143,13 @@ func (b *BashTool) Execute(ctx context.Context, args json.RawMessage) (string, e
 	_ = tmp.Close()
 
 	if ctx.Err() != nil {
-		return "", laxctx.NewErrorWithPrompt(&laxctx.BashExecuteError{},
+		return "", NewErrorWithPrompt(&BashExecuteError{},
 			fmt.Errorf("bash执行超时或被取消: %w", ctx.Err()))
 	}
 
 	output, readErr := os.ReadFile(tmp.Name())
 	if readErr != nil {
-		return "", laxctx.NewErrorWithPrompt(&laxctx.BashExecuteError{},
+		return "", NewErrorWithPrompt(&BashExecuteError{},
 			fmt.Errorf("读取命令输出失败: %w", readErr))
 	}
 
@@ -161,7 +160,7 @@ func (b *BashTool) Execute(ctx context.Context, args json.RawMessage) (string, e
 		if errors.As(err, &exitErr) {
 			result.ExitCode = exitErr.ExitCode()
 		} else {
-			return "", laxctx.NewErrorWithPrompt(&laxctx.BashExecuteError{}, err)
+			return "", NewErrorWithPrompt(&BashExecuteError{}, err)
 		}
 	}
 

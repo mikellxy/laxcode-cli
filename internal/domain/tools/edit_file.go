@@ -10,7 +10,6 @@ import (
 	"strconv"
 	"strings"
 
-	laxctx "github.com/mikellxy/laxcode/internal/context"
 	"github.com/mikellxy/laxcode/internal/domain/sharedkernel"
 )
 
@@ -76,15 +75,15 @@ func (e *EditFileTool) Execute(ctx context.Context, args json.RawMessage) (strin
 
 	path, ok := argsMap["path"]
 	if !ok || strings.TrimSpace(path) == "" {
-		return "", laxctx.NewErrorWithPrompt(&laxctx.ParamError{}, errors.New("path required"))
+		return "", NewErrorWithPrompt(&ParamError{}, errors.New("path required"))
 	}
 	oldText, ok := argsMap["old_text"]
 	if !ok || strings.TrimSpace(oldText) == "" {
-		return "", laxctx.NewErrorWithPrompt(&laxctx.ParamError{}, errors.New("old_text required"))
+		return "", NewErrorWithPrompt(&ParamError{}, errors.New("old_text required"))
 	}
 	newText, ok := argsMap["new_text"]
 	if !ok {
-		return "", laxctx.NewErrorWithPrompt(&laxctx.ParamError{}, errors.New("new_text required"))
+		return "", NewErrorWithPrompt(&ParamError{}, errors.New("new_text required"))
 	}
 
 	target, err := safeJoinWorkDir(path, e.WorkDir)
@@ -95,10 +94,10 @@ func (e *EditFileTool) Execute(ctx context.Context, args json.RawMessage) (strin
 	b, err := os.ReadFile(target)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return "", laxctx.NewErrorWithPrompt(&laxctx.FileNotExistError{},
+			return "", NewErrorWithPrompt(&FileNotExistError{},
 				fmt.Errorf("文件 %s 不存在，新建文件请使用 write_file", path))
 		}
-		return "", laxctx.NewErrorWithPrompt(&laxctx.FileIOError{}, err)
+		return "", NewErrorWithPrompt(&FileIOError{}, err)
 	}
 
 	newContent, start, end, level, err := applyEdit(string(b), oldText, newText)
@@ -107,7 +106,7 @@ func (e *EditFileTool) Execute(ctx context.Context, args json.RawMessage) (strin
 	}
 
 	if err := os.WriteFile(target, []byte(newContent), 0o644); err != nil {
-		return "", laxctx.NewErrorWithPrompt(&laxctx.FileIOError{}, err)
+		return "", NewErrorWithPrompt(&FileIOError{}, err)
 	}
 
 	rel, err := filepath.Rel(e.WorkDir, target)
@@ -226,7 +225,7 @@ func applyEdit(content, oldText, newText string) (string, int, int, string, erro
 		}
 	}
 
-	return "", 0, 0, "", laxctx.NewErrorWithPrompt(&laxctx.EditNotFoundError{},
+	return "", 0, 0, "", NewErrorWithPrompt(&EditNotFoundError{},
 		errors.New("未找到匹配。文件可能已被修改，请重新 read_file 后重试；注意 old_text 须与文件内容逐字一致"))
 }
 
@@ -323,6 +322,6 @@ func multiMatchError(lineNos []int) error {
 	for i, n := range lineNos {
 		parts[i] = strconv.Itoa(n)
 	}
-	return laxctx.NewErrorWithPrompt(&laxctx.EditMultiMatchError{},
+	return NewErrorWithPrompt(&EditMultiMatchError{},
 		fmt.Errorf("old_text 在文件中匹配到 %d 处（第 %s 行），请扩大 old_text 范围加入上下文行使其唯一", len(lineNos), strings.Join(parts, "、")))
 }

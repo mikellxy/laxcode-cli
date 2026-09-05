@@ -9,7 +9,6 @@ import (
 	"path/filepath"
 	"strings"
 
-	laxctx "github.com/mikellxy/laxcode/internal/context"
 	"github.com/mikellxy/laxcode/internal/domain/sharedkernel"
 )
 
@@ -66,31 +65,31 @@ func (w *WriteFileTool) Definition() sharedkernel.ToolDefinition {
 func (w *WriteFileTool) Execute(ctx context.Context, args json.RawMessage) (string, error) {
 	argsMap := make(map[string]string)
 	if err := json.Unmarshal(args, &argsMap); err != nil {
-		return "", laxctx.NewErrorWithPrompt(&laxctx.ParamError{}, err)
+		return "", NewErrorWithPrompt(&ParamError{}, err)
 	}
 
 	path, ok := argsMap["path"]
 	if !ok || strings.TrimSpace(path) == "" {
-		return "", laxctx.NewErrorWithPrompt(&laxctx.ParamError{}, errors.New("path required"))
+		return "", NewErrorWithPrompt(&ParamError{}, errors.New("path required"))
 	}
 
 	content, ok := argsMap["content"]
 	if !ok {
-		return "", laxctx.NewErrorWithPrompt(&laxctx.ParamError{}, errors.New("content required"))
+		return "", NewErrorWithPrompt(&ParamError{}, errors.New("content required"))
 	}
 
 	target, err := safeJoinWorkDir(path, w.WorkDir)
 	if err != nil {
-		return "", laxctx.NewErrorWithPrompt(&laxctx.FilePathError{}, err)
+		return "", NewErrorWithPrompt(&FilePathError{}, err)
 	}
 
 	// 自动创建父目录
 	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
-		return "", laxctx.NewErrorWithPrompt(&laxctx.FileIOError{}, fmt.Errorf("create parent dir: %w", err))
+		return "", NewErrorWithPrompt(&FileIOError{}, fmt.Errorf("create parent dir: %w", err))
 	}
 
 	if err := os.WriteFile(target, []byte(content), 0o644); err != nil {
-		return "", laxctx.NewErrorWithPrompt(&laxctx.FileIOError{}, err)
+		return "", NewErrorWithPrompt(&FileIOError{}, err)
 	}
 
 	// 返回相对工作目录的路径，便于模型确认

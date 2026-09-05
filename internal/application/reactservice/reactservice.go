@@ -65,7 +65,7 @@ func (r *ReActService) Run(ctx context.Context) (*sharedkernel.Message, error) {
 			r.ReActEventConsumerF(&ReactEvent{Type: ReActEventTypeToolCall, Content: info})
 
 			result := r.ToolRegistry.Execute(ctx, &tc)
-			toolMsg := tools.ToolResultAsMsg(ctx, tc.Name, result)
+			toolMsg := tools.ToolResultAsMsg(result)
 			if err := r.Session.AppendMessage(ctx, toolMsg); err != nil {
 				return nil, err
 			}

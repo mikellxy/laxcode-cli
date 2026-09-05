@@ -8,7 +8,6 @@ import (
 	"os"
 	"strings"
 
-	laxctx "github.com/mikellxy/laxcode/internal/context"
 	"github.com/mikellxy/laxcode/internal/domain/sharedkernel"
 	"github.com/mikellxy/laxcode/internal/utils"
 )
@@ -82,26 +81,26 @@ func (r *ReadFileTool) Definition() sharedkernel.ToolDefinition {
 func (r *ReadFileTool) Execute(ctx context.Context, args json.RawMessage) (string, error) {
 	var argsObj readFileToolArgs
 	if err := json.Unmarshal(args, &argsObj); err != nil {
-		return "", laxctx.NewErrorWithPrompt(&laxctx.ParamError{}, err)
+		return "", NewErrorWithPrompt(&ParamError{}, err)
 	}
 
 	if argsObj.Path == "" || strings.TrimSpace(argsObj.Path) == "" {
-		return "", laxctx.NewErrorWithPrompt(&laxctx.ParamError{}, errors.New("path required"))
+		return "", NewErrorWithPrompt(&ParamError{}, errors.New("path required"))
 	}
 
 	pathSafe, err := safeJoinWorkDir(argsObj.Path, r.WorkDir)
 	if err != nil {
-		return "", laxctx.NewErrorWithPrompt(&laxctx.FilePathError{}, err)
+		return "", NewErrorWithPrompt(&FilePathError{}, err)
 	}
 
 	result := utils.ReadUpToNKB(readFileToolMaxReadBytes, readFileToolMaxReadLines,
 		argsObj.StartLineNo, argsObj.StartBytes, pathSafe)
 	if result.Err != nil {
 		if os.IsNotExist(result.Err) {
-			return "", laxctx.NewErrorWithPrompt(&laxctx.FileNotExistError{},
+			return "", NewErrorWithPrompt(&FileNotExistError{},
 				fmt.Errorf("文件 %s 不存在，请核对相对路径是否正确", argsObj.Path))
 		}
-		return "", laxctx.NewErrorWithPrompt(&laxctx.FileIOError{}, result.Err)
+		return "", NewErrorWithPrompt(&FileIOError{}, result.Err)
 	}
 
 	if len(result.Content) == 0 {
