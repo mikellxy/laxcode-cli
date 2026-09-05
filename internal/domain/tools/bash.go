@@ -127,15 +127,18 @@ func (b *BashTool) Execute(ctx context.Context, args json.RawMessage) (string, e
 	// 独立进程组：超时时收割整棵进程树（含后台派生），且不波及其他
 	// 命令留下的后台进程
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	// 覆盖 CommandContext 默认的"只杀直接子进程"，改为按负 pid 杀整组。
+	// 必须在 Start 之前完成赋值：os/exec 的 watchCtx 协程在 Start 返回后
+	// 可能并发读取 Cancel，Start 之后再写会构成数据竞争。闭包内对
+	// cmd.Process 的读取发生在取消时刻（彼时 Start 早已返回并赋好值）。
+	cmd.Cancel = func() error {
+		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	}
 
 	if err := cmd.Start(); err != nil {
 		_ = tmp.Close()
 		_ = os.Remove(tmp.Name())
 		return "", NewErrorWithPrompt(&BashExecuteError{}, err)
-	}
-	// 覆盖 CommandContext 默认的"只杀直接子进程"，改为按负 pid 杀整组
-	cmd.Cancel = func() error {
-		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 	}
 
 	b.track(cmd.Process.Pid, tmp.Name())
