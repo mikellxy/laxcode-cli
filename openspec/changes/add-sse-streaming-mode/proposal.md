@@ -25,7 +25,7 @@ provider 层的流式底座（`StreamProvider.GenerateStream` + `StreamChunk`）
 
 ## Impact
 
-- **代码（engine）**：新增 `internal/engine/runsse.go`（`RunSse` + `RunEvent`）、`internal/engine/sse_server.go`（HTTP handler + server 装配）；改 `engine.go`（`Run` 内联记账、删 `errTooManyTurns`、简化 `TerminalLoop` 错误分支）、`oneshot.go`（删 `ErrTypeTooManyTurns` 及映射）、`session.go`（`SessionDB` 加读写锁、`GetSession` 双检加载、文档注释更新）；删 `monitored_provider.go` 与 `monitored_provider_test.go`。
+- **代码（engine）**：新增 `internal/engine/runsse.go`（`RunSse` + `RunEvent`）、`internal/engine/sse_server.go`（HTTP handler + server 装配）；改 `reactservice.go`（`Run` 内联记账、删 `errTooManyTurns`、简化 `TerminalLoop` 错误分支）、`oneshot.go`（删 `ErrTypeTooManyTurns` 及映射）、`session.go`（`SessionDB` 加读写锁、`GetSession` 双检加载、文档注释更新）；删 `monitored_provider.go` 与 `monitored_provider_test.go`。
 - **代码（main）**：`cmd/main/main.go` 新增 `-sse`（及 `-addr`）参数与 `runSseServer` 装配路径；`assembleEngine` 改用裸 provider（去 `MonitoredProvider`）。
 - **代码（subagent）**：`internal/engine/subagent.go` 装配改用裸 provider。
 - **依赖**：仅标准库 `net/http`，无新增第三方依赖。
