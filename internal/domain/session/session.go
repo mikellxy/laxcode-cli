@@ -46,20 +46,17 @@ func (s *Session) Init() error {
 	return nil
 }
 
-func (s *Session) ReplaceSysPrompt(ctx context.Context, p string) {
+func (s *Session) ReplaceSysPrompt(ctx context.Context, p string) error {
 	if len(s.Messages) > 0 && s.Messages[0].Role == sharedkernel.RoleSystem {
 		s.Messages[0].Content = p
-		return
+		return nil
 	}
 
 	msg := sharedkernel.Message{
 		Role:    sharedkernel.RoleSystem,
 		Content: p,
 	}
-	msgs := make([]sharedkernel.Message, 0, len(s.Messages)+1)
-	msgs = append(msgs, msg)
-	msgs = append(msgs, s.Messages...)
-	s.Messages = msgs
+	return s.AppendMessage(ctx, &msg)
 }
 
 func (s *Session) AppendUserPrompt(ctx context.Context, p string) error {
@@ -75,17 +72,24 @@ func (s *Session) AppendMessage(ctx context.Context, msg *sharedkernel.Message) 
 		return err
 	}
 	s.Messages = append(s.Messages, *msg)
+	if msg.Role == sharedkernel.RoleAssistant {
+		s.UpdateCost(ctx, msg.TokenUsed.TokenInput, msg.TokenUsed.TokenOutput)
+	}
 	return nil
 }
 
-func (s *Session) UpdateCost(tokenInput, tokenOutput int) {
+func (s *Session) UpdateCost(ctx context.Context, tokenInput, tokenOutput int) {
 	s.TokenUsed.TokenInput += tokenInput
 	s.TokenUsed.TokenOutput += tokenOutput
-}
-
-func (s *Session) UpdateWindowToken(tokenInput, tokenOutput int) {
 	s.WindowToken.TokenInput = tokenInput
 	s.WindowToken.TokenOutput = tokenOutput
+	s.UpdateMeta(ctx)
+}
+
+func (s *Session) UpdateWindowToken(ctx context.Context, tokenInput, tokenOutput int) {
+	s.WindowToken.TokenInput += tokenInput
+	s.WindowToken.TokenOutput += tokenOutput
+	s.UpdateMeta(ctx)
 }
 
 func (s *Session) UpdateMeta(ctx context.Context) {

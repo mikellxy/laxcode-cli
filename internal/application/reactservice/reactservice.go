@@ -89,8 +89,7 @@ func (r *ReActService) Run(ctx context.Context) (*sharedkernel.Message, error) {
 		msgs, compressRes := compactor.SimpleCompactor.Compress(r.Session.Messages, maxWindowToken, r.Session.TokenUsed)
 		r.Session.Messages = msgs
 		if compressRes != nil && compressRes.Total() > 0 {
-			r.Session.WindowToken.TokenInput -= compressRes.InputTokenCompressed
-			r.Session.WindowToken.TokenOutput -= compressRes.OutputTokenCompressed
+			r.Session.UpdateWindowToken(ctx, -compressRes.InputTokenCompressed, -compressRes.OutputTokenCompressed)
 		}
 
 		msg, err := r.LLMClient.Generate(turnCtx, r.Session.Messages, r.ToolRegistry.GetAvailableTools())
@@ -110,10 +109,6 @@ func (r *ReActService) Run(ctx context.Context) (*sharedkernel.Message, error) {
 		if msg.Content != "" {
 			r.ReActEventConsumerF(&ReactEvent{Type: ReActEventTypeMsg, Content: msg.Content})
 		}
-		r.Session.WindowToken.TokenInput += msg.TokenUsed.TokenInput
-		r.Session.WindowToken.TokenOutput += msg.TokenUsed.TokenOutput
-		r.Session.TokenUsed.TokenInput += msg.TokenUsed.TokenInput
-		r.Session.TokenUsed.TokenOutput += msg.TokenUsed.TokenOutput
 
 		// llm-turn / ReAct 级 token 用量统计
 		reActInput += msg.TokenUsed.TokenInput

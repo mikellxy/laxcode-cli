@@ -1,4 +1,4 @@
-package main
+package run_cli
 
 import (
 	"bufio"
@@ -61,7 +61,7 @@ func newCliTraceHandle(logPath string) *tracing.Handle {
 	return tracing.New(tp)
 }
 
-func main() {
+func Run() {
 	printer := cliprinter.NewDefaultPrinter()
 
 	if err := checkConfig(); err != nil {
@@ -76,11 +76,13 @@ func main() {
 	}
 	sessionDir := filepath.Join(workDir, ".laxcode", ".session")
 	sessionRepo := sessionrepo.NewFsSessionRepo(sessionDir)
-	sess := session.NewSession("", sessionRepo)
+	sess := session.NewSession(config.CliConf.Session, sessionRepo)
 	if err := sess.Init(); err != nil {
 		printer.Fatal(err)
 	}
-	sess.ReplaceSysPrompt(ctx, prompt.GetSysPrompt(workDir))
+	if err := sess.ReplaceSysPrompt(ctx, prompt.GetSysPrompt(workDir)); err != nil {
+		printer.Fatal(err)
+	}
 
 	c := config.EnvAndFileConf
 	llmProvider := llmprovider.NewOpenApiProvider(c.OpenaiApiKey, c.OpenaiBaseUrl, c.OpenaiModel)

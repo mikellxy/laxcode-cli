@@ -6,7 +6,6 @@ import (
 
 	"github.com/mikellxy/laxcode/internal/config"
 	"github.com/mikellxy/laxcode/internal/domain/sharedkernel"
-	"github.com/mikellxy/laxcode/internal/schema"
 	"github.com/openai/openai-go/v3"
 	"github.com/openai/openai-go/v3/option"
 	"github.com/openai/openai-go/v3/responses"
@@ -48,7 +47,6 @@ func (p *OpenApiProvider) Generate(ctx context.Context, msgs []sharedkernel.Mess
 			for _, c := range r.Content {
 				msg.ReasoningContent += c.Text
 			}
-			config.Debugf("reasoning parsed: id=%q len=%d", r.ID, len(msg.ReasoningContent))
 		case "function_call":
 			c := output.AsFunctionCall()
 			msg.ToolCalls = append(msg.ToolCalls, sharedkernel.ToolCall{
@@ -130,13 +128,13 @@ func (p *OpenApiProvider) buildResponseParams(msgs []sharedkernel.Message, tools
 // 为权威源取参数（与批式读 resp.Output 同源），故 function_call_arguments.delta
 // 不需处理；token 用量只在 response.completed 可得。
 func (p *OpenApiProvider) GenerateStream(ctx context.Context, msgs []sharedkernel.Message, toolsDefs []sharedkernel.ToolDefinition,
-	emit func(chunk sharedkernel.StreamChunk)) (*schema.Message, error) {
+	emit func(chunk sharedkernel.StreamChunk)) (*sharedkernel.Message, error) {
 	reqParams := p.buildResponseParams(msgs, toolsDefs)
 
 	stream := p.client.Responses.NewStreaming(ctx, reqParams)
 	defer stream.Close()
 
-	msg := &schema.Message{Role: schema.RoleAssistant}
+	msg := &sharedkernel.Message{Role: sharedkernel.RoleAssistant}
 	// 三段式边界：首个 delta 惰性触发 start，对应 done 事件触发 end
 	var textStarted, reasoningStarted bool
 
@@ -186,7 +184,7 @@ func (p *OpenApiProvider) GenerateStream(ctx context.Context, msgs []sharedkerne
 				config.Debugf("reasoning streamed: id=%q len=%d", r.ID, len(msg.ReasoningContent))
 			case "function_call":
 				c := item.AsFunctionCall()
-				tc := schema.ToolCall{
+				tc := sharedkernel.ToolCall{
 					ID:        c.CallID,
 					Name:      c.Name,
 					Arguments: json.RawMessage(c.Arguments),
@@ -196,7 +194,7 @@ func (p *OpenApiProvider) GenerateStream(ctx context.Context, msgs []sharedkerne
 			}
 		case "response.completed":
 			resp := ev.AsResponseCompleted().Response
-			msg.TokenUsed = schema.TokenStatistics{
+			msg.TokenUsed = sharedkernel.TokenStatistics{
 				TokenInput:  int(resp.Usage.InputTokens),
 				TokenOutput: int(resp.Usage.OutputTokens),
 			}
