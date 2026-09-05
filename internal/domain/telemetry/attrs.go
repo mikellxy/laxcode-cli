@@ -1,11 +1,21 @@
-package tracing
+// Package telemetry 是 DDD 架构下领域层的可观测性词汇包：集中定义 span
+// 名与属性键常量、session_id 的 ctx 传播、span 关闭辅助与 noop 缺省。
+//
+// 本包只依赖 OpenTelemetry API（go.opentelemetry.io/otel），不包含任何
+// 上报后端、装配或资源生命周期逻辑，供 domain/application 层安全引用，
+// 使领域与编排代码不必静态依赖具体基础设施。
+//
+// 观测语义约定（ReAct/llm-turn/tool-exec 调用树、laxcode.* 业务属性、
+// gen_ai.* token 属性）沉淀于此，与 OTel 具体实现无关。真正的装配——
+// TracerProvider/上报后端的选择与进程退出 Shutdown——由
+// internal/infrastructure/tracing 负责。
+package telemetry
 
 import "go.opentelemetry.io/otel/attribute"
 
-// span 名。DDD 架构调用树（去掉老 terminal-task 层，聚焦 ReAct 循环）：
-// ReAct → llm-turn → {llm-generate, tool-exec}。ReAct/llm-turn 由
-// ReActService 负责，tool-exec 由工具注册表负责，llm-generate 由 provider
-// 层负责（本次不迁移）。
+// span 名。DDD 架构调用树：ReAct → llm-turn → {llm-generate, tool-exec}。
+// ReAct/llm-turn 由 application 层 ReActService 负责，tool-exec 由
+// domain/tools 注册表负责，llm-generate 由基础设施 provider 层负责。
 const (
 	SpanReAct       = "ReAct"
 	LLMTurn         = "llm-turn"

@@ -9,7 +9,7 @@ import (
 	"time"
 
 	"github.com/mikellxy/laxcode/internal/domain/sharedkernel"
-	"github.com/mikellxy/laxcode/internal/infrastructure/tracing"
+	"github.com/mikellxy/laxcode/internal/domain/telemetry"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 )
@@ -43,7 +43,7 @@ type DefaultRegistry struct {
 func NewDefaultRegistry(tracer trace.Tracer) *DefaultRegistry {
 	return &DefaultRegistry{
 		db:     make(map[string]BaseTool),
-		tracer: tracing.OrNoop(tracer),
+		tracer: telemetry.OrNoop(tracer),
 	}
 }
 
@@ -67,15 +67,15 @@ func (d *DefaultRegistry) Execute(ctx context.Context, toolCall *sharedkernel.To
 	timeStart := time.Now()
 	var execErr error
 
-	attrs := []attribute.KeyValue{tracing.AttrToolName.String(toolCall.Name)}
-	if sid := tracing.SessionIDFromContext(ctx); sid != "" {
-		attrs = append(attrs, tracing.AttrSessionID.String(sid))
+	attrs := []attribute.KeyValue{telemetry.AttrToolName.String(toolCall.Name)}
+	if sid := telemetry.SessionIDFromContext(ctx); sid != "" {
+		attrs = append(attrs, telemetry.AttrSessionID.String(sid))
 	}
-	ctx, span := d.tracer.Start(ctx, tracing.SpanToolExec, trace.WithAttributes(attrs...))
+	ctx, span := d.tracer.Start(ctx, telemetry.SpanToolExec, trace.WithAttributes(attrs...))
 	defer func() {
-		tracing.CloseSpan(span,
-			tracing.WithTimeCostMs(time.Since(timeStart).Milliseconds()),
-			tracing.WithErr(execErr),
+		telemetry.CloseSpan(span,
+			telemetry.WithTimeCostMs(time.Since(timeStart).Milliseconds()),
+			telemetry.WithErr(execErr),
 		)
 	}()
 
