@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -18,6 +19,10 @@ import (
 	"github.com/mikellxy/laxcode/internal/infrastructure/config"
 	"github.com/mikellxy/laxcode/internal/infrastructure/llmprovider"
 	"github.com/mikellxy/laxcode/internal/infrastructure/sessionrepo"
+	"github.com/mikellxy/laxcode/internal/infrastructure/tracing"
+	_ "github.com/mikellxy/laxcode/internal/infrastructure/tracing/custom"
+	"github.com/mikellxy/laxcode/internal/infrastructure/tracing/filetrace"
+	"go.opentelemetry.io/otel/trace"
 )
 
 const (
@@ -41,6 +46,19 @@ func checkConfig() error {
 		return errors.New("openai_model is required")
 	}
 	return nil
+}
+
+// newCliTraceHandle 按 logPath 构造默认的 filetrace Provider；日志文件无法
+// 创建时回退 noop 并在 stderr 提示。HandleDB 非空时由调用方覆盖为自定义 Handle。
+// 与老 main.go 的 newTraceHandle 区分命名，避免同包符号冲突。
+func newCliTraceHandle(logPath string) *tracing.Handle {
+	var tp trace.TracerProvider
+	if f, err := filetrace.New(logPath); err == nil {
+		tp = f
+	} else {
+		fmt.Fprintf(os.Stderr, "filetrace: %v; tracing disabled\n", err)
+	}
+	return tracing.New(tp)
 }
 
 func main() {
@@ -67,7 +85,24 @@ func main() {
 	c := config.Config
 	llmProvider := llmprovider.NewOpenApiProvider(c.OpenaiApiKey, c.OpenaiBaseUrl, c.OpenaiModel)
 
-	toolReg := tools.NewDefaultRegistry()
+	// tracer 装配：HandleDB 非空时优先用 custom 包 init 注册的 Handle；否则
+	// 默认用 filetrace 落盘到 ${workDir}/.laxcode/.session/${sessID}/log/tracing.log。
+	// 先查 HandleDB 再决定是否创建 filetrace，避免命中注册项时仍打开日志文件
+	// 造成句柄泄漏。defer Shutdown 先于 toolReg.Close 注册，故最后执行，确保
+	// 工具关闭阶段的 span 也被 flush。
+	var traceHandle *tracing.Handle
+	for _, h := range tracing.HandleDB {
+		traceHandle = h
+		break
+	}
+	if traceHandle == nil {
+		logPath := filepath.Join(workDir, ".laxcode", ".session", sess.ID, "log", "tracing.log")
+		traceHandle = newCliTraceHandle(logPath)
+	}
+	defer func() { _ = traceHandle.Shutdown(ctx) }()
+	tracer := traceHandle.Tracer
+
+	toolReg := tools.NewDefaultRegistry(tracer)
 	toolReg.Register(tools.NewBashTool(workDir))
 	toolReg.Register(tools.NewWriteFileTool(workDir))
 	toolReg.Register(tools.NewReadFileTool(workDir))
@@ -98,9 +133,11 @@ func main() {
 		sess,
 		llmProvider,
 		toolReg,
-		rcf)
+		rcf,
+		tracer)
 
 	scanner := bufio.NewScanner(os.Stdin)
+	printer.Printf("session_id: %s\n", sess.ID)
 	printer.Printf(">>> Agent ready, input your question\n")
 	for {
 		printer.Printf("%s> %s", ColorBlue, ColorReset)

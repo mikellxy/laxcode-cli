@@ -6,10 +6,12 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/mikellxy/laxcode/internal/domain/sharedkernel"
-	"github.com/mikellxy/laxcode/internal/tracing"
+	"github.com/mikellxy/laxcode/internal/infrastructure/tracing"
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 )
 
 type Closer interface {
@@ -33,11 +35,15 @@ type BaseTool interface {
 
 type DefaultRegistry struct {
 	db map[string]BaseTool
+	// tracer 是工具执行 span 的追踪注入点，经构造注入；nil 缺省 noop，
+	// 不产生任何观测输出。
+	tracer trace.Tracer
 }
 
-func NewDefaultRegistry() *DefaultRegistry {
+func NewDefaultRegistry(tracer trace.Tracer) *DefaultRegistry {
 	return &DefaultRegistry{
-		db: make(map[string]BaseTool),
+		db:     make(map[string]BaseTool),
+		tracer: tracing.OrNoop(tracer),
 	}
 }
 
@@ -58,12 +64,20 @@ func (d *DefaultRegistry) BeforeExecInfo(toolCall *sharedkernel.ToolCall) string
 }
 
 func (d *DefaultRegistry) Execute(ctx context.Context, toolCall *sharedkernel.ToolCall) *sharedkernel.ToolResult {
+	timeStart := time.Now()
 	var execErr error
 
 	attrs := []attribute.KeyValue{tracing.AttrToolName.String(toolCall.Name)}
 	if sid := tracing.SessionIDFromContext(ctx); sid != "" {
 		attrs = append(attrs, tracing.AttrSessionID.String(sid))
 	}
+	ctx, span := d.tracer.Start(ctx, tracing.SpanToolExec, trace.WithAttributes(attrs...))
+	defer func() {
+		tracing.CloseSpan(span,
+			tracing.WithTimeCostMs(time.Since(timeStart).Milliseconds()),
+			tracing.WithErr(execErr),
+		)
+	}()
 
 	tool, ok := d.db[toolCall.Name]
 	if !ok {
