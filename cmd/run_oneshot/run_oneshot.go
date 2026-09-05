@@ -14,21 +14,12 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
 	"strings"
 
+	"github.com/mikellxy/laxcode/cmd/agentasm"
 	"github.com/mikellxy/laxcode/internal/application/reactservice"
-	"github.com/mikellxy/laxcode/internal/domain/prompt"
-	"github.com/mikellxy/laxcode/internal/domain/session"
 	"github.com/mikellxy/laxcode/internal/domain/sharedkernel"
-	"github.com/mikellxy/laxcode/internal/domain/tools"
 	"github.com/mikellxy/laxcode/internal/infrastructure/config"
-	"github.com/mikellxy/laxcode/internal/infrastructure/llmprovider"
-	"github.com/mikellxy/laxcode/internal/infrastructure/sessionrepo"
-	"github.com/mikellxy/laxcode/internal/infrastructure/tracing"
-	_ "github.com/mikellxy/laxcode/internal/infrastructure/tracing/custom"
-	"github.com/mikellxy/laxcode/internal/infrastructure/tracing/filetrace"
-	"go.opentelemetry.io/otel/trace"
 )
 
 // 进程 exit code：供 main 直接 os.Exit 映射，与老 runOneShot 一致。
@@ -67,12 +58,13 @@ type OneShotResult struct {
 
 // Run 执行 one-shot 模式并返回进程 exit code（0 成功 / 1 运行失败 / 2 用法错误）。
 //
-// 契约：stdout 只承载单行结果 JSON；中间过程（thinking / 生成 / 工具调用）在
-// -verbose 下写 stderr，否则整体丢弃。错误一律走 stdout 的结构化 JSON + exit code，
-// 不 panic——用法错误在跑任务前即可判定，运行失败则带已发生的 token 统计。
+// 契约：stdout 只承载单行结果 JSON；中间过程（thinking / 生成 / 工具调用）整体
+// 丢弃（见 newEventConsumer）。错误一律走 stdout 的结构化 JSON + exit code，不
+// panic——用法错误在跑任务前即可判定，运行失败则带已发生的 token 统计。
 //
-// 装配流程与交互模式 run_cli.Run 同源（session / tracer / tools / provider /
-// ReActService），仅前后多出「参数校验」与「结果契约输出」两段 one-shot 专属逻辑。
+// 装配（session / tracer / tools / provider / ReActService）经 cmd/agentasm 组合根
+// 与交互模式 run_cli.Run 共用；本函数只保留 one-shot 专属的「参数校验」与「结果
+// 契约输出」两段逻辑。
 func Run() int {
 	ctx := context.Background()
 	cli := config.CliConf
@@ -102,52 +94,26 @@ func Run() int {
 		return usageFail("one-shot mode requires a non-empty prompt from -task or -task-file")
 	}
 
-	workDir := cli.WorkDir
-
-	// session：-session 非空则续聊（Init 重放历史），否则以毫秒精度时间串新建。
-	repo := sessionrepo.NewFsSessionRepo(filepath.Join(workDir, ".laxcode", ".session"))
-	sess := session.NewSession(cli.Session, repo)
-	if err := sess.Init(); err != nil {
-		return usageFail("init session failed: %v", err)
+	// 装配（会话 / tracer / 工具集含子 Agent / provider / ReActService）收口到
+	// cmd/agentasm 组合根，与交互模式共用；one-shot 专属的只有前后的参数校验与结果
+	// 契约输出。Consumer 用静默丢弃回调，保证 stdout 只承载结果 JSON。
+	assembled, err := agentasm.Assemble(ctx, agentasm.Input{
+		WorkDir:   cli.WorkDir,
+		SessionID: cli.Session,
+		PlanMode:  cli.Plan,
+		Consumer:  newEventConsumer(),
+	})
+	if err != nil {
+		return usageFail("assemble agent failed: %v", err)
 	}
-	if err := sess.ReplaceSysPrompt(ctx, prompt.GetSysPrompt(workDir, sess.ID, cli.Plan)); err != nil {
-		return usageFail("replace sys prompt failed: %v", err)
-	}
-
-	// tracer：HandleDB 命中（custom 包 init 注册）优先，否则 filetrace 落盘到
-	// ${workDir}/.laxcode/.session/${sessID}/log/tracing.log；无法创建则回退 noop。
-	// 先查 HandleDB 再决定是否创建 filetrace，避免命中注册项时仍打开日志文件造成
-	// 句柄泄漏。Shutdown 先于 toolReg.Close 注册，故最后执行（LIFO），确保工具
-	// 关闭阶段的 span 也被 flush。
-	var traceHandle *tracing.Handle
-	for _, h := range tracing.HandleDB {
-		traceHandle = h
-		break
-	}
-	if traceHandle == nil {
-		logPath := filepath.Join(workDir, ".laxcode", ".session", sess.ID, "log", "tracing.log")
-		traceHandle = newTraceHandle(logPath)
-	}
-	defer func() { _ = traceHandle.Shutdown(ctx) }()
-	tracer := traceHandle.Tracer
-
-	// tools：与交互模式同一套默认工具；退出时回收带生命周期的工具（bash 后台
-	// 进程与临时文件）。
-	toolReg := tools.NewDefaultRegistry(tracer)
-	toolReg.Register(tools.NewBashTool(workDir))
-	toolReg.Register(tools.NewWriteFileTool(workDir))
-	toolReg.Register(tools.NewReadFileTool(workDir))
-	toolReg.Register(tools.NewEditFileTool(workDir))
-	defer toolReg.Close()
-
-	llmClient := llmprovider.NewOpenApiProvider(env.OpenaiApiKey, env.OpenaiBaseUrl, env.OpenaiModel)
-	reActSvc := reactservice.NewReActService(sess, llmClient, toolReg, newEventConsumer(), tracer)
+	defer assembled.Cleanup()
+	sess := assembled.Session
 
 	// 追加 task 为 user 消息后执行一次 ReAct 循环，直到模型给出无工具调用的最终回答。
 	if err := sess.AppendUserPrompt(ctx, taskPrompt); err != nil {
 		return usageFail("append task prompt failed: %v", err)
 	}
-	msg, runErr := reActSvc.Run(ctx)
+	msg, runErr := assembled.Service.Run(ctx)
 
 	// 结果契约：成功 / 失败共用同一 schema，均带 session_id 与 token 统计。
 	res := OneShotResult{
@@ -167,9 +133,9 @@ func Run() int {
 	return exitOK
 }
 
-// newEventConsumer 按 verbose 构造 ReAct 事件回调：verbose 时把中间过程写 stderr
-// （与 stdout 的结果 JSON 分流），否则返回丢弃回调。任何分支都不写 stdout，
-// 以保证 one-shot 的 stdout 契约纯净。
+// newEventConsumer 返回 one-shot 的 ReAct 事件回调：始终丢弃中间过程（thinking /
+// 生成 / 工具调用），保证 stdout 只承载结果 JSON、契约纯净。作为 Consumer 注入
+// cmd/agentasm 的装配。
 func newEventConsumer() func(*reactservice.ReactEvent) {
 	return func(*reactservice.ReactEvent) {}
 }
@@ -186,18 +152,6 @@ func loadTaskPrompt(taskText, taskFilePath string) (string, error) {
 		return strings.TrimSpace(string(data)), nil
 	}
 	return strings.TrimSpace(taskText), nil
-}
-
-// newTraceHandle 按 logPath 构造默认 filetrace Provider；日志文件无法创建（如目录
-// 无写权限）时回退官方 noop 并在 stderr 提示，不中断 one-shot 主流程。
-func newTraceHandle(logPath string) *tracing.Handle {
-	var tp trace.TracerProvider
-	if f, err := filetrace.New(logPath); err == nil {
-		tp = f
-	} else {
-		fmt.Fprintf(os.Stderr, "filetrace: %v; tracing disabled\n", err)
-	}
-	return tracing.New(tp)
 }
 
 // writeResult 把结果序列化为单行 JSON（带换行）写入 w。字段全为可序列化类型，

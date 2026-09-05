@@ -4,25 +4,15 @@ import (
 	"bufio"
 	"context"
 	"errors"
-	"fmt"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"strings"
 	"syscall"
 
+	"github.com/mikellxy/laxcode/cmd/agentasm"
 	"github.com/mikellxy/laxcode/internal/application/reactservice"
-	"github.com/mikellxy/laxcode/internal/domain/prompt"
-	"github.com/mikellxy/laxcode/internal/domain/session"
-	"github.com/mikellxy/laxcode/internal/domain/tools"
 	"github.com/mikellxy/laxcode/internal/infrastructure/cliprinter"
 	"github.com/mikellxy/laxcode/internal/infrastructure/config"
-	"github.com/mikellxy/laxcode/internal/infrastructure/llmprovider"
-	"github.com/mikellxy/laxcode/internal/infrastructure/sessionrepo"
-	"github.com/mikellxy/laxcode/internal/infrastructure/tracing"
-	_ "github.com/mikellxy/laxcode/internal/infrastructure/tracing/custom"
-	"github.com/mikellxy/laxcode/internal/infrastructure/tracing/filetrace"
-	"go.opentelemetry.io/otel/trace"
 )
 
 const (
@@ -48,19 +38,6 @@ func checkConfig() error {
 	return nil
 }
 
-// newCliTraceHandle 按 logPath 构造默认的 filetrace Provider；日志文件无法
-// 创建时回退 noop 并在 stderr 提示。HandleDB 非空时由调用方覆盖为自定义 Handle。
-// 与老 main.go 的 newTraceHandle 区分命名，避免同包符号冲突。
-func newCliTraceHandle(logPath string) *tracing.Handle {
-	var tp trace.TracerProvider
-	if f, err := filetrace.New(logPath); err == nil {
-		tp = f
-	} else {
-		fmt.Fprintf(os.Stderr, "filetrace: %v; tracing disabled\n", err)
-	}
-	return tracing.New(tp)
-}
-
 func Run() {
 	printer := cliprinter.NewDefaultPrinter()
 
@@ -74,52 +51,9 @@ func Run() {
 	if err != nil {
 		printer.Fatal(err)
 	}
-	sessionDir := filepath.Join(workDir, ".laxcode", ".session")
-	sessionRepo := sessionrepo.NewFsSessionRepo(sessionDir)
-	sess := session.NewSession(config.CliConf.Session, sessionRepo)
-	if err := sess.Init(); err != nil {
-		printer.Fatal(err)
-	}
-	if err := sess.ReplaceSysPrompt(ctx, prompt.GetSysPrompt(workDir, sess.ID, config.CliConf.Plan)); err != nil {
-		printer.Fatal(err)
-	}
 
-	c := config.EnvAndFileConf
-	llmProvider := llmprovider.NewOpenApiProvider(c.OpenaiApiKey, c.OpenaiBaseUrl, c.OpenaiModel)
-
-	// tracer 装配：HandleDB 非空时优先用 custom 包 init 注册的 Handle；否则
-	// 默认用 filetrace 落盘到 ${workDir}/.laxcode/.session/${sessID}/log/tracing.log。
-	// 先查 HandleDB 再决定是否创建 filetrace，避免命中注册项时仍打开日志文件
-	// 造成句柄泄漏。defer Shutdown 先于 toolReg.Close 注册，故最后执行，确保
-	// 工具关闭阶段的 span 也被 flush。
-	var traceHandle *tracing.Handle
-	for _, h := range tracing.HandleDB {
-		traceHandle = h
-		break
-	}
-	if traceHandle == nil {
-		logPath := filepath.Join(workDir, ".laxcode", ".session", sess.ID, "log", "tracing.log")
-		traceHandle = newCliTraceHandle(logPath)
-	}
-	defer func() { _ = traceHandle.Shutdown(ctx) }()
-	tracer := traceHandle.Tracer
-
-	toolReg := tools.NewDefaultRegistry(tracer)
-	toolReg.Register(tools.NewBashTool(workDir))
-	toolReg.Register(tools.NewWriteFileTool(workDir))
-	toolReg.Register(tools.NewReadFileTool(workDir))
-	toolReg.Register(tools.NewEditFileTool(workDir))
-	defer toolReg.Close()
-
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
-	defer signal.Stop(sigCh)
-	go func() {
-		<-sigCh
-		toolReg.Close()
-		os.Exit(130)
-	}()
-
+	// rcf：交互模式的事件呈现——把 ReAct 中间过程彩色打印到 stdout。作为 Consumer
+	// 注入装配，与 one-shot 的静默丢弃回调形成对照。
 	rcf := func(e *reactservice.ReactEvent) {
 		switch e.Type {
 		case reactservice.ReActEventTypeReasoning:
@@ -131,15 +65,31 @@ func Run() {
 		}
 	}
 
-	reActSvc := reactservice.NewReActService(
-		sess,
-		llmProvider,
-		toolReg,
-		rcf,
-		tracer)
+	// 装配（会话 / tracer / 工具集含子 Agent / provider / ReActService）收口到
+	// cmd/agentasm 组合根，与 one-shot 共用；本函数只保留交互模式专属的信号处理与
+	// REPL 循环。Cleanup 幂等：正常退出（defer）与信号退出（goroutine）各调一次安全。
+	assembled, err := agentasm.Assemble(ctx, agentasm.Input{
+		WorkDir:   workDir,
+		SessionID: config.CliConf.Session,
+		PlanMode:  config.CliConf.Plan,
+		Consumer:  rcf,
+	})
+	if err != nil {
+		printer.Fatal(err)
+	}
+	defer assembled.Cleanup()
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
+	go func() {
+		<-sigCh
+		assembled.Cleanup()
+		os.Exit(130)
+	}()
 
 	scanner := bufio.NewScanner(os.Stdin)
-	printer.Printf("session_id: %s\n", sess.ID)
+	printer.Printf("session_id: %s\n", assembled.Session.ID)
 	printer.Printf(">>> Agent ready, input your question\n")
 	for {
 		printer.Printf("%s> %s", ColorBlue, ColorReset)
@@ -153,10 +103,10 @@ func Run() {
 			continue
 		}
 
-		if err := reActSvc.Session.AppendUserPrompt(ctx, userInput); err != nil {
+		if err := assembled.Session.AppendUserPrompt(ctx, userInput); err != nil {
 			printer.Fatal(err)
 		}
-		_, err := reActSvc.Run(ctx)
+		_, err := assembled.Service.Run(ctx)
 		if err != nil {
 			printer.Fatal(err)
 		}
