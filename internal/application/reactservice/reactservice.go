@@ -7,6 +7,7 @@ import (
 	"github.com/mikellxy/laxcode/internal/domain/session"
 	"github.com/mikellxy/laxcode/internal/domain/sharedkernel"
 	"github.com/mikellxy/laxcode/internal/domain/tools"
+	"github.com/mikellxy/laxcode/internal/infrastructure/compactor"
 )
 
 type ReActService struct {
@@ -21,6 +22,10 @@ const (
 	ReActEventTypeReasoning = "reasoning"
 	ReActEventTypeToolCall  = "tool_call"
 )
+
+// maxWindowToken 是触发上下文压缩的窗口 token 预算，暂写死 200k，
+// 未来再做动态配置。
+const maxWindowToken = 200_000
 
 type ReactEvent struct {
 	Type    string
@@ -41,6 +46,15 @@ func NewReActService(sess *session.Session,
 
 func (r *ReActService) Run(ctx context.Context) (*sharedkernel.Message, error) {
 	for {
+		// 上下文压缩：每轮 generate 前压缩历史（对齐老 engine.Run），触发
+		// 阈值 maxWindowToken；压缩后回写 Messages 并同步扣减窗口占用。
+		msgs, compressRes := compactor.SimpleCompactor.Compress(r.Session.Messages, maxWindowToken, r.Session.TokenUsed)
+		r.Session.Messages = msgs
+		if compressRes != nil && compressRes.Total() > 0 {
+			r.Session.WindowToken.TokenInput -= compressRes.InputTokenCompressed
+			r.Session.WindowToken.TokenOutput -= compressRes.OutputTokenCompressed
+		}
+
 		msg, err := r.LLMClient.Generate(ctx, r.Session.Messages, r.ToolRegistry.GetAvailableTools())
 		if err != nil {
 			return nil, err
