@@ -3,40 +3,4 @@ schema: spec-driven
 context: |
   Language: Go (go.mod at repo root)
   Entry: cmd/main/main.go（分流交互模式 run_cli / one-shot 模式 run_oneshot）
-  Architecture: DDD 分层，依赖方向 cmd → application → domain ← infrastructure
-    cmd/
-      main      = 入口：解析配置，按模式分流
-      agentasm  = 组合根：装配 session/tracer/tools/provider/ReActService，并注入各端口的实现
-      run_cli   = 交互模式前端（REPL 循环、信号处理）
-      run_oneshot = one-shot 模式前端（结果 JSON 契约输出、exit code）
-    internal/
-      application/reactservice = ReAct 推理循环、子 Agent 委派
-      domain/
-        session      = 会话聚合、SessionRepository 仓储接口
-        tools        = 工具注册表与 read/write/edit/bash 行为契约，WorkFS / ShellRunner 端口
-        llmprovider  = LLM 客户端接口
-        prompt       = 系统提示词组装（人格 / Skill 索引 / Plan Mode），SkillSource 端口
-        compactor    = 上下文压缩策略与 token 估算
-        telemetry    = 观测词汇表：span 名、属性键、追踪辅助函数
-        sharedkernel = 消息、工具定义、token 统计等共享类型
-      infrastructure/
-        llmprovider = OpenAI Responses 协议实现
-        sessionrepo = 会话文件仓储（JSONL 落盘）
-        workfs      = WorkFS 端口的真实文件系统实现
-        shell       = ShellRunner 端口实现：exec、进程组、超时杀进程
-        skillrepo   = SkillSource 端口实现：扫描 .laxcode/skills
-        layout      = 磁盘布局单一真源（.laxcode / .session / skills / tracing.log）
-        config      = 配置加载（环境变量 / 配置文件 / CLI 参数）
-        cliprinter  = 终端打印
-        tracing     = OTel 封装、filetrace 落盘、custom 扩展点
-    端口 → 适配器：session.SessionRepository→sessionrepo、llmprovider.LLMClient→llmprovider、
-      tools.WorkFS→workfs、tools.ShellRunner→shell、prompt.SkillSource→skillrepo
-  Convention:
-    - 分层判据：工具的行为契约（Definition/JSON Schema、参数校验、错误分类学、面向模型的提示文案、
-      分页等纯算法）放 domain；OS 机制（syscall、os.Open、exec、进程组、目录扫描）放 infrastructure。
-    - domain 与 application 都不得 import internal/infrastructure；需 OS 能力时在 domain 新增端口接口，
-      在 infrastructure 实现，由 cmd/agentasm 装配。
-    - domain/application/cmd 的埋点一律经 domain/telemetry，不得直接 import go.opentelemetry.io/ 下的包；
-      全仓 OTel import 只应出现在 domain/telemetry（埋点语义）与 infrastructure/tracing（装配与导出）两处。
-    - .laxcode / .session / skills / tracing.log 等磁盘路径片段一律取自 infrastructure/layout，不得硬编码。
   Full details: README.md
