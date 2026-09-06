@@ -5,12 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
-	"os/exec"
 	"strconv"
 	"strings"
-	"sync"
-	"syscall"
 	"time"
 
 	"github.com/mikellxy/laxcode/internal/domain/sharedkernel"
@@ -29,20 +25,13 @@ type BashTool struct {
 	WorkDir string
 	// Timeout 是单条命令的超时上限，零值取默认 30s；测试可缩短
 	Timeout time.Duration
-
-	// procs 登记每次调用派生的进程组与输出临时文件，供 Close 统一
-	// 回收 LLM 遗忘清理的后台进程
-	mu    sync.Mutex
-	procs []bashProcRecord
+	// Runner 是命令执行端口，经构造注入；进程组、输出临时文件与
+	// 后台进程回收等 OS 机制见 infrastructure/shell
+	Runner ShellRunner
 }
 
-type bashProcRecord struct {
-	pgid     int
-	tempfile string
-}
-
-func NewBashTool(workDir string) *BashTool {
-	return &BashTool{WorkDir: workDir, Timeout: defaultBashTimeout}
+func NewBashTool(workDir string, runner ShellRunner) *BashTool {
+	return &BashTool{WorkDir: workDir, Runner: runner, Timeout: defaultBashTimeout}
 }
 
 func (b *BashTool) AfterExecInfo(message json.RawMessage) string {
@@ -109,62 +98,21 @@ func (b *BashTool) Execute(ctx context.Context, args json.RawMessage) (string, e
 		return "", NewErrorWithPrompt(&ParamError{}, errors.New("command required"))
 	}
 
-	ctx, cancel := context.WithTimeout(ctx, b.timeout())
-	defer cancel()
-
-	// 输出落临时文件而非 CombinedOutput 的内部管道：后台子进程继承的
-	// 管道写端会让 Wait 永久阻塞（超时也救不了）；文件句柄则随主命令
-	// 退出即可返回，后台进程还能继续安全写入
-	tmp, err := os.CreateTemp("", "laxbash-*")
+	outcome, err := b.Runner.Run(ctx, b.WorkDir, command, b.timeout())
 	if err != nil {
-		return "", NewErrorWithPrompt(&BashExecuteError{}, err)
-	}
-
-	cmd := exec.CommandContext(ctx, "bash", "-c", command)
-	cmd.Dir = b.WorkDir
-	cmd.Stdout = tmp
-	cmd.Stderr = tmp
-	// 独立进程组：超时时收割整棵进程树（含后台派生），且不波及其他
-	// 命令留下的后台进程
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	// 覆盖 CommandContext 默认的"只杀直接子进程"，改为按负 pid 杀整组。
-	// 必须在 Start 之前完成赋值：os/exec 的 watchCtx 协程在 Start 返回后
-	// 可能并发读取 Cancel，Start 之后再写会构成数据竞争。闭包内对
-	// cmd.Process 的读取发生在取消时刻（彼时 Start 早已返回并赋好值）。
-	cmd.Cancel = func() error {
-		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
-	}
-
-	if err := cmd.Start(); err != nil {
-		_ = tmp.Close()
-		_ = os.Remove(tmp.Name())
-		return "", NewErrorWithPrompt(&BashExecuteError{}, err)
-	}
-
-	b.track(cmd.Process.Pid, tmp.Name())
-	err = cmd.Wait()
-	_ = tmp.Close()
-
-	if ctx.Err() != nil {
-		return "", NewErrorWithPrompt(&BashExecuteError{},
-			fmt.Errorf("bash执行超时或被取消: %w", ctx.Err()))
-	}
-
-	output, readErr := os.ReadFile(tmp.Name())
-	if readErr != nil {
-		return "", NewErrorWithPrompt(&BashExecuteError{},
-			fmt.Errorf("读取命令输出失败: %w", readErr))
-	}
-
-	result := &ExecResult{Desc: "命令执行成功", Stdout: string(output)}
-	if err != nil {
-		result.Desc = "命令执行失败: " + err.Error()
-		var exitErr *exec.ExitError
-		if errors.As(err, &exitErr) {
-			result.ExitCode = exitErr.ExitCode()
-		} else {
-			return "", NewErrorWithPrompt(&BashExecuteError{}, err)
+		// 超时/取消单独成文案：引导模型改用后台进程或缩小命令粒度，
+		// 而非误判为命令本身写错
+		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+			return "", NewErrorWithPrompt(&BashExecuteError{},
+				fmt.Errorf("bash执行超时或被取消: %w", err))
 		}
+		return "", NewErrorWithPrompt(&BashExecuteError{}, err)
+	}
+
+	// 非零退出不是工具错误：退出码与原始错误描述一并回给模型自行判断
+	result := &ExecResult{Desc: "命令执行成功", Stdout: outcome.Output, ExitCode: outcome.ExitCode}
+	if outcome.ExitErr != "" {
+		result.Desc = "命令执行失败: " + outcome.ExitErr
 	}
 
 	const maxRune = 8000
@@ -176,27 +124,10 @@ func (b *BashTool) Execute(ctx context.Context, args json.RawMessage) (string, e
 	return result.String(), nil
 }
 
-// Close 回收本次运行内由 bash 工具启动的进程组（含 LLM 遗忘清理的后台
-// 进程）并删除输出临时文件，随会话结束由 Registry.Close 统一调用
+// Close 委托命令执行端口回收本次运行内遗留的后台进程（含 LLM 遗忘
+// 清理的）与输出临时文件，随会话结束由 Registry.Close 统一调用
 func (b *BashTool) Close() error {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	var errs []error
-	for _, p := range b.procs {
-		// 组已随命令正常退出时返回 ESRCH，属预期，忽略
-		_ = syscall.Kill(-p.pgid, syscall.SIGKILL)
-		if err := os.Remove(p.tempfile); err != nil && !os.IsNotExist(err) {
-			errs = append(errs, err)
-		}
-	}
-	b.procs = nil
-	return errors.Join(errs...)
-}
-
-func (b *BashTool) track(pgid int, tempfile string) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	b.procs = append(b.procs, bashProcRecord{pgid: pgid, tempfile: tempfile})
+	return b.Runner.Close()
 }
 
 func (b *BashTool) timeout() time.Duration {

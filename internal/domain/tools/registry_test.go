@@ -10,7 +10,6 @@ import (
 
 	"github.com/mikellxy/laxcode/internal/domain/sharedkernel"
 	"github.com/mikellxy/laxcode/internal/domain/telemetry"
-	"go.opentelemetry.io/otel/trace"
 )
 
 // stubTool 是仅用于注册表测试的 BaseTool：Execute 行为由回调决定。
@@ -192,10 +191,11 @@ func TestToolResultAsMsg(t *testing.T) {
 }
 
 func TestRegistryExecuteWithTracingAndSessionID(t *testing.T) {
-	// 覆盖 Execute 内部埋点路径：ctx 携带 session_id 时不应 panic，
-	// 注册表默认 noop tracer 零成本执行
+	// 覆盖 Execute 内部埋点路径：ctx 携带 session_id 时不应 panic。
+	// 本包不直接依赖 OTel，故用 telemetry.NoopTracer() 而非 nil，以走到
+	// 「非 nil tracer」分支；span 名与属性的正确性由 telemetry 层自测守住。
 	ctx := telemetry.ContextWithSessionID(context.Background(), "sess-trace")
-	r := NewDefaultRegistry(trace.NewNoopTracerProvider().Tracer("x"))
+	r := NewDefaultRegistry(telemetry.NoopTracer())
 	r.Register(&stubTool{name: "t"})
 	res := r.Execute(ctx, &sharedkernel.ToolCall{Name: "t"})
 	if res.Error != nil {
@@ -204,9 +204,25 @@ func TestRegistryExecuteWithTracingAndSessionID(t *testing.T) {
 	if res.Output != "ok" {
 		t.Errorf("输出不符：%q", res.Output)
 	}
-	// 顺带校验 fmt 未引入意外符号
-	if !strings.HasPrefix(res.Output, "ok") {
-		t.Errorf("异常输出 %q", res.Output)
+}
+
+// TestRegistryExecutePassesSpanCtxToTool 守住埋点不截断 ctx 链：子 Agent 与
+// 文件工具都依赖 Execute 交回的 ctx（它携带 tool-exec span）接续下去。
+func TestRegistryExecutePassesSpanCtxToTool(t *testing.T) {
+	type ctxKey struct{}
+	var seen any
+	r := NewDefaultRegistry(nil)
+	r.Register(&stubTool{name: "probe", execFn: func(ctx context.Context, _ json.RawMessage) (string, error) {
+		seen = ctx.Value(ctxKey{})
+		return "ok", nil
+	}})
+
+	ctx := context.WithValue(context.Background(), ctxKey{}, "carried")
+	if res := r.Execute(ctx, &sharedkernel.ToolCall{Name: "probe"}); res.Error != nil {
+		t.Fatalf("执行失败：%v", res.Error)
+	}
+	if seen != "carried" {
+		t.Errorf("工具应能从 ctx 读到上游值，实际 %v", seen)
 	}
 }
 

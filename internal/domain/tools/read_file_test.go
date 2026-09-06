@@ -10,12 +10,16 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/mikellxy/laxcode/internal/infrastructure/workfs"
 )
 
 func TestReadFileTool(t *testing.T) {
 	workDir := t.TempDir()
 	ctx := context.Background()
-	r := NewReadFileTool(workDir)
+	// 本用例验证的是真实文件语义（分页、越界拒绝、不存在报错），故注入
+	// workfs 真实现；workfs 只依赖标准库，不构成层间循环。
+	r := NewReadFileTool(workDir, workfs.New())
 
 	seed := func(rel, content string) string {
 		t.Helper()

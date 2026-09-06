@@ -26,7 +26,8 @@ type Provider struct {
 }
 
 // New 创建一个把 trace 日志追加到 path 的 Provider。它会自动创建所在目录。
-// path 通常取 ${work_dir}/.laxcode/.session/log/tracing.log。
+// path 通常取 infrastructure/layout.TracingLog(workDir, sessID)，即
+// ${work_dir}/.laxcode/.session/${sessID}/log/tracing.log（每个会话一份）。
 func New(path string) (*Provider, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
 		return nil, fmt.Errorf("create trace log dir: %w", err)

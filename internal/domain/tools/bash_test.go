@@ -1,19 +1,50 @@
 package tools
 
+// bash 工具的领域测试：用 ShellRunner 替身验证参数校验、结果文案编排、
+// 输出截断、超时/取消的错误分类，以及工作目录与超时的正确透传。
+// 真实进程行为（后台进程存活、进程组收割、临时文件回收）在
+// infrastructure/shell 的测试中覆盖。
+
 import (
 	"context"
 	"encoding/json"
-	"fmt"
-	"net"
-	"os"
-	"os/exec"
-	"path/filepath"
-	"strconv"
+	"errors"
 	"strings"
-	"syscall"
 	"testing"
 	"time"
 )
+
+// fakeRunner 是 ShellRunner 的测试替身：记录调用入参并回放预设结果。
+type fakeRunner struct {
+	outcome  ShellOutcome
+	err      error
+	closeErr error
+
+	closed     int
+	gotWorkDir string
+	gotCommand string
+	gotTimeout time.Duration
+}
+
+func (f *fakeRunner) Run(_ context.Context, workDir, command string, timeout time.Duration) (ShellOutcome, error) {
+	f.gotWorkDir = workDir
+	f.gotCommand = command
+	f.gotTimeout = timeout
+	return f.outcome, f.err
+}
+
+func (f *fakeRunner) Close() error {
+	f.closed++
+	return f.closeErr
+}
+
+// 编译期确保替身满足端口。
+var _ ShellRunner = (*fakeRunner)(nil)
+
+func newTestBashTool(t *testing.T, runner ShellRunner) *BashTool {
+	t.Helper()
+	return NewBashTool(t.TempDir(), runner)
+}
 
 func execBash(t *testing.T, b *BashTool, command string) (string, error) {
 	t.Helper()
@@ -24,90 +55,69 @@ func execBash(t *testing.T, b *BashTool, command string) (string, error) {
 	return b.Execute(context.Background(), args)
 }
 
-// parseBgPid 从输出中提取 "pid=NNN" 形式的后台进程 pid
-func parseBgPid(t *testing.T, out string) int {
+// asPromptErr 断言 err 携带面向模型的自愈提示词。
+func asPromptErr(t *testing.T, err error) string {
 	t.Helper()
-	idx := strings.Index(out, "pid=")
-	if idx < 0 {
-		t.Fatalf("output missing pid=: %q", out)
+	var promptErr ErrorWithPrompt
+	if !errors.As(err, &promptErr) {
+		t.Fatalf("err 应实现 ErrorWithPrompt，实际 %T: %v", err, err)
 	}
-	rest := out[idx+len("pid="):]
-	end := 0
-	for end < len(rest) && rest[end] >= '0' && rest[end] <= '9' {
-		end++
+	prompt, ok := promptErr.AsPrompt()
+	if !ok || prompt == "" {
+		t.Fatalf("AsPrompt 应返回非空提示词，实际 (%q, %v)", prompt, ok)
 	}
-	pid, err := strconv.Atoi(rest[:end])
-	if err != nil {
-		t.Fatalf("parse pid from %q: %v", out, err)
-	}
-	return pid
+	return prompt
 }
 
-func procAlive(pid int) bool {
-	return syscall.Kill(pid, 0) == nil
-}
+func TestBashToolExecuteSuccess(t *testing.T) {
+	runner := &fakeRunner{outcome: ShellOutcome{Output: "hello\n", ExitCode: 0}}
+	b := newTestBashTool(t, runner)
 
-// waitProcDead 轮询等待进程退出：被杀后到被回收前存在僵尸窗口，
-// kill(pid,0) 对僵尸进程仍返回成功
-func waitProcDead(t *testing.T, pid int) {
-	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
-	for procAlive(pid) {
-		if time.Now().After(deadline) {
-			t.Fatalf("process %d still alive after 2s", pid)
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-}
-
-func newTestBashTool(t *testing.T) *BashTool {
-	t.Helper()
-	return NewBashTool(t.TempDir())
-}
-
-func freeTCPPort(t *testing.T) int {
-	t.Helper()
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen :0: %v", err)
-	}
-	port := l.Addr().(*net.TCPAddr).Port
-	_ = l.Close()
-	return port
-}
-
-func TestBashToolMergedOutput(t *testing.T) {
-	b := newTestBashTool(t)
-	out, err := execBash(t, b, "echo out; echo err 1>&2")
+	out, err := execBash(t, b, "echo hello")
 	if err != nil {
 		t.Fatalf("Execute() error = %v", err)
 	}
-	if !strings.Contains(out, "out") || !strings.Contains(out, "err") {
-		t.Errorf("merged output missing streams: %q", out)
+	if !strings.Contains(out, "命令执行成功") {
+		t.Errorf("缺成功描述: %q", out)
 	}
 	if !strings.Contains(out, "exit_code:0") {
 		t.Errorf("expected exit_code:0 in: %q", out)
 	}
-	t.Cleanup(func() { _ = b.Close() })
+	if !strings.Contains(out, "stdout_truncated:false") {
+		t.Errorf("expected stdout_truncated:false in: %q", out)
+	}
+	if !strings.Contains(out, "hello") {
+		t.Errorf("缺命令输出: %q", out)
+	}
 }
 
-func TestBashToolNonZeroExit(t *testing.T) {
-	b := newTestBashTool(t)
+// TestBashToolNonZeroExitIsNotError 锁定端口契约：非零退出由 ShellOutcome
+// 承载而非 error，工具须把退出码与原始错误描述一并回给模型。
+func TestBashToolNonZeroExitIsNotError(t *testing.T) {
+	runner := &fakeRunner{outcome: ShellOutcome{
+		Output: "boom\n", ExitCode: 3, ExitErr: "exit status 3",
+	}}
+	b := newTestBashTool(t, runner)
+
 	out, err := execBash(t, b, "echo boom; exit 3")
 	if err != nil {
-		t.Fatalf("Execute() should not return error for non-zero exit: %v", err)
+		t.Fatalf("非零退出不应返回 error，实际 = %v", err)
 	}
 	if !strings.Contains(out, "exit_code:3") {
 		t.Errorf("expected exit_code:3 in: %q", out)
 	}
-	if !strings.Contains(out, "boom") {
-		t.Errorf("output missing stdout: %q", out)
+	if !strings.Contains(out, "命令执行失败: exit status 3") {
+		t.Errorf("缺失败描述与原始错误: %q", out)
 	}
-	t.Cleanup(func() { _ = b.Close() })
+	if !strings.Contains(out, "boom") {
+		t.Errorf("失败时仍应带上原始输出: %q", out)
+	}
 }
 
 func TestBashToolTruncateOutput(t *testing.T) {
-	b := newTestBashTool(t)
+	runner := &fakeRunner{outcome: ShellOutcome{Output: strings.Repeat("a", 10000)}}
+	b := newTestBashTool(t, runner)
+
 	out, err := execBash(t, b, "head -c 10000 /dev/zero | tr '\\0' 'a'")
 	if err != nil {
 		t.Fatalf("Execute() error = %v", err)
@@ -115,155 +125,198 @@ func TestBashToolTruncateOutput(t *testing.T) {
 	if !strings.Contains(out, "stdout_truncated:true") {
 		t.Errorf("expected truncated flag in: %q", out)
 	}
+	if !strings.Contains(out, "bash输出过长已截断至前:8000字符") {
+		t.Errorf("缺截断说明: %q", out)
+	}
 	idx := strings.Index(out, "stdout:")
 	if idx < 0 {
 		t.Fatalf("missing stdout section: %q", out)
 	}
+	// ExecResult.String 不追加尾换行，stdout: 之后即截断后的正文
 	if got := len([]rune(out[idx+len("stdout:"):])); got != 8000 {
 		t.Errorf("truncated stdout rune count = %d, want 8000", got)
 	}
-	t.Cleanup(func() { _ = b.Close() })
 }
 
-func TestBashToolBackgroundProcessReturnsImmediately(t *testing.T) {
-	b := newTestBashTool(t)
-	start := time.Now()
-	out, err := execBash(t, b, "sleep 30 & echo pid=$!")
+// TestBashToolTruncateKeepsMultibyteRunes 验证按 rune 而非字节截断，
+// 不会把多字节字符切成半个。
+func TestBashToolTruncateKeepsMultibyteRunes(t *testing.T) {
+	runner := &fakeRunner{outcome: ShellOutcome{Output: strings.Repeat("中", 9000)}}
+	b := newTestBashTool(t, runner)
+
+	out, err := execBash(t, b, "cmd")
 	if err != nil {
 		t.Fatalf("Execute() error = %v", err)
 	}
-	if elapsed := time.Since(start); elapsed > 5*time.Second {
-		t.Errorf("Execute() blocked %v behind background process", elapsed)
+	idx := strings.Index(out, "stdout:")
+	if idx < 0 {
+		t.Fatalf("missing stdout section: %q", out)
 	}
-	pid := parseBgPid(t, out)
-	if !procAlive(pid) {
-		t.Errorf("background process %d should survive after Execute returns", pid)
+	body := out[idx+len("stdout:"):]
+	if got := len([]rune(body)); got != 8000 {
+		t.Errorf("truncated rune count = %d, want 8000", got)
 	}
-	if err := b.Close(); err != nil {
-		t.Errorf("Close() error = %v", err)
-	}
-	waitProcDead(t, pid)
-}
-
-func TestBashToolCloseRemovesTempFiles(t *testing.T) {
-	b := newTestBashTool(t)
-	glob := filepath.Join(os.TempDir(), "laxbash-*")
-	before, _ := filepath.Glob(glob)
-
-	if _, err := execBash(t, b, "echo hi"); err != nil {
-		t.Fatalf("Execute() error = %v", err)
-	}
-	after, _ := filepath.Glob(glob)
-	if len(after) != len(before)+1 {
-		t.Fatalf("expected one temp file created, before=%d after=%d", len(before), len(after))
-	}
-
-	if err := b.Close(); err != nil {
-		t.Fatalf("Close() error = %v", err)
-	}
-	final, _ := filepath.Glob(glob)
-	if len(final) != len(before) {
-		t.Errorf("temp files not removed by Close(), before=%d final=%d", len(before), len(final))
+	if strings.Contains(body, "\uFFFD") {
+		t.Error("截断不应产生半字符（U+FFFD）")
 	}
 }
 
-func TestBashToolTimeoutKillsProcess(t *testing.T) {
-	b := newTestBashTool(t)
-	b.Timeout = 300 * time.Millisecond
-	start := time.Now()
+// TestBashToolTimeoutWording 验证超时被归为 BashExecuteError 且文案引导模型
+// 改用后台进程，而非误判为命令写错。
+func TestBashToolTimeoutWording(t *testing.T) {
+	runner := &fakeRunner{err: context.DeadlineExceeded}
+	b := newTestBashTool(t, runner)
+
 	_, err := execBash(t, b, "sleep 30")
 	if err == nil {
 		t.Fatal("expected timeout error")
 	}
-	if elapsed := time.Since(start); elapsed > 5*time.Second {
-		t.Errorf("timeout took %v, group kill did not unblock Wait", elapsed)
+	if !strings.Contains(err.Error(), "bash执行超时或被取消") {
+		t.Errorf("超时文案不符: %v", err)
 	}
-	t.Cleanup(func() { _ = b.Close() })
+	if !strings.Contains(err.Error(), context.DeadlineExceeded.Error()) {
+		t.Errorf("超时应保留底层原因: %v", err)
+	}
+	asPromptErr(t, err)
 }
 
-func TestBashToolTimeoutKillsBackgroundChildren(t *testing.T) {
-	if _, err := exec.LookPath("pgrep"); err != nil {
-		t.Skip("pgrep not available")
-	}
-	b := newTestBashTool(t)
-	b.Timeout = 300 * time.Millisecond
-	marker := "laxbash-test-marker-9871"
-	_, err := execBash(t, b, fmt.Sprintf("sleep 30 %s & sleep 30", marker))
+func TestBashToolCanceledWording(t *testing.T) {
+	runner := &fakeRunner{err: context.Canceled}
+	b := newTestBashTool(t, runner)
+
+	_, err := execBash(t, b, "sleep 30")
 	if err == nil {
-		t.Fatal("expected timeout error")
+		t.Fatal("expected canceled error")
 	}
-	// 组杀必须连后台派生进程一起收割
-	deadline := time.Now().Add(2 * time.Second)
-	for {
-		pgrep := exec.Command("pgrep", "-f", marker)
-		if pgrep.Run() != nil {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Errorf("background process with marker %q still alive after timeout", marker)
-			break
-		}
-		time.Sleep(50 * time.Millisecond)
+	if !strings.Contains(err.Error(), "bash执行超时或被取消") {
+		t.Errorf("取消应复用超时文案: %v", err)
 	}
-	t.Cleanup(func() { _ = b.Close() })
 }
 
-func TestBashToolTimeoutDoesNotKillEarlierBackground(t *testing.T) {
-	b := newTestBashTool(t)
-	out, err := execBash(t, b, "sleep 30 & echo pid=$!")
-	if err != nil {
+func TestBashToolRunnerInfraError(t *testing.T) {
+	runner := &fakeRunner{err: errors.New("启动命令失败: fork/exec: resource exhausted")}
+	b := newTestBashTool(t, runner)
+
+	_, err := execBash(t, b, "echo hi")
+	if err == nil {
+		t.Fatal("expected infra error")
+	}
+	if strings.Contains(err.Error(), "bash执行超时或被取消") {
+		t.Errorf("基础设施失败不应套用超时文案: %v", err)
+	}
+	asPromptErr(t, err)
+}
+
+// TestBashToolPassesWorkDirAndTimeout 验证工作目录与超时上限被正确透传给端口，
+// 且零值 Timeout 回落到默认 30s。
+func TestBashToolPassesWorkDirAndTimeout(t *testing.T) {
+	runner := &fakeRunner{outcome: ShellOutcome{Output: "ok"}}
+	b := newTestBashTool(t, runner)
+
+	if _, err := execBash(t, b, "echo ok"); err != nil {
 		t.Fatalf("Execute() error = %v", err)
 	}
-	pid := parseBgPid(t, out)
+	if runner.gotWorkDir != b.WorkDir {
+		t.Errorf("workDir = %q, want %q", runner.gotWorkDir, b.WorkDir)
+	}
+	if runner.gotCommand != "echo ok" {
+		t.Errorf("command = %q, want %q", runner.gotCommand, "echo ok")
+	}
+	if runner.gotTimeout != defaultBashTimeout {
+		t.Errorf("timeout = %v, want default %v", runner.gotTimeout, defaultBashTimeout)
+	}
 
 	b.Timeout = 300 * time.Millisecond
-	if _, err := execBash(t, b, "sleep 30"); err == nil {
-		t.Fatal("expected timeout error")
-	}
-	if !procAlive(pid) {
-		t.Errorf("earlier background process %d was killed by an unrelated timeout", pid)
-	}
-	_ = syscall.Kill(-pid, syscall.SIGKILL)
-	t.Cleanup(func() { _ = b.Close() })
-}
-
-func TestBashToolBackgroundServerIntegration(t *testing.T) {
-	// 集成测试：真实后台服务器 + curl 场景，验证"启动-测试-清理"完整
-	// 工作流；默认跳过，LAXCODE_INTEGRATION=1 显式开启
-	if os.Getenv("LAXCODE_INTEGRATION") == "" {
-		t.Skip("skipping integration test; set LAXCODE_INTEGRATION=1 to run")
-	}
-	python, err := exec.LookPath("python3")
-	if err != nil {
-		t.Skip("python3 not available")
-	}
-	if _, err := exec.LookPath("curl"); err != nil {
-		t.Skip("curl not available")
-	}
-	port := freeTCPPort(t)
-
-	b := newTestBashTool(t)
-	start := time.Now()
-	out, err := execBash(t, b, fmt.Sprintf(
-		`%s -m http.server %d --bind 127.0.0.1 > /tmp/laxbash-srv.log 2>&1 & echo "pid=$!"; sleep 0.5; curl -s -o /dev/null -w '%%{http_code}' http://127.0.0.1:%d/`,
-		python, port, port))
-	if err != nil {
+	if _, err := execBash(t, b, "echo ok"); err != nil {
 		t.Fatalf("Execute() error = %v", err)
 	}
-	if elapsed := time.Since(start); elapsed > 5*time.Second {
-		t.Errorf("Execute() blocked %v behind background server", elapsed)
+	if runner.gotTimeout != 300*time.Millisecond {
+		t.Errorf("timeout = %v, want 300ms", runner.gotTimeout)
 	}
-	if !strings.Contains(out, "200") {
-		t.Errorf("curl did not get 200, output: %q", out)
+}
+
+// TestBashToolCloseDelegates 验证 Close 透传到端口：后台进程与临时文件的回收
+// 责任在基础设施侧，工具只负责在会话结束时触发。
+func TestBashToolCloseDelegates(t *testing.T) {
+	runner := &fakeRunner{}
+	b := newTestBashTool(t, runner)
+
+	if err := b.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
 	}
-	pid := parseBgPid(t, out)
-	if !procAlive(pid) {
-		t.Fatal("server should survive between tool calls")
+	if runner.closed != 1 {
+		t.Errorf("Runner.Close 调用次数 = %d, want 1", runner.closed)
 	}
 
-	if _, err := execBash(t, b, fmt.Sprintf("kill -9 %d", pid)); err != nil {
-		t.Fatalf("kill Execute() error = %v", err)
+	wantErr := errors.New("remove tempfile: permission denied")
+	runner.closeErr = wantErr
+	if err := b.Close(); !errors.Is(err, wantErr) {
+		t.Errorf("Close() = %v, want %v", err, wantErr)
 	}
-	waitProcDead(t, pid)
-	t.Cleanup(func() { _ = b.Close() })
+}
+
+func TestBashToolParamValidation(t *testing.T) {
+	b := newTestBashTool(t, &fakeRunner{})
+	ctx := context.Background()
+
+	t.Run("非法 JSON", func(t *testing.T) {
+		if _, err := b.Execute(ctx, json.RawMessage(`{bad json`)); err == nil {
+			t.Fatal("expected param error")
+		} else {
+			asPromptErr(t, err)
+		}
+	})
+
+	t.Run("缺 command", func(t *testing.T) {
+		args, _ := json.Marshal(map[string]string{})
+		if _, err := b.Execute(ctx, args); err == nil {
+			t.Fatal("expected param error")
+		} else if !strings.Contains(err.Error(), "command required") {
+			t.Errorf("err = %v, want it to mention %q", err, "command required")
+		}
+	})
+
+	t.Run("command 为空白", func(t *testing.T) {
+		args, _ := json.Marshal(map[string]string{"command": "   "})
+		if _, err := b.Execute(ctx, args); err == nil {
+			t.Fatal("expected param error")
+		}
+	})
+}
+
+func TestBashToolExecInfo(t *testing.T) {
+	b := newTestBashTool(t, &fakeRunner{})
+
+	if got := b.Name(); got != ToolBash {
+		t.Errorf("Name = %q, want %q", got, ToolBash)
+	}
+	if got := b.AfterExecInfo(nil); got != "" {
+		t.Errorf("AfterExecInfo = %q, want empty", got)
+	}
+
+	args, _ := json.Marshal(map[string]string{"command": "grep -rn Foo"})
+	if got := b.BeforeExecInfo(args); got != "bash(grep -rn Foo)" {
+		t.Errorf("BeforeExecInfo = %q, want %q", got, "bash(grep -rn Foo)")
+	}
+	if got := b.BeforeExecInfo(json.RawMessage(`{bad`)); got != "bash()" {
+		t.Errorf("非法入参应回落占位文案，实际 %q", got)
+	}
+	if got := b.BeforeExecInfo(json.RawMessage(`{}`)); got != "bash()" {
+		t.Errorf("缺 command 应回落占位文案，实际 %q", got)
+	}
+
+	def := b.Definition()
+	if def.Name != ToolBash {
+		t.Errorf("Definition.Name = %q, want %q", def.Name, ToolBash)
+	}
+	if def.Description == "" {
+		t.Error("Definition.Description 不应为空")
+	}
+	params, ok := def.Parameters["properties"].(map[string]any)
+	if !ok {
+		t.Fatalf("Definition.Parameters 应含 properties：%v", def.Parameters)
+	}
+	if _, ok := params["command"]; !ok {
+		t.Errorf("command 属性缺失：%v", params)
+	}
 }

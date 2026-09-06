@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
+	"io/fs"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -15,10 +15,12 @@ import (
 
 type EditFileTool struct {
 	WorkDir string
+	// FS 是沙箱文件读写端口，经构造注入；实现见 infrastructure/workfs。
+	FS WorkFS
 }
 
-func NewEditFileTool(workDir string) *EditFileTool {
-	return &EditFileTool{WorkDir: workDir}
+func NewEditFileTool(workDir string, workFS WorkFS) *EditFileTool {
+	return &EditFileTool{WorkDir: workDir, FS: workFS}
 }
 
 func (e *EditFileTool) AfterExecInfo(message json.RawMessage) string {
@@ -91,9 +93,9 @@ func (e *EditFileTool) Execute(ctx context.Context, args json.RawMessage) (strin
 		return "", err
 	}
 
-	b, err := os.ReadFile(target)
+	b, err := e.FS.ReadFile(target)
 	if err != nil {
-		if os.IsNotExist(err) {
+		if errors.Is(err, fs.ErrNotExist) {
 			return "", NewErrorWithPrompt(&FileNotExistError{},
 				fmt.Errorf("文件 %s 不存在，新建文件请使用 write_file", path))
 		}
@@ -105,7 +107,7 @@ func (e *EditFileTool) Execute(ctx context.Context, args json.RawMessage) (strin
 		return "", err
 	}
 
-	if err := os.WriteFile(target, []byte(newContent), 0o644); err != nil {
+	if err := e.FS.WriteFile(target, []byte(newContent)); err != nil {
 		return "", NewErrorWithPrompt(&FileIOError{}, err)
 	}
 

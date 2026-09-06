@@ -4,13 +4,12 @@ import (
 	"context"
 	"time"
 
+	"github.com/mikellxy/laxcode/internal/domain/compactor"
 	"github.com/mikellxy/laxcode/internal/domain/llmprovider"
 	"github.com/mikellxy/laxcode/internal/domain/session"
 	"github.com/mikellxy/laxcode/internal/domain/sharedkernel"
 	"github.com/mikellxy/laxcode/internal/domain/telemetry"
 	"github.com/mikellxy/laxcode/internal/domain/tools"
-	"github.com/mikellxy/laxcode/internal/infrastructure/compactor"
-	"go.opentelemetry.io/otel/trace"
 )
 
 type ReActService struct {
@@ -19,8 +18,9 @@ type ReActService struct {
 	ToolRegistry        tools.Registry
 	ReActEventConsumerF func(reactEvent *ReactEvent)
 	// tracer 是 ReAct/llm-turn span 的追踪注入点，经构造注入；nil 缺省
-	// noop，不产生任何观测输出。
-	tracer trace.Tracer
+	// noop，不产生任何观测输出。类型经 telemetry 别名持有，本包不直接
+	// 依赖 OTel（span 的开启与收尾均走 telemetry 辅助函数）。
+	tracer telemetry.Tracer
 }
 
 const (
@@ -42,7 +42,7 @@ func NewReActService(sess *session.Session,
 	llmClient llmprovider.LLMClient,
 	toolRegistry tools.Registry,
 	reActEventConsumerF func(reactEvent *ReactEvent),
-	tracer trace.Tracer) *ReActService {
+	tracer telemetry.Tracer) *ReActService {
 	return &ReActService{
 		Session:             sess,
 		LLMClient:           llmClient,
@@ -57,11 +57,10 @@ func (r *ReActService) Run(ctx context.Context) (*sharedkernel.Message, error) {
 	// 业务关联键（span 属性不会自动继承）。ReAct span 的父链由调用方 ctx
 	// 决定，交互模式下本 span 自动成为 root。
 	ctx = telemetry.ContextWithSessionID(ctx, r.Session.ID)
-	ctx, reActSpan := r.tracer.Start(ctx, telemetry.SpanReAct,
-		trace.WithAttributes(
-			telemetry.AttrSessionID.String(r.Session.ID),
-			telemetry.AttrAgentRole.String(telemetry.AgentRoleMain),
-		))
+	ctx, reActSpan := telemetry.Start(ctx, r.tracer, telemetry.SpanReAct,
+		telemetry.AttrSessionID.String(r.Session.ID),
+		telemetry.AttrAgentRole.String(telemetry.AgentRoleMain),
+	)
 	// run 级 token 合计在 defer 中统一落属性，各 return 路径共享
 	var reActInput, reActOutput int
 	var reActErr error
@@ -80,8 +79,8 @@ func (r *ReActService) Run(ctx context.Context) (*sharedkernel.Message, error) {
 	turnCnt := 0
 	for {
 		turnCnt++
-		turnCtx, turnSpan := r.tracer.Start(ctx, telemetry.LLMTurn,
-			trace.WithAttributes(telemetry.AttrTurnSeq.Int(turnCnt)))
+		turnCtx, turnSpan := telemetry.Start(ctx, r.tracer, telemetry.LLMTurn,
+			telemetry.AttrTurnSeq.Int(turnCnt))
 		turnStart := time.Now()
 
 		// 上下文压缩：每轮 generate 前压缩历史（对齐老 engine.Run），触发

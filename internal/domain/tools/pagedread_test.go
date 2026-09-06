@@ -1,29 +1,44 @@
-package utils
+package tools
+
+// ReadPaged 的算法测试：全部基于 strings.Reader，不触碰文件系统。
+// 真实磁盘读取（打开失败、fixture 文件）的覆盖在 infrastructure/workfs。
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
-	"os"
-	"path/filepath"
+	"io"
 	"strings"
 	"testing"
 )
 
-// testResourcePath 为仓库自带测试资源：4 行、每行 11 字符、末行无换行符。
-const testResourcePath = "./test_resource/test_data.txt"
-
-// writeTempFile 在临时目录写入指定内容的文件并返回其路径。
-func writeTempFile(t *testing.T, content string) string {
-	t.Helper()
-	p := filepath.Join(t.TempDir(), "data.txt")
-	if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
-		t.Fatalf("write temp file: %v", err)
-	}
-	return p
+// readPagedStr 用内存 Reader 跑一次分页读取。
+func readPagedStr(content string, nMax, linesMax, startLineNo, startBytes int) *PagedReadResult {
+	return ReadPaged(strings.NewReader(content), PagedReadRequest{
+		MaxBytes:    nMax,
+		MaxLines:    linesMax,
+		StartLineNo: startLineNo,
+		StartBytes:  startBytes,
+	})
 }
 
-func TestReadUpToNKB(t *testing.T) {
-	// 4 行 11 字符、末行无换行符，与 test_resource/test_data.txt 布局一致
+// errReader 在读满 n 字节后返回非 EOF 错误，用于覆盖读取中途失败的分支。
+type errReader struct {
+	remain string
+	err    error
+}
+
+func (r *errReader) Read(p []byte) (int, error) {
+	if r.remain == "" {
+		return 0, r.err
+	}
+	n := copy(p, r.remain)
+	r.remain = r.remain[n:]
+	return n, nil
+}
+
+func TestReadPaged(t *testing.T) {
+	// 4 行 11 字符、末行无换行符
 	const fourLines = "11111111111\n22222222222\n33333333333\n44444444444"
 
 	tests := []struct {
@@ -255,7 +270,7 @@ func TestReadUpToNKB(t *testing.T) {
 			wantFinished:  true,
 		},
 		{
-			name:          "空文件",
+			name:          "空内容",
 			content:       "",
 			nMax:          100,
 			linesMax:      10,
@@ -269,7 +284,7 @@ func TestReadUpToNKB(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			res := ReadUpToNKB(tt.nMax, tt.linesMax, tt.startLineNo, tt.startBytes, writeTempFile(t, tt.content))
+			res := readPagedStr(tt.content, tt.nMax, tt.linesMax, tt.startLineNo, tt.startBytes)
 			if res.Err != nil {
 				t.Fatalf("unexpected err: %v", res.Err)
 			}
@@ -295,50 +310,39 @@ func TestReadUpToNKB(t *testing.T) {
 	}
 }
 
-func TestReadUpToNKBTestResource(t *testing.T) {
-	t.Run("全量读取四行", func(t *testing.T) {
-		res := ReadUpToNKB(10*1024, 100, 1, 1, testResourcePath)
-		if res.Err != nil {
-			t.Fatalf("unexpected err: %v", res.Err)
-		}
-		want := "11111111111\n22222222222\n33333333333\n44444444444\n"
-		if string(res.Content) != want {
-			t.Errorf("Content = %q, want %q", res.Content, want)
-		}
-		if !res.Finished || res.LinesRead != 4 || res.EndLineNo != 4 {
-			t.Errorf("Finished=%v LinesRead=%d EndLineNo=%d, want true/4/4",
-				res.Finished, res.LinesRead, res.EndLineNo)
-		}
+// TestReadPagedReadError 覆盖读取中途失败（非 EOF）的分支：错误原样透出，
+// 且不置 Finished，避免调用方误判为文件已读完。
+func TestReadPagedReadError(t *testing.T) {
+	boom := errors.New("boom")
+	res := ReadPaged(&errReader{remain: "partial\n", err: boom}, PagedReadRequest{
+		MaxBytes: 1024, MaxLines: 10, StartLineNo: 1, StartBytes: 1,
 	})
-
-	t.Run("startBytes=3 跳过首行前两字节（历史用例）", func(t *testing.T) {
-		res := ReadUpToNKB(10*1024, 1, 1, 3, testResourcePath)
-		if res.Err != nil {
-			t.Fatalf("unexpected err: %v", res.Err)
-		}
-		if want := "111111111\n"; string(res.Content) != want {
-			t.Errorf("Content = %q, want %q", res.Content, want)
-		}
-	})
-}
-
-func TestReadUpToNKBFileNotFound(t *testing.T) {
-	res := ReadUpToNKB(1024, 10, 1, 1, filepath.Join(t.TempDir(), "no_such_file.txt"))
-	if res.Err == nil {
-		t.Fatal("expected error for missing file")
+	if !errors.Is(res.Err, boom) {
+		t.Fatalf("Err = %v, want %v", res.Err, boom)
 	}
 	if res.Finished {
-		t.Error("Finished should be false on open error")
+		t.Error("读取失败时 Finished 应为 false")
 	}
 }
 
-// TestReadUpToNKBPaginateAll 端到端验证分页续读约定：
-//   - 未截断：续读传 startLineNo=EndLineNo+1、startBytes=1
-//   - 行被截断：续读传 startLineNo=EndLineNo、startBytes=LastLineTruncatedBytes+1
+// TestReadPagedStartClamp 覆盖非法起始参数被钳制到行首（1-based）。
+func TestReadPagedStartClamp(t *testing.T) {
+	res := readPagedStr("aaa\nbbb\n", 1024, 10, 0, 0)
+	if res.StartLineNo != 1 {
+		t.Errorf("StartLineNo = %d, want 1", res.StartLineNo)
+	}
+	if got, want := string(res.Content), "aaa\nbbb\n"; got != want {
+		t.Errorf("Content = %q, want %q", got, want)
+	}
+}
+
+// TestReadPagedPaginateAll 端到端验证分页续读约定：
+//   - 未截断：续读传 StartLineNo=EndLineNo+1、StartBytes=1
+//   - 行被截断：续读传 StartLineNo=EndLineNo、StartBytes=LastLineTruncatedBytes+1
 //
 // 任意分页参数下拼接结果必须与一次性全量读取一致。
-func TestReadUpToNKBPaginateAll(t *testing.T) {
-	files := []struct {
+func TestReadPagedPaginateAll(t *testing.T) {
+	contents := []struct {
 		name    string
 		content string
 	}{
@@ -347,16 +351,15 @@ func TestReadUpToNKBPaginateAll(t *testing.T) {
 		{"纯空行文件", "\n\n\n"},
 		{"超长行", strings.Repeat("X", 5000) + "\ntail\n" + strings.Repeat("Y", 8192) + "\nend\n"},
 		{"CRLF", "aaa\r\nbb\r\n\r\nccc"},
-		{"空文件", ""},
+		{"空内容", ""},
 	}
 	paramSets := [][2]int{
 		{1, 1}, {2, 3}, {3, 2}, {5, 2}, {7, 100}, {100, 1}, {12, 4},
 		{4096, 1}, {4096, 3}, {4500, 10}, {8192, 2},
 	}
 
-	for _, f := range files {
-		path := writeTempFile(t, f.content)
-		full := ReadUpToNKB(1<<20, 1<<20, 1, 1, path)
+	for _, f := range contents {
+		full := readPagedStr(f.content, 1<<20, 1<<20, 1, 1)
 		if full.Err != nil {
 			t.Fatalf("[%s] full read: %v", f.name, full.Err)
 		}
@@ -366,13 +369,13 @@ func TestReadUpToNKBPaginateAll(t *testing.T) {
 
 		for _, p := range paramSets {
 			t.Run(fmt.Sprintf("%s/nMax=%d,linesMax=%d", f.name, p[0], p[1]), func(t *testing.T) {
-				// 每页至少推进 1 字节或完整消费 1 行，步数上限按文件规模估算
+				// 每页至少推进 1 字节或完整消费 1 行，步数上限按内容规模估算
 				maxSteps := len(f.content) + strings.Count(f.content, "\n") + 128
 				var buf bytes.Buffer
 				startLine, startBytes := 1, 1
 				finished := false
 				for step := 0; step < maxSteps; step++ {
-					res := ReadUpToNKB(p[0], p[1], startLine, startBytes, path)
+					res := readPagedStr(f.content, p[0], p[1], startLine, startBytes)
 					if res.Err != nil {
 						t.Fatalf("step %d: %v", step, res.Err)
 					}
@@ -399,3 +402,6 @@ func TestReadUpToNKBPaginateAll(t *testing.T) {
 		}
 	}
 }
+
+// 编译期确保 errReader 满足 io.Reader。
+var _ io.Reader = (*errReader)(nil)

@@ -45,16 +45,74 @@ func (s *recordingSpan) End(_ ...trace.SpanEndOption) {
 	s.ended = true
 }
 
-// recordingTracer 记录由它 Start 出来的 span。
+// recordingTracer 记录由它 Start 出来的 span 名与 span 本体。
 type recordingTracer struct {
 	embedded.Tracer
-	spans []*recordingSpan
+	spans     []*recordingSpan
+	spanNames []string
 }
 
-func (t *recordingTracer) Start(_ context.Context, _ string, _ ...trace.SpanStartOption) (context.Context, trace.Span) {
+func (t *recordingTracer) Start(ctx context.Context, name string, _ ...trace.SpanStartOption) (context.Context, trace.Span) {
 	s := new(recordingSpan)
 	t.spans = append(t.spans, s)
-	return context.Background(), s
+	t.spanNames = append(t.spanNames, name)
+	// 原样交回 ctx，使调用方可断言 ctx 链未被截断（真实 tracer 会在此基础上
+	// 再插入 span）
+	return ctx, s
+}
+
+func TestNoopTracer(t *testing.T) {
+	tr := NoopTracer()
+	if tr == nil {
+		t.Fatal("NoopTracer 不应返回 nil")
+	}
+	ctx, span := tr.Start(context.Background(), SpanReAct)
+	if ctx == nil || span == nil {
+		t.Fatal("noop tracer Start 不应返回 nil ctx/span")
+	}
+	span.End()
+
+	if got := OrNoop(nil); got == nil {
+		t.Error("OrNoop(nil) 不应返回 nil")
+	}
+}
+
+func TestStartPassesSpanNameAndKeepsCtxChain(t *testing.T) {
+	tr := &recordingTracer{}
+	type ctxKey struct{}
+	parent := context.WithValue(context.Background(), ctxKey{}, "v")
+
+	gotCtx, span := Start(parent, tr, SpanToolExec, AttrToolName.String("bash"))
+	if span == nil {
+		t.Fatal("Start 不应返回 nil span")
+	}
+	if len(tr.spanNames) != 1 || tr.spanNames[0] != SpanToolExec {
+		t.Errorf("span 名应为 %q，实际 %v", SpanToolExec, tr.spanNames)
+	}
+	// ctx 链不得被截断：下游埋点靠它接续父子关系与业务关联键
+	if gotCtx.Value(ctxKey{}) != "v" {
+		t.Error("Start 返回的 ctx 应保留父 ctx 的值")
+	}
+}
+
+// TestStartKeepsSessionID 守住注册表依赖的行为：tool-exec span 开启后，
+// ctx 里的 session_id 仍须可读（span 属性不会自动继承，业务关联键靠 ctx 传）。
+func TestStartKeepsSessionID(t *testing.T) {
+	tr := &recordingTracer{}
+	parent := ContextWithSessionID(context.Background(), "sess-7")
+
+	gotCtx, _ := Start(parent, tr, SpanToolExec)
+	if got := SessionIDFromContext(gotCtx); got != "sess-7" {
+		t.Errorf("Start 后应仍能读到 session_id，实际 %q", got)
+	}
+}
+
+func TestStartNilTracerFallsBackToNoop(t *testing.T) {
+	ctx, span := Start(context.Background(), nil, SpanReAct)
+	if span == nil || ctx == nil {
+		t.Fatal("nil tracer 应退化为 noop，而非 panic 或返回 nil")
+	}
+	span.End()
 }
 
 func TestOrNoop(t *testing.T) {

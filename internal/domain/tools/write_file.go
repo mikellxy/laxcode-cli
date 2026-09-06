@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
 	"path/filepath"
 	"strings"
 
@@ -14,10 +13,12 @@ import (
 
 type WriteFileTool struct {
 	WorkDir string
+	// FS 是沙箱文件读写端口，经构造注入；实现见 infrastructure/workfs。
+	FS WorkFS
 }
 
-func NewWriteFileTool(workDir string) *WriteFileTool {
-	return &WriteFileTool{WorkDir: workDir}
+func NewWriteFileTool(workDir string, workFS WorkFS) *WriteFileTool {
+	return &WriteFileTool{WorkDir: workDir, FS: workFS}
 }
 
 func (w *WriteFileTool) AfterExecInfo(message json.RawMessage) string {
@@ -83,12 +84,8 @@ func (w *WriteFileTool) Execute(ctx context.Context, args json.RawMessage) (stri
 		return "", NewErrorWithPrompt(&FilePathError{}, err)
 	}
 
-	// 自动创建父目录
-	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
-		return "", NewErrorWithPrompt(&FileIOError{}, fmt.Errorf("create parent dir: %w", err))
-	}
-
-	if err := os.WriteFile(target, []byte(content), 0o644); err != nil {
+	// 写入沙箱内目标路径，父目录不存在时由端口实现自动创建
+	if err := w.FS.WriteFile(target, []byte(content)); err != nil {
 		return "", NewErrorWithPrompt(&FileIOError{}, err)
 	}
 

@@ -193,7 +193,7 @@ laxcode only depends on the OpenTelemetry API module and does not ship an implem
 4. A registered custom Handle is automatically preferred over the built-in filetrace (no startup argument needed); when nothing is registered, the default is local filetrace persistence.
 
 ## 7. Architecture
-The codebase follows DDD layering, with dependencies flowing `cmd → application → domain ← infrastructure` (domain depends on no other layer):
+The codebase follows DDD layering, with dependencies flowing `cmd → application → domain ← infrastructure`. Neither domain nor application imports infrastructure: whenever an OS capability is needed (files, processes, directory scanning), domain declares a port interface, infrastructure implements it, and the composition root `cmd/agentasm` wires them together.
 
 ```
 LaxCode/
@@ -207,20 +207,38 @@ LaxCode/
 │   │   └── reactservice/  # ReAct reasoning loop, sub-agent delegation
 │   ├── domain/
 │   │   ├── session/       # session aggregate, SessionRepository interface
-│   │   ├── tools/         # tool interfaces & registry, read/write/edit/bash implementations
+│   │   ├── tools/         # tool registry & read/write/edit/bash behavioral contracts, WorkFS / ShellRunner ports
 │   │   ├── llmprovider/   # LLM client interface
-│   │   ├── prompt/        # system prompt assembly (persona / skill index / Plan Mode)
+│   │   ├── prompt/        # system prompt assembly (persona / skill index / Plan Mode), SkillSource port
+│   │   ├── compactor/     # context compaction strategy & token estimation
+│   │   ├── telemetry/     # observability vocabulary: span names, attribute keys, tracing helpers
 │   │   └── sharedkernel/  # shared types: messages, tool definitions, token stats
-│   ├── infrastructure/
-│   │   ├── llmprovider/   # OpenAI Responses protocol implementation
-│   │   ├── sessionrepo/   # filesystem session repository (JSONL persistence)
-│   │   ├── compactor/     # context compaction
-│   │   ├── config/        # configuration loading (env vars / config file / CLI flags)
-│   │   ├── cliprinter/    # terminal printing
-│   │   └── tracing/       # OTel wrapper, filetrace persistence, custom extension point
-│   └── utils/             # stateless infrastructure such as paginated reading
+│   └── infrastructure/
+│       ├── llmprovider/   # OpenAI Responses protocol implementation
+│       ├── sessionrepo/   # filesystem session repository (JSONL persistence)
+│       ├── workfs/        # real-filesystem implementation of the WorkFS port
+│       ├── shell/         # ShellRunner port implementation: exec, process groups, timeout kill
+│       ├── skillrepo/     # SkillSource port implementation: scans .laxcode/skills
+│       ├── layout/        # single source of truth for the on-disk layout (.laxcode / .session / skills / tracing.log)
+│       ├── config/        # configuration loading (env vars / config file / CLI flags)
+│       ├── cliprinter/    # terminal printing
+│       └── tracing/       # OTel wrapper, filetrace persistence, custom extension point
 └── openspec/              # change-management docs produced during development
 ```
+
+Ports and their adapters:
+
+| Port (declared in domain) | Adapter (implemented in infrastructure) |
+| --- | --- |
+| `session.SessionRepository` | `sessionrepo` |
+| `llmprovider.LLMClient` | `llmprovider` |
+| `tools.WorkFS` | `workfs` |
+| `tools.ShellRunner` | `shell` |
+| `prompt.SkillSource` | `skillrepo` |
+
+The layering criterion: **a tool's "behavioral contract" stays in domain** (`Definition` and JSON Schema, argument validation, error taxonomy, model-facing prompt text, pagination and other pure algorithms), while **OS mechanics sink into infrastructure** (`syscall`, `os.Open`, `exec`, process groups, directory scanning). That is why `domain/tools` contains `bash.go` but no `os/exec`; on-disk path segments are always taken from `infrastructure/layout` instead of being hardcoded elsewhere.
+
+domain has only two third-party dependencies, each quarantined in a single "vocabulary" package: `domain/telemetry` funnels the OpenTelemetry API, and `domain/prompt` uses `go.yaml.in/yaml/v4` to parse skill frontmatter. Across the whole repo, imports of `go.opentelemetry.io/` should appear only in `domain/telemetry` (instrumentation semantics: span names, attribute keys, tracing helpers) and `infrastructure/tracing` (assembly and export implementation); instrumentation sites in domain / application / cmd must go through `telemetry`, because importing OTel directly would reduce "switching observability vendors touches only two packages" to an empty claim.
 
 ```mermaid
 flowchart TD

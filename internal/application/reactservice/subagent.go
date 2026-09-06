@@ -21,6 +21,22 @@ type subAgentArgs struct {
 	Abstract string `json:"abstract"`
 }
 
+// SubAgentDeps 是子 Agent 派生受限工具集所需的领域端口集合，由组合根
+// （cmd/agentasm）注入基础设施实现。集中在一个结构体里，使 application 层
+// 只依赖 domain 端口、不反向依赖 infrastructure，且后续新增端口不破构造签名。
+type SubAgentDeps struct {
+	// WorkFS 是沙箱文件读写端口，供子 Agent 的 read_file 使用；无状态，可与父共享。
+	WorkFS tools.WorkFS
+	// NewShell 为每个子 Agent 新建一个独立的命令执行端口。**必须每次新建**：
+	// 实现方持有自己派生的后台进程与输出临时文件登记表，子 Agent 结束时
+	// childReg.Close() 会回收它；若与父共享同一实例，子 Agent 收尾会连带
+	// 杀掉父 Agent 尚在运行的后台进程（如开发服务器）。
+	NewShell func() tools.ShellRunner
+	// SkillSrc 是技能定义文件的发现端口，供子 Agent 的系统提示词渲染技能索引；
+	// 无状态且按调用传 workDir，可与父共享（子 Agent 可能跑在不同的 work_dir 下）。
+	SkillSrc prompt.SkillSource
+}
+
 // SubAgent 把「启动一个隔离子 Agent 跑子任务」包装成 tools.BaseTool 的适配器。
 // 它编排一个子 ReActService：
 //   - 全新子会话（id=sub:<ts>-<parentID>，复用父 Repo），历史独立，绝不写回父对话；
@@ -33,13 +49,15 @@ type subAgentArgs struct {
 type SubAgent struct {
 	parent  *ReActService
 	workDir string
+	deps    SubAgentDeps
 }
 
-// NewSubAgent 以父 ReActService 与工作目录构造子 Agent 工具。父的 LLMClient /
-// tracer / Session.Repo 经 parent 复用；workDir 用于构建子 Agent 的受限工具集，
-// 子任务可通过 work_dir 入参覆盖。调用方须在 parent 装配完成后注册本工具。
-func NewSubAgent(parent *ReActService, workDir string) *SubAgent {
-	return &SubAgent{parent: parent, workDir: workDir}
+// NewSubAgent 以父 ReActService、工作目录与端口集合构造子 Agent 工具。父的
+// LLMClient / tracer / Session.Repo 经 parent 复用；workDir 用于构建子 Agent 的
+// 受限工具集，子任务可通过 work_dir 入参覆盖。调用方须在 parent 装配完成后
+// 注册本工具。
+func NewSubAgent(parent *ReActService, workDir string, deps SubAgentDeps) *SubAgent {
+	return &SubAgent{parent: parent, workDir: workDir, deps: deps}
 }
 
 func (s *SubAgent) Name() string { return tools.ToolRunSubAgent }
@@ -88,18 +106,22 @@ func (s *SubAgent) Execute(ctx context.Context, args json.RawMessage) (string, e
 	}
 
 	// 子会话：全新 id、复用父 Repo；不调用 Init（子会话从不续聊，无需加载历史）。
-	// planMode=false，注入人格系统提示词（含 workDir 沙箱约束）。
+	// 注入人格系统提示词（含 workDir 沙箱约束）与子工作目录下的技能索引；
+	// plan 传 nil（子 Agent 不支持 Plan Mode），warn 传 nil（技能警告已在主 Agent
+	// 启动时针对主工作目录输出过，此处重复输出只会淹没子任务结果）。
 	childID := "sub:" + time.Now().Format("20060102-150405.000") + "-" + s.parent.Session.ID
 	childSess := session.NewSession(childID, s.parent.Session.Repo)
-	if err := childSess.ReplaceSysPrompt(ctx, prompt.GetSysPrompt(workDir, childID, false)); err != nil {
+	childSkills := prompt.LoadSkills(s.deps.SkillSrc, workDir, nil)
+	if err := childSess.ReplaceSysPrompt(ctx, prompt.GetSysPrompt(workDir, childSkills, nil)); err != nil {
 		return fmt.Sprintf("sub agent failed to set sys prompt: %v", err), nil
 	}
 
 	// 受限工具集：仅 bash + read_file，不含 sub-agent 自身 → 防递归。子 Agent
-	// 一次运行即完整生命周期，defer Close 回收 bash 后台进程与临时文件。
+	// 一次运行即完整生命周期，defer Close 回收 bash 后台进程与临时文件；
+	// 命令执行端口按子 Agent 新建，以免回收波及父 Agent 的后台进程。
 	childReg := tools.NewDefaultRegistry(s.parent.tracer)
-	childReg.Register(tools.NewBashTool(workDir))
-	childReg.Register(tools.NewReadFileTool(workDir))
+	childReg.Register(tools.NewBashTool(workDir, s.deps.NewShell()))
+	childReg.Register(tools.NewReadFileTool(workDir, s.deps.WorkFS))
 	defer childReg.Close()
 
 	// 事件静默：子 Agent 中间过程不外发（consumer 直接丢弃）。

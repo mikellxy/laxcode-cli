@@ -1,7 +1,10 @@
 // Package compactor 提供 agent 运行时上下文的压缩能力：在每轮 LLM 生成前
 // 按窗口 token 预算裁剪历史消息（清理早期工具输出、截断超长正文、丢弃陈旧
-// reasoning），以控制发给模型的上下文规模。本包只依赖 domain/sharedkernel，
-// 不依赖 internal/schema。
+// reasoning），以控制发给模型的上下文规模。
+//
+// 本包属领域层：“上下文窗口紧张时该保留什么、丢弃什么”是 agent 的业务策略，
+// 全部计算都在内存中完成（只用 fmt 与 unicode），不涉任何 I/O、OS 机制或
+// 第三方 SDK，故不是基础设施。仅依赖 domain/sharedkernel。
 package compactor
 
 import (
@@ -26,27 +29,30 @@ type Strategy interface {
 	Compress(msgs []sharedkernel.Message, maxToken int, winConsumed sharedkernel.TokenStatistics) ([]sharedkernel.Message, *CompressResult)
 }
 
+// simpleStrategy 是默认的简单压缩策略：无状态，可安全并发使用。
 type simpleStrategy struct {
+	// inMemoryMsgsCnt 是“完整保留、不做任何裁剪”的尾部消息条数。
+	// 取 1 即本策略的当前行为：只有最后一条消息被视为在内存中。
 	inMemoryMsgsCnt int
 }
 
 // SimpleCompactor 是默认的简单压缩策略实现。
-var SimpleCompactor simpleStrategy = simpleStrategy{inMemoryMsgsCnt: 8}
+var SimpleCompactor simpleStrategy = simpleStrategy{inMemoryMsgsCnt: 1}
 
 // 编译期确保 simpleStrategy 满足 Strategy 接口。
 var _ Strategy = SimpleCompactor
 
-// Compress 在窗口占用达到 maxToken 的 80% 时裁剪 msgs：仅最后一条消息视为
-// "在内存中"完整保留，其余的工具输出 / 超长正文按规则清理或截断，早于最后
-// 一次用户输入的 reasoning 直接丢弃。未达阈值时原样返回、result 为零值。
-// 传入的 msgs 会被原地修改并返回。
+// Compress 在窗口占用达到 maxToken 的 80% 时裁剪 msgs：仅最后
+// s.inMemoryMsgsCnt 条消息视为"在内存中"完整保留，其余的工具输出 / 超长正文
+// 按规则清理或截断，早于最后一次用户输入的 reasoning 直接丢弃。
+// 未达阈值时原样返回、result 为零值。传入的 msgs 会被原地修改并返回。
 func (s simpleStrategy) Compress(msgs []sharedkernel.Message, maxToken int, winConsumed sharedkernel.TokenStatistics) ([]sharedkernel.Message, *CompressResult) {
 	result := new(CompressResult)
 	if float64(winConsumed.TokenInput+winConsumed.TokenOutput) < float64(maxToken)*0.8 {
 		return msgs, result
 	}
 
-	minInMemoryIdx := len(msgs) - 1
+	minInMemoryIdx := len(msgs) - s.inMemoryMsgsCnt
 
 	// Reasoning only matters since the last human input; older ones are
 	// stale and get dropped to save context tokens.

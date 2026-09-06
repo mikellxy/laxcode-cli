@@ -4,9 +4,9 @@ import (
 	"errors"
 	"flag"
 	"os"
-	"path"
 	"strings"
 
+	"github.com/mikellxy/laxcode/internal/infrastructure/layout"
 	"github.com/spf13/viper"
 )
 
@@ -37,7 +37,8 @@ func ParseEnvAndFile() error {
 	var filePath string
 	homeDir, err := os.UserHomeDir()
 	if err == nil {
-		filePath = path.Join(homeDir, ".laxcode", "settings.json")
+		// 用户级配置路径统一由布局包拼装（${home}/.laxcode/settings.json）
+		filePath = layout.UserSettings(homeDir)
 	}
 
 	if filePath != "" {

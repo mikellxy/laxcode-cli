@@ -12,7 +12,6 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"path/filepath"
 	"sync"
 
 	"github.com/mikellxy/laxcode/internal/application/reactservice"
@@ -20,12 +19,15 @@ import (
 	"github.com/mikellxy/laxcode/internal/domain/session"
 	"github.com/mikellxy/laxcode/internal/domain/tools"
 	"github.com/mikellxy/laxcode/internal/infrastructure/config"
+	"github.com/mikellxy/laxcode/internal/infrastructure/layout"
 	"github.com/mikellxy/laxcode/internal/infrastructure/llmprovider"
 	"github.com/mikellxy/laxcode/internal/infrastructure/sessionrepo"
+	"github.com/mikellxy/laxcode/internal/infrastructure/shell"
+	"github.com/mikellxy/laxcode/internal/infrastructure/skillrepo"
 	"github.com/mikellxy/laxcode/internal/infrastructure/tracing"
 	_ "github.com/mikellxy/laxcode/internal/infrastructure/tracing/custom"
 	"github.com/mikellxy/laxcode/internal/infrastructure/tracing/filetrace"
-	"go.opentelemetry.io/otel/trace"
+	"github.com/mikellxy/laxcode/internal/infrastructure/workfs"
 )
 
 // Input 是装配 ReActService 所需、且因前端而异的输入。
@@ -57,18 +59,27 @@ type Assembled struct {
 // 调用前须已由调用方校验（本函数不重复校验，缺失会在 Run 时才暴露）。
 // 返回的 error 仅来自会话初始化 / 系统提示词写入。
 func Assemble(ctx context.Context, in Input) (*Assembled, error) {
-	// session：repo 落在 ${workDir}/.laxcode/.session；SessionID 为空则新建。
-	repo := sessionrepo.NewFsSessionRepo(filepath.Join(in.WorkDir, ".laxcode", ".session"))
+	// session：repo 落在 layout.SessionRoot(workDir)；SessionID 为空则新建。
+	repo := sessionrepo.NewFsSessionRepo(layout.SessionRoot(in.WorkDir))
 	sess := session.NewSession(in.SessionID, repo)
 	if err := sess.Init(); err != nil {
 		return nil, err
 	}
-	if err := sess.ReplaceSysPrompt(ctx, prompt.GetSysPrompt(in.WorkDir, sess.ID, in.PlanMode)); err != nil {
+	// 系统提示词：技能索引在启动时快照一次（会话期内不刷新）；技能发现端口
+	// 以领域类型接收即完成编译期断言（同 workFS）。Plan Mode 的会话规划目录
+	// 由布局包算好后注入，领域层不再自行拼路径。
+	var skillSrc prompt.SkillSource = skillrepo.New()
+	skills := prompt.LoadSkills(skillSrc, in.WorkDir, warnSkillSkip)
+	var plan *prompt.PlanMode
+	if in.PlanMode {
+		plan = &prompt.PlanMode{SessionDir: layout.SessionDir(in.WorkDir, sess.ID)}
+	}
+	if err := sess.ReplaceSysPrompt(ctx, prompt.GetSysPrompt(in.WorkDir, skills, plan)); err != nil {
 		return nil, err
 	}
 
 	// tracer：HandleDB 命中（custom 包 init 注册）优先，否则 filetrace 落盘到
-	// ${workDir}/.laxcode/.session/${sessID}/log/tracing.log；无法创建回退 noop。
+	// layout.TracingLog(workDir, sessID)；无法创建回退 noop。
 	// 先查 HandleDB 再决定是否创建 filetrace，避免命中注册项时仍打开日志文件造成句柄泄漏。
 	var traceHandle *tracing.Handle
 	for _, h := range tracing.HandleDB {
@@ -76,17 +87,23 @@ func Assemble(ctx context.Context, in Input) (*Assembled, error) {
 		break
 	}
 	if traceHandle == nil {
-		logPath := filepath.Join(in.WorkDir, ".laxcode", ".session", sess.ID, "log", "tracing.log")
-		traceHandle = newTraceHandle(logPath)
+		traceHandle = newTraceHandle(layout.TracingLog(in.WorkDir, sess.ID))
 	}
 	tracer := traceHandle.Tracer
 
 	// tools：默认工具集；子 Agent 须在 svc 建好后注册进同一 registry（见下）。
+	// workFS 是文件类工具（read/write/edit）唯一的 os 触点实现，此处以领域
+	// 端口类型接收即完成编译期断言（infra/workfs 不反向导入 domain，避免与
+	// domain 内部测试成环）。
+	var workFS tools.WorkFS = workfs.New()
+	// shellRunner 与本次运行同生命周期：登记命令派生的后台进程与输出临时
+	// 文件，由 Cleanup 里的 toolReg.Close() 统一回收。
+	shellRunner := shell.New()
 	toolReg := tools.NewDefaultRegistry(tracer)
-	toolReg.Register(tools.NewBashTool(in.WorkDir))
-	toolReg.Register(tools.NewWriteFileTool(in.WorkDir))
-	toolReg.Register(tools.NewReadFileTool(in.WorkDir))
-	toolReg.Register(tools.NewEditFileTool(in.WorkDir))
+	toolReg.Register(tools.NewBashTool(in.WorkDir, shellRunner))
+	toolReg.Register(tools.NewWriteFileTool(in.WorkDir, workFS))
+	toolReg.Register(tools.NewReadFileTool(in.WorkDir, workFS))
+	toolReg.Register(tools.NewEditFileTool(in.WorkDir, workFS))
 
 	// provider + service
 	c := config.EnvAndFileConf
@@ -94,7 +111,14 @@ func Assemble(ctx context.Context, in Input) (*Assembled, error) {
 	svc := reactservice.NewReActService(sess, llmClient, toolReg, in.Consumer, tracer)
 	// 子 Agent 复用 svc 的 LLMClient/tracer/Repo 派生隔离子服务，注册进同一
 	// toolReg（svc 持其引用，late register 对 svc 可见）。
-	toolReg.Register(reactservice.NewSubAgent(svc, in.WorkDir))
+	toolReg.Register(reactservice.NewSubAgent(svc, in.WorkDir,
+		reactservice.SubAgentDeps{
+			WorkFS:   workFS,
+			SkillSrc: skillSrc,
+			// 每个子 Agent 各自新建：其 childReg.Close() 只回收自己派生的
+			// 后台进程，不会波及主 Agent 尚在运行的后台服务
+			NewShell: func() tools.ShellRunner { return shell.New() },
+		}))
 
 	var once sync.Once
 	cleanup := func() {
@@ -107,14 +131,21 @@ func Assemble(ctx context.Context, in Input) (*Assembled, error) {
 	return &Assembled{Service: svc, Session: sess, Cleanup: cleanup}, nil
 }
 
+// warnSkillSkip 是技能跳过警告的落点：写 stderr 而非 stdout，使 one-shot 模式的
+// stdout JSON 契约与交互模式的彩色输出都不被污染，警告仍可被用户看到。
+func warnSkillSkip(msg string) {
+	fmt.Fprintf(os.Stderr, "laxcode: %s\n", msg)
+}
+
 // newTraceHandle 按 logPath 构造默认 filetrace Provider；日志文件无法创建（如目录
-// 无写权限）时回退官方 noop 并在 stderr 提示，不中断装配。
+// 无写权限）时传 nil 让 tracing 回退官方 noop 并在 stderr 提示，不中断装配。
+// 分支返回而非先存进一个 TracerProvider 变量，是为了让本文件不必 import OTel——
+// 「OTel 只出现在 domain/telemetry 与 infrastructure/tracing」因此可被 grep 校验。
 func newTraceHandle(logPath string) *tracing.Handle {
-	var tp trace.TracerProvider
-	if f, err := filetrace.New(logPath); err == nil {
-		tp = f
-	} else {
+	f, err := filetrace.New(logPath)
+	if err != nil {
 		fmt.Fprintf(os.Stderr, "filetrace: %v; tracing disabled\n", err)
+		return tracing.New(nil)
 	}
-	return tracing.New(tp)
+	return tracing.New(f)
 }

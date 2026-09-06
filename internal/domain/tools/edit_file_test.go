@@ -8,6 +8,8 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+
+	"github.com/mikellxy/laxcode/internal/infrastructure/workfs"
 )
 
 func TestApplyEdit(t *testing.T) {
@@ -174,7 +176,7 @@ func TestMatchLines(t *testing.T) {
 func TestEditFileTool(t *testing.T) {
 	workDir := t.TempDir()
 	ctx := context.Background()
-	e := NewEditFileTool(workDir)
+	e := NewEditFileTool(workDir, workfs.New())
 
 	seed := func(rel, content string) string {
 		t.Helper()

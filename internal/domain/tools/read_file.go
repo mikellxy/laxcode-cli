@@ -5,11 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
+	"io/fs"
 	"strings"
 
 	"github.com/mikellxy/laxcode/internal/domain/sharedkernel"
-	"github.com/mikellxy/laxcode/internal/utils"
 )
 
 type readFileToolArgs struct {
@@ -25,10 +24,12 @@ const (
 
 type ReadFileTool struct {
 	WorkDir string `json:"work_dir"`
+	// FS 是沙箱文件读写端口，经构造注入；实现见 infrastructure/workfs。
+	FS WorkFS
 }
 
-func NewReadFileTool(workDir string) *ReadFileTool {
-	return &ReadFileTool{WorkDir: workDir}
+func NewReadFileTool(workDir string, workFS WorkFS) *ReadFileTool {
+	return &ReadFileTool{WorkDir: workDir, FS: workFS}
 }
 
 func (r *ReadFileTool) AfterExecInfo(message json.RawMessage) string {
@@ -93,13 +94,23 @@ func (r *ReadFileTool) Execute(ctx context.Context, args json.RawMessage) (strin
 		return "", NewErrorWithPrompt(&FilePathError{}, err)
 	}
 
-	result := utils.ReadUpToNKB(readFileToolMaxReadBytes, readFileToolMaxReadLines,
-		argsObj.StartLineNo, argsObj.StartBytes, pathSafe)
-	if result.Err != nil {
-		if os.IsNotExist(result.Err) {
+	file, err := r.FS.OpenRead(pathSafe)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
 			return "", NewErrorWithPrompt(&FileNotExistError{},
 				fmt.Errorf("文件 %s 不存在，请核对相对路径是否正确", argsObj.Path))
 		}
+		return "", NewErrorWithPrompt(&FileIOError{}, err)
+	}
+	defer file.Close()
+
+	result := ReadPaged(file, PagedReadRequest{
+		MaxBytes:    readFileToolMaxReadBytes,
+		MaxLines:    readFileToolMaxReadLines,
+		StartLineNo: argsObj.StartLineNo,
+		StartBytes:  argsObj.StartBytes,
+	})
+	if result.Err != nil {
 		return "", NewErrorWithPrompt(&FileIOError{}, result.Err)
 	}
 
@@ -118,7 +129,7 @@ func (r *ReadFileTool) Execute(ctx context.Context, args json.RawMessage) (strin
 // readFooter 生成 read_file 输出的尾部状态说明：文件是否读完、读到的
 // 最后一行行号、最后一行是否截断及该行已读字节数，并给出续读参数，
 // 使模型无需额外信息即可自行翻页。
-func readFooter(res *utils.ReadResult) string {
+func readFooter(res *PagedReadResult) string {
 	if res.EndLineNo == 0 {
 		return "文件为空"
 	}
