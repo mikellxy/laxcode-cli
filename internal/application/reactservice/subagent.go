@@ -110,11 +110,9 @@ func (s *SubAgent) Execute(ctx context.Context, args json.RawMessage) (string, e
 	// plan 传 nil（子 Agent 不支持 Plan Mode），warn 传 nil（技能警告已在主 Agent
 	// 启动时针对主工作目录输出过，此处重复输出只会淹没子任务结果）。
 	childID := "sub:" + time.Now().Format("20060102-150405.000") + "-" + s.parent.Session.ID
-	childSess := session.NewSession(childID, s.parent.Session.Repo)
+	childSess := session.NewSession(childID)
 	childSkills := prompt.LoadSkills(s.deps.SkillSrc, workDir, nil)
-	if err := childSess.ReplaceSysPrompt(ctx, prompt.GetSysPrompt(workDir, childSkills, nil)); err != nil {
-		return fmt.Sprintf("sub agent failed to set sys prompt: %v", err), nil
-	}
+	sysPromt := prompt.GetSysPrompt(workDir, childSkills, nil)
 
 	// 受限工具集：仅 bash + read_file，不含 sub-agent 自身 → 防递归。子 Agent
 	// 一次运行即完整生命周期，defer Close 回收 bash 后台进程与临时文件；
@@ -125,12 +123,15 @@ func (s *SubAgent) Execute(ctx context.Context, args json.RawMessage) (string, e
 	defer childReg.Close()
 
 	// 事件静默：子 Agent 中间过程不外发（consumer 直接丢弃）。
-	childSvc := NewReActService(childSess, s.parent.LLMClient, childReg, func(*ReactEvent) {}, s.parent.tracer)
-
-	if err := childSess.AppendUserPrompt(ctx, a.Task); err != nil {
-		return fmt.Sprintf("sub agent failed to append task: %v", err), nil
+	childSvc := NewReActService(childSess, s.parent.SessRepo, s.parent.LLMClient, childReg, func(*ReactEvent) {}, s.parent.tracer)
+	if err := childSvc.InitSession(ctx); err != nil {
+		return "", fmt.Errorf("init session: %w", err)
 	}
-	msg, err := childSvc.Run(ctx)
+	if err := childSvc.InitSysPrompt(ctx, sysPromt); err != nil {
+		return "", fmt.Errorf("init sys prompt: %w", err)
+	}
+
+	msg, err := childSvc.Chat(ctx, a.Task)
 	if err != nil {
 		// 失败交还父 Agent（不中断父循环）；当前 Run 出错时 msg 为 nil，
 		// 若将来 Run 能交回部分产出，则一并附上供父判断补救方向。

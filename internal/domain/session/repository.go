@@ -8,7 +8,9 @@ import (
 
 type SessionRepository interface {
 	AppendMessage(ctx context.Context, sessionID string, msg *sharedkernel.Message) error
+	// update or insert
+	UpsertSysMessage(ctx context.Context, sessionID string, msg *sharedkernel.Message) error
 	UpdateMeta(ctx context.Context, sessionID string, msg *sharedkernel.SessionMeta) error
 	GetMessages(ctx context.Context, sessionID string) ([]sharedkernel.Message, error)
-	GetMeta(ctx context.Context, sessionID string) (*sharedkernel.SessionMeta, error)
+	GetMeta(ctx context.Context, sessionID string) (sharedkernel.SessionMeta, error)
 }

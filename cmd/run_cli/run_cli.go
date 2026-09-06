@@ -103,10 +103,7 @@ func Run() {
 			continue
 		}
 
-		if err := assembled.Session.AppendUserPrompt(ctx, userInput); err != nil {
-			printer.Fatal(err)
-		}
-		_, err := assembled.Service.Run(ctx)
+		_, err := assembled.Service.Chat(ctx, userInput)
 		if err != nil {
 			printer.Fatal(err)
 		}

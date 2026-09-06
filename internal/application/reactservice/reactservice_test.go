@@ -32,7 +32,7 @@ func TestRunReturnsImmediateAnswer(t *testing.T) {
 	rec := &eventRecorder{}
 	svc := NewReActService(sess, llm, tools.NewDefaultRegistry(nil), rec.record, nil)
 
-	msg, err := svc.Run(context.Background())
+	msg, err := svc.think(context.Background())
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -71,7 +71,7 @@ func TestRunEmitsReasoningEvent(t *testing.T) {
 	rec := &eventRecorder{}
 	svc := NewReActService(sess, llm, tools.NewDefaultRegistry(nil), rec.record, nil)
 
-	if _, err := svc.Run(context.Background()); err != nil {
+	if _, err := svc.think(context.Background()); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 	types := map[string]string{}
@@ -102,7 +102,7 @@ func TestRunToolCallLoop(t *testing.T) {
 	rec := &eventRecorder{}
 	svc := NewReActService(sess, llm, reg, rec.record, nil)
 
-	msg, err := svc.Run(context.Background())
+	msg, err := svc.think(context.Background())
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -143,7 +143,7 @@ func TestRunPropagatesGenerateError(t *testing.T) {
 	}}
 	svc := NewReActService(sess, llm, tools.NewDefaultRegistry(nil), func(*ReactEvent) {}, nil)
 
-	_, err := svc.Run(context.Background())
+	_, err := svc.think(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "llm down") {
 		t.Fatalf("应透传 LLM 错误，实际 %v", err)
 	}
@@ -164,7 +164,7 @@ func TestRunUnknownToolDoesNotHang(t *testing.T) {
 	reg.Register(echoTool{}) // 不含 ghost_tool
 	svc := NewReActService(sess, llm, reg, func(*ReactEvent) {}, nil)
 
-	msg, err := svc.Run(context.Background())
+	msg, err := svc.think(context.Background())
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -194,7 +194,7 @@ func TestRunRegistersTokenUsageToSession(t *testing.T) {
 		}},
 	}}
 	svc := NewReActService(sess, llm, tools.NewDefaultRegistry(nil), func(*ReactEvent) {}, nil)
-	if _, err := svc.Run(context.Background()); err != nil {
+	if _, err := svc.think(context.Background()); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 	if sess.TokenUsed.TokenInput != 100 || sess.TokenUsed.TokenOutput != 20 {

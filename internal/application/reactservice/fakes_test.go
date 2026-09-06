@@ -140,7 +140,7 @@ func (fatalTool) AfterExecInfo(json.RawMessage) string { return "" }
 // newTestSession 构造带内存 repo 的会话并写入一条系统提示，贴近真实装配。
 func newTestSession(id string, repo session.SessionRepository) *session.Session {
 	sess := session.NewSession(id, repo)
-	if err := sess.ReplaceSysPrompt(context.Background(), "system prompt"); err != nil {
+	if err := sess.UpdateOrCreateSysPrompt(context.Background(), "system prompt"); err != nil {
 		panic(err)
 	}
 	return sess

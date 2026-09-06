@@ -8,12 +8,15 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/mikellxy/laxcode/internal/domain/session"
 	"github.com/mikellxy/laxcode/internal/domain/sharedkernel"
 )
 
 const historyFile = "history.jsonl"
 
 const metaFile = "meta.json"
+
+const sysMessageFile = "sys_message.json"
 
 type FsSessionRepo struct {
 	Dir string
@@ -44,14 +47,30 @@ func (r *FsSessionRepo) AppendMessage(ctx context.Context, sessionID string, msg
 	return nil
 }
 
+func (r *FsSessionRepo) UpsertSysMessage(ctx context.Context, sessionID string, msg *sharedkernel.Message) error {
+	path := filepath.Join(r.Dir, sessionID, sysMessageFile)
+
+	data, err := json.MarshalIndent(msg, "", "  ")
+	if err != nil {
+		return err
+	}
+
+	return r.writeFile(ctx, path, data)
+}
+
 func (r *FsSessionRepo) UpdateMeta(ctx context.Context, sessionID string, meta *sharedkernel.SessionMeta) error {
 	path := filepath.Join(r.Dir, sessionID, metaFile)
-	dir := filepath.Dir(path)
 
 	data, err := json.MarshalIndent(meta, "", "  ")
 	if err != nil {
 		return err
 	}
+
+	return r.writeFile(ctx, path, data)
+}
+
+func (r *FsSessionRepo) writeFile(ctx context.Context, path string, data []byte) error {
+	dir := filepath.Dir(path)
 
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
@@ -73,21 +92,37 @@ func (r *FsSessionRepo) UpdateMeta(ctx context.Context, sessionID string, meta *
 	if err := os.Rename(tmpName, path); err != nil {
 		os.Remove(tmpName)
 	}
+
 	return nil
 }
 
 func (r *FsSessionRepo) GetMessages(ctx context.Context, sessionID string) ([]sharedkernel.Message, error) {
+	var msgs []sharedkernel.Message
+	{
+		path := filepath.Join(r.Dir, sessionID, sysMessageFile)
+		data, err := os.ReadFile(path)
+		if err != nil && !os.IsNotExist(err) {
+			return nil, err
+		}
+		if len(data) > 0 {
+			var sysMsg sharedkernel.Message
+			if err = json.Unmarshal(data, &sysMsg); err != nil {
+				return nil, err
+			}
+			msgs = append(msgs, sysMsg)
+		}
+	}
+
 	path := filepath.Join(r.Dir, sessionID, historyFile)
 	f, err := os.Open(path)
 	if err != nil {
 		if !os.IsNotExist(err) {
 			return nil, err
 		}
-		return nil, nil
+		return msgs, nil
 	}
 	defer f.Close()
 
-	var msgs []sharedkernel.Message
 	scanner := bufio.NewScanner(f)
 	scanner.Buffer(make([]byte, 64*1024), 16*1024*1024)
 	for lineNo := 1; scanner.Scan(); lineNo++ {
@@ -106,20 +141,22 @@ func (r *FsSessionRepo) GetMessages(ctx context.Context, sessionID string) ([]sh
 	return msgs, nil
 }
 
-func (r *FsSessionRepo) GetMeta(ctx context.Context, sessionID string) (*sharedkernel.SessionMeta, error) {
+func (r *FsSessionRepo) GetMeta(ctx context.Context, sessionID string) (sharedkernel.SessionMeta, error) {
+	var meta sharedkernel.SessionMeta
 	path := filepath.Join(r.Dir, sessionID, metaFile)
 	content, err := os.ReadFile(path)
 	if err != nil {
 		if !os.IsNotExist(err) {
-			return nil, err
+			return meta, err
 		}
-		return new(sharedkernel.SessionMeta), nil
+		return meta, nil
 	}
 
-	var meta sharedkernel.SessionMeta
 	if err := json.Unmarshal(content, &meta); err != nil {
-		return nil, err
+		return meta, err
 	}
 
-	return &meta, nil
+	return meta, nil
 }
+
+var _ session.SessionRepository = (*FsSessionRepo)(nil)

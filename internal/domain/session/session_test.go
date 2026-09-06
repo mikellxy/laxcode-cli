@@ -61,7 +61,7 @@ func TestReplaceSysPrompt(t *testing.T) {
 	s := NewSession("s1", newMemoryRepo())
 
 	// 空会话：追加 system 消息
-	if err := s.ReplaceSysPrompt(ctx, "p1"); err != nil {
+	if err := s.UpdateOrCreateSysPrompt(ctx, "p1"); err != nil {
 		t.Fatalf("ReplaceSysPrompt on empty: %v", err)
 	}
 	if len(s.Messages) != 1 || s.Messages[0].Role != sharedkernel.RoleSystem || s.Messages[0].Content != "p1" {
@@ -69,7 +69,7 @@ func TestReplaceSysPrompt(t *testing.T) {
 	}
 
 	// 已有首条 system：原地替换，不重复追加
-	if err := s.ReplaceSysPrompt(ctx, "p2"); err != nil {
+	if err := s.UpdateOrCreateSysPrompt(ctx, "p2"); err != nil {
 		t.Fatalf("ReplaceSysPrompt again: %v", err)
 	}
 	if len(s.Messages) != 1 {

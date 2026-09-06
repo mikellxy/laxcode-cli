@@ -60,11 +60,8 @@ type Assembled struct {
 // 返回的 error 仅来自会话初始化 / 系统提示词写入。
 func Assemble(ctx context.Context, in Input) (*Assembled, error) {
 	// session：repo 落在 layout.SessionRoot(workDir)；SessionID 为空则新建。
-	repo := sessionrepo.NewFsSessionRepo(layout.SessionRoot(in.WorkDir))
-	sess := session.NewSession(in.SessionID, repo)
-	if err := sess.Init(); err != nil {
-		return nil, err
-	}
+	sessRepo := sessionrepo.NewFsSessionRepo(layout.SessionRoot(in.WorkDir))
+	sess := session.NewSession(in.SessionID)
 	// 系统提示词：技能索引在启动时快照一次（会话期内不刷新）；技能发现端口
 	// 以领域类型接收即完成编译期断言（同 workFS）。Plan Mode 的会话规划目录
 	// 由布局包算好后注入，领域层不再自行拼路径。
@@ -74,9 +71,7 @@ func Assemble(ctx context.Context, in Input) (*Assembled, error) {
 	if in.PlanMode {
 		plan = &prompt.PlanMode{SessionDir: layout.SessionDir(in.WorkDir, sess.ID)}
 	}
-	if err := sess.ReplaceSysPrompt(ctx, prompt.GetSysPrompt(in.WorkDir, skills, plan)); err != nil {
-		return nil, err
-	}
+	sysPrompt := prompt.GetSysPrompt(in.WorkDir, skills, plan)
 
 	// tracer：HandleDB 命中（custom 包 init 注册）优先，否则 filetrace 落盘到
 	// layout.TracingLog(workDir, sessID)；无法创建回退 noop。
@@ -108,7 +103,8 @@ func Assemble(ctx context.Context, in Input) (*Assembled, error) {
 	// provider + service
 	c := config.EnvAndFileConf
 	llmClient := llmprovider.NewOpenApiProvider(c.OpenaiApiKey, c.OpenaiBaseUrl, c.OpenaiModel)
-	svc := reactservice.NewReActService(sess, llmClient, toolReg, in.Consumer, tracer)
+	svc := reactservice.NewReActService(sess, sessRepo, llmClient, toolReg,
+		in.Consumer, tracer)
 	// 子 Agent 复用 svc 的 LLMClient/tracer/Repo 派生隔离子服务，注册进同一
 	// toolReg（svc 持其引用，late register 对 svc 可见）。
 	toolReg.Register(reactservice.NewSubAgent(svc, in.WorkDir,
@@ -119,6 +115,13 @@ func Assemble(ctx context.Context, in Input) (*Assembled, error) {
 			// 后台进程，不会波及主 Agent 尚在运行的后台服务
 			NewShell: func() tools.ShellRunner { return shell.New() },
 		}))
+
+	if err := svc.InitSession(ctx); err != nil {
+		return nil, err
+	}
+	if err := svc.InitSysPrompt(ctx, sysPrompt); err != nil {
+		return nil, err
+	}
 
 	var once sync.Once
 	cleanup := func() {
@@ -131,10 +134,9 @@ func Assemble(ctx context.Context, in Input) (*Assembled, error) {
 	return &Assembled{Service: svc, Session: sess, Cleanup: cleanup}, nil
 }
 
-// warnSkillSkip 是技能跳过警告的落点：写 stderr 而非 stdout，使 one-shot 模式的
-// stdout JSON 契约与交互模式的彩色输出都不被污染，警告仍可被用户看到。
 func warnSkillSkip(msg string) {
-	fmt.Fprintf(os.Stderr, "laxcode: %s\n", msg)
+	//fmt.Fprintf(os.Stderr, "laxcode: %s\n", msg)
+	// TODO: 打日志，避免污染 stdout
 }
 
 // newTraceHandle 按 logPath 构造默认 filetrace Provider；日志文件无法创建（如目录

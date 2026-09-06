@@ -110,10 +110,7 @@ func Run() int {
 	sess := assembled.Session
 
 	// 追加 task 为 user 消息后执行一次 ReAct 循环，直到模型给出无工具调用的最终回答。
-	if err := sess.AppendUserPrompt(ctx, taskPrompt); err != nil {
-		return usageFail("append task prompt failed: %v", err)
-	}
-	msg, runErr := assembled.Service.Run(ctx)
+	msg, runErr := assembled.Service.Chat(ctx, taskPrompt)
 
 	// 结果契约：成功 / 失败共用同一 schema，均带 session_id 与 token 统计。
 	res := OneShotResult{

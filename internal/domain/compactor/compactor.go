@@ -26,7 +26,7 @@ func (c *CompressResult) Total() int {
 
 // Strategy 是上下文压缩策略抽象。
 type Strategy interface {
-	Compress(msgs []sharedkernel.Message, maxToken int, winConsumed sharedkernel.TokenStatistics) ([]sharedkernel.Message, *CompressResult)
+	Compress(msgs []sharedkernel.Message, maxToken int, winConsumed sharedkernel.TokenStatistics) ([]sharedkernel.Message, sharedkernel.TokenStatistics, error)
 }
 
 // simpleStrategy 是默认的简单压缩策略：无状态，可安全并发使用。
@@ -46,10 +46,10 @@ var _ Strategy = SimpleCompactor
 // s.inMemoryMsgsCnt 条消息视为"在内存中"完整保留，其余的工具输出 / 超长正文
 // 按规则清理或截断，早于最后一次用户输入的 reasoning 直接丢弃。
 // 未达阈值时原样返回、result 为零值。传入的 msgs 会被原地修改并返回。
-func (s simpleStrategy) Compress(msgs []sharedkernel.Message, maxToken int, winConsumed sharedkernel.TokenStatistics) ([]sharedkernel.Message, *CompressResult) {
-	result := new(CompressResult)
+func (s simpleStrategy) Compress(msgs []sharedkernel.Message, maxToken int, winConsumed sharedkernel.TokenStatistics) ([]sharedkernel.Message, sharedkernel.TokenStatistics, error) {
+	var result sharedkernel.TokenStatistics
 	if float64(winConsumed.TokenInput+winConsumed.TokenOutput) < float64(maxToken)*0.8 {
-		return msgs, result
+		return msgs, result, nil
 	}
 
 	minInMemoryIdx := len(msgs) - s.inMemoryMsgsCnt
@@ -72,12 +72,12 @@ func (s simpleStrategy) Compress(msgs []sharedkernel.Message, maxToken int, winC
 				if len(msg.Content) > 200 {
 					newContent = fmt.Sprintf("为节省上下文空间，早起工具输出已被系统清理。原始输出长度为:%d字节", len(msg.Content))
 				}
-				result.InputTokenCompressed += EstimateTokenInt(msg.Content) - EstimateTokenInt(newContent)
+				result.TokenInput += EstimateTokenInt(msg.Content) - EstimateTokenInt(newContent)
 			} else if len(msg.Content) > 1000 {
 				head := msg.Content[:500]
 				tail := msg.Content[len(msg.Content)-500:]
 				newContent = fmt.Sprintf("%s [...输出过长，中间%d字节已被截断...] %s", head, len(msg.Content)-1000, tail)
-				result.InputTokenCompressed += EstimateTokenInt(msg.Content) - EstimateTokenInt(newContent)
+				result.TokenInput += EstimateTokenInt(msg.Content) - EstimateTokenInt(newContent)
 			}
 		}
 
@@ -86,7 +86,7 @@ func (s simpleStrategy) Compress(msgs []sharedkernel.Message, maxToken int, winC
 				head := msg.Content[:500]
 				tail := msg.Content[len(msg.Content)-500:]
 				newContent = fmt.Sprintf("%s [...早起推理输出过长，中间%d字节已被截断...] %s", head, len(msg.Content)-1000, tail)
-				result.OutputTokenCompressed += EstimateTokenInt(msg.Content) - EstimateTokenInt(newContent)
+				result.TokenOutput += EstimateTokenInt(msg.Content) - EstimateTokenInt(newContent)
 			}
 		}
 
@@ -94,10 +94,10 @@ func (s simpleStrategy) Compress(msgs []sharedkernel.Message, maxToken int, winC
 		msgs[i].Content = newContent
 
 		if msg.Role == sharedkernel.RoleAssistant && i < lastUserIdx && msg.ReasoningContent != "" {
-			result.OutputTokenCompressed += EstimateTokenInt(msg.ReasoningContent)
+			result.TokenOutput += EstimateTokenInt(msg.ReasoningContent)
 			msgs[i].ReasoningContent = ""
 		}
 	}
 
-	return msgs, result
+	return msgs, result, nil
 }
