@@ -16,7 +16,12 @@ const historyFile = "history.jsonl"
 
 const metaFile = "meta.json"
 
+// sysMessageFile 独立存放系统提示词：它每轮启动都会被整体覆盖（技能索引 /
+// Plan Mode 变化），而 history.jsonl 是只追加的对话流水，两者写入语义不同。
 const sysMessageFile = "sys_message.json"
+
+// tmpPattern 是原子写（写临时文件 + rename）的临时文件名模板。
+const tmpPattern = "*.tmp"
 
 type FsSessionRepo struct {
 	Dir string
@@ -43,7 +48,11 @@ func (r *FsSessionRepo) AppendMessage(ctx context.Context, sessionID string, msg
 		return err
 	}
 	defer f.Close()
-	_, err = f.Write(append(line, '\n'))
+	// 写失败必须上报：静默丢弃会让内存里的会话与磁盘历史分叉，
+	// 续聊时表现为“上一轮对话凭空消失”。
+	if _, err := f.Write(append(line, '\n')); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -69,13 +78,14 @@ func (r *FsSessionRepo) UpdateMeta(ctx context.Context, sessionID string, meta *
 	return r.writeFile(ctx, path, data)
 }
 
+// writeFile 以“临时文件 + rename”原子替换 path，避免写一半被读到。
 func (r *FsSessionRepo) writeFile(ctx context.Context, path string, data []byte) error {
 	dir := filepath.Dir(path)
 
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
-	tmp, err := os.CreateTemp(dir, "meta.*.tmp")
+	tmp, err := os.CreateTemp(dir, tmpPattern)
 	if err != nil {
 		return err
 	}
@@ -91,13 +101,21 @@ func (r *FsSessionRepo) writeFile(ctx context.Context, path string, data []byte)
 	}
 	if err := os.Rename(tmpName, path); err != nil {
 		os.Remove(tmpName)
+		return err
 	}
 
 	return nil
 }
 
+// GetMessages 读回完整消息序列：系统提示词（sys_message.json）居首，
+// 其后是 history.jsonl 的对话流水。会话不存在时返回空序列而非错误。
+//
+// 旧版布局把系统提示词写在 history.jsonl 首行，新版改存独立文件。两者同时
+// 存在时以 sys_message.json 为准，跳过 history 里的 system 行：否则续聊会
+// 向模型发送两条系统提示词（新的一条 + 陈旧的一条）。
 func (r *FsSessionRepo) GetMessages(ctx context.Context, sessionID string) ([]sharedkernel.Message, error) {
 	var msgs []sharedkernel.Message
+	hasSysFile := false
 	{
 		path := filepath.Join(r.Dir, sessionID, sysMessageFile)
 		data, err := os.ReadFile(path)
@@ -110,6 +128,7 @@ func (r *FsSessionRepo) GetMessages(ctx context.Context, sessionID string) ([]sh
 				return nil, err
 			}
 			msgs = append(msgs, sysMsg)
+			hasSysFile = true
 		}
 	}
 
@@ -134,9 +153,15 @@ func (r *FsSessionRepo) GetMessages(ctx context.Context, sessionID string) ([]sh
 		if err := json.Unmarshal(line, &msg); err != nil {
 			continue
 		}
+		if hasSysFile && msg.Role == sharedkernel.RoleSystem {
+			continue // 旧布局遗留的系统提示词，已被 sys_message.json 取代
+		}
 		msgs = append(msgs, msg)
 	}
+	// 扫描中途失败（如单行超出缓冲上限）必须上报：静默截断会让续聊
+	// 丢掉后半段历史，而调用方无从知晓。
 	if err := scanner.Err(); err != nil {
+		return nil, err
 	}
 	return msgs, nil
 }

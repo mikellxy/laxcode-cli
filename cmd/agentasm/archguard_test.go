@@ -145,6 +145,30 @@ func TestDomainDoesNotImportOSMechanics(t *testing.T) {
 	}
 }
 
+// domain 的内部依赖必须收敛在 domain 之内。本文件其余用例只禁止“domain 依赖
+// infrastructure / OS 机制”，对 internal/utils 这类层外杂项包无能为力（它根本
+// 不在 layers 里）：一旦 domain 引了它，既绕过守护，又会让同一份纯算法（如
+// token 估算）在两个包里各存一份。共享类型与纯算法的正确落点是
+// domain/sharedkernel，跨层能力则在 domain 定义端口、交 infrastructure 实现。
+func TestDomainInternalImportsStayInDomain(t *testing.T) {
+	imports := scanImports(t, "internal/domain")
+	if len(imports) == 0 {
+		t.Fatal("未扫描到 internal/domain 下任何包，检查是否失效")
+	}
+	const domainPrefix = modulePath + "internal/domain/"
+	for dir, imps := range imports {
+		for _, imp := range imps {
+			// 标准库与第三方不在此约束内（第三方依赖另有专门用例与 README 白名单）
+			if !strings.HasPrefix(imp, modulePath) {
+				continue
+			}
+			if !strings.HasPrefix(imp, domainPrefix) {
+				t.Errorf("%s 依赖了领域层之外的内部包 %s：共享类型/纯算法请放 domain/sharedkernel，跨层能力请在 domain 定义端口交 infrastructure 实现", dir, imp)
+			}
+		}
+	}
+}
+
 // otelHomes 是全仓唯一允许 import OpenTelemetry 的两处：domain/telemetry 承载
 // 埋点语义（span 名、属性键、追踪辅助函数），infrastructure/tracing 承载
 // TracerProvider 装配与导出实现（含 filetrace）。多一处，"换观测方案只改两个包"

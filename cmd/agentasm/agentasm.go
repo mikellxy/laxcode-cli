@@ -44,9 +44,10 @@ type Input struct {
 
 // Assembled 是装配产物。
 type Assembled struct {
-	// Service 是可直接 Run 的主 Agent 服务（已注册 bash/write/read/edit + 子 Agent）。
+	// Service 是已完成会话初始化的主 Agent 服务（已注册 bash/write/read/edit +
+	// 子 Agent），前端直接调 Chat 发一轮对话。
 	Service *reactservice.ReActService
-	// Session 是 Service 持有的主会话，供前端读取 ID / token 统计、追加 user 消息。
+	// Session 是 Service 持有的主会话，供前端读取 ID / token 统计。
 	Session *session.Session
 	// Cleanup 回收带生命周期的资源，调用方 defer 一次；以 sync.Once 保证幂等，
 	// 使信号处理与正常退出路径可各自安全调用。顺序：先 Close 工具注册表（回收
@@ -116,13 +117,9 @@ func Assemble(ctx context.Context, in Input) (*Assembled, error) {
 			NewShell: func() tools.ShellRunner { return shell.New() },
 		}))
 
-	if err := svc.InitSession(ctx); err != nil {
-		return nil, err
-	}
-	if err := svc.InitSysPrompt(ctx, sysPrompt); err != nil {
-		return nil, err
-	}
-
+	// cleanup 必须在任何可能失败的初始化之前建好：会话加载 / 系统提示词写盘
+	// 失败时调用方拿不到 Assembled，已获取的资源（filetrace 日志句柄、工具
+	// 注册表里的 bash 后台进程与临时文件）只能由本函数负责回收。
 	var once sync.Once
 	cleanup := func() {
 		once.Do(func() {
@@ -131,12 +128,26 @@ func Assemble(ctx context.Context, in Input) (*Assembled, error) {
 		})
 	}
 
+	// 会话初始化放在资源装配之后：子 Agent 工具需先注册进 toolReg，而
+	// InitSysPrompt 写入的系统提示词含技能索引，与工具集属于同一份启动快照。
+	if err := svc.InitSession(ctx); err != nil {
+		cleanup()
+		return nil, err
+	}
+	if err := svc.InitSysPrompt(ctx, sysPrompt); err != nil {
+		cleanup()
+		return nil, err
+	}
+
 	return &Assembled{Service: svc, Session: sess, Cleanup: cleanup}, nil
 }
 
+// warnSkillSkip 是技能跳过警告的落点：写 stderr 而非 stdout，使 one-shot 模式
+// 的 stdout JSON 契约与交互模式的彩色输出都不被污染，警告仍可被用户看到。
+// 不得把它改成空实现：技能 frontmatter 解析失败将被静默后，模型侧表现为
+// “技能没生效”而无任何线索。
 func warnSkillSkip(msg string) {
-	//fmt.Fprintf(os.Stderr, "laxcode: %s\n", msg)
-	// TODO: 打日志，避免污染 stdout
+	fmt.Fprintf(os.Stderr, "laxcode: %s\n", msg)
 }
 
 // newTraceHandle 按 logPath 构造默认 filetrace Provider；日志文件无法创建（如目录

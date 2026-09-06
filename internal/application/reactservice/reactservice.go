@@ -2,6 +2,7 @@ package reactservice
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/mikellxy/laxcode/internal/domain/compactor"
@@ -10,11 +11,12 @@ import (
 	"github.com/mikellxy/laxcode/internal/domain/sharedkernel"
 	"github.com/mikellxy/laxcode/internal/domain/telemetry"
 	"github.com/mikellxy/laxcode/internal/domain/tools"
-	"go.opentelemetry.io/otel/trace"
 )
 
 type ReActService struct {
-	Session             *session.Session
+	Session *session.Session
+	// SessRepo 是会话持久化端口：加载与落盘由本服务（application 层）编排，
+	// 聚合只做内存内的状态演化，不持有仓储。
 	SessRepo            session.SessionRepository
 	LLMClient           llmprovider.LLMClient
 	ToolRegistry        tools.Registry
@@ -56,40 +58,35 @@ func NewReActService(sess *session.Session,
 	}
 }
 
-// InitSession 获取 Session messages、meta
+// InitSession 从仓储读回历史与 token 账目，重建聚合状态（装配 / 续聊期一次）。
 func (r *ReActService) InitSession(ctx context.Context) error {
 	msgs, err := r.SessRepo.GetMessages(ctx, r.Session.ID)
 	if err != nil {
 		return err
 	}
-	r.Session.LoadMessages(ctx, msgs)
+	r.Session.LoadMessages(msgs)
 
 	meta, err := r.SessRepo.GetMeta(ctx, r.Session.ID)
 	if err != nil {
 		return err
 	}
-	r.Session.LoadMeta(ctx, meta)
+	r.Session.LoadMeta(meta)
 
 	return nil
 }
 
+// InitSysPrompt 写入本次运行的系统提示词：聚合先落定状态并交出消息快照，
+// 再由本服务落盘。token 账目不在此写 meta：系统提示词的估算占用每次启动
+// 都会重算，真正需要持久化的账目随首条 assistant 消息一起落盘。
 func (r *ReActService) InitSysPrompt(ctx context.Context, p string) error {
-	sysMsg := r.Session.BuildSysMessage(ctx, p)
-	if err := r.SessRepo.UpsertSysMessage(ctx, r.Session.ID, sysMsg); err != nil {
-		return err
-	}
-	if err := r.Session.UpsertSysMessage(ctx, sysMsg); err != nil {
-		return err
-	}
-	return nil
+	sysMsg := r.Session.UpsertSysMessage(p)
+	return r.SessRepo.UpsertSysMessage(ctx, r.Session.ID, &sysMsg)
 }
 
+// Chat 追加一条用户消息并跑一轮 ReAct 循环，直到模型给出无工具调用的回答。
 func (r *ReActService) Chat(ctx context.Context, p string) (*sharedkernel.Message, error) {
-	userMsg := r.Session.BuildUserMessage(ctx, p)
-	if err := r.SessRepo.AppendMessage(ctx, r.Session.ID, userMsg); err != nil {
-		return nil, err
-	}
-	if err := r.Session.AppendMessage(ctx, userMsg); err != nil {
+	userMsg := r.Session.BuildUserMessage(p)
+	if err := r.handleTurnMsg(ctx, &userMsg); err != nil {
 		return nil, err
 	}
 	return r.think(ctx)
@@ -125,21 +122,32 @@ func (r *ReActService) think(ctx context.Context) (*sharedkernel.Message, error)
 		turnCtx, turnSpan := telemetry.Start(ctx, r.tracer, telemetry.LLMTurn,
 			telemetry.AttrTurnSeq.Int(turnCnt))
 		turnStart := time.Now()
+		// closeTurn 是本轮 span 的唯一收尾点：各 return 路径都经它落耗时与错误
+		// 状态。span 生命周期留在本函数而不交给持久化辅助函数，本包才能继续
+		// 只经 telemetry 使用追踪能力，不直接依赖 OTel 类型。
+		closeTurn := func(err error) {
+			telemetry.CloseSpan(turnSpan,
+				telemetry.WithTimeCostMs(time.Since(turnStart).Milliseconds()),
+				telemetry.WithErr(err))
+		}
 
 		// 上下文压缩：每轮 generate 前压缩历史（对齐老 engine.Run），触发
-		// 阈值 maxWindowToken；压缩后回写 Messages 并同步扣减窗口占用。
-		msgs, compressedToken, _ := compactor.SimpleCompactor.Compress(r.Session.Messages, maxWindowToken, r.Session.TokenUsed)
-		r.Session.LoadCompactorResult(ctx, msgs, compressedToken)
+		// 阈值 maxWindowToken；压缩在聚合内改写 Messages 并同步扣减窗口占用。
+		if err := r.Session.Compact(compactor.SimpleCompactor, maxWindowToken); err != nil {
+			reActErr = err
+			closeTurn(err)
+			return nil, err
+		}
 
 		msg, err := r.LLMClient.Generate(turnCtx, r.Session.Messages, r.ToolRegistry.GetAvailableTools())
 		if err != nil {
 			reActErr = err
-			telemetry.CloseSpan(turnSpan, telemetry.WithTimeCostMs(time.Since(turnStart).Milliseconds()), telemetry.WithErr(err))
+			closeTurn(err)
 			return nil, err
 		}
-		err = r.handleTurnMsg(ctx, msg, turnStart, turnSpan)
-		if err != nil {
+		if err := r.handleTurnMsg(ctx, msg); err != nil {
 			reActErr = err
+			closeTurn(err)
 			return nil, err
 		}
 		if msg.ReasoningContent != "" {
@@ -160,7 +168,7 @@ func (r *ReActService) think(ctx context.Context) (*sharedkernel.Message, error)
 
 		// 无工具调用，推理循环完成
 		if len(msg.ToolCalls) == 0 {
-			telemetry.CloseSpan(turnSpan, telemetry.WithTimeCostMs(time.Since(turnStart).Milliseconds()))
+			closeTurn(nil)
 			return msg, nil
 		}
 
@@ -171,24 +179,40 @@ func (r *ReActService) think(ctx context.Context) (*sharedkernel.Message, error)
 			// turnCtx 携带 llm-turn span，tool-exec span 经注册表挂到其下
 			result := r.ToolRegistry.Execute(turnCtx, &tc)
 			toolMsg := tools.ToolResultAsMsg(result)
-			err := r.handleTurnMsg(ctx, toolMsg, turnStart, turnSpan)
-			if err != nil {
+			if err := r.handleTurnMsg(ctx, toolMsg); err != nil {
 				reActErr = err
+				closeTurn(err)
 				return nil, err
 			}
 		}
-		telemetry.CloseSpan(turnSpan, telemetry.WithTimeCostMs(time.Since(turnStart).Milliseconds()))
+		closeTurn(nil)
 	}
 }
 
-func (r *ReActService) handleTurnMsg(ctx context.Context, msg *sharedkernel.Message, start time.Time, span trace.Span) error {
+// handleTurnMsg 把一条消息落盘、同步进聚合，并在 token 账目变化时写回 meta。
+// 顺序是“先磁盘后内存”：写盘失败时聚合状态不动，内存与续聊读回的历史
+// 不会分叉。本函数只返回 error，span 收尾由调用方的 closeTurn 统一负责。
+func (r *ReActService) handleTurnMsg(ctx context.Context, msg *sharedkernel.Message) error {
 	if err := r.SessRepo.AppendMessage(ctx, r.Session.ID, msg); err != nil {
-		telemetry.CloseSpan(span, telemetry.WithTimeCostMs(time.Since(start).Milliseconds()), telemetry.WithErr(err))
 		return err
 	}
-	if err := r.Session.AppendMessage(ctx, msg); err != nil {
-		telemetry.CloseSpan(span, telemetry.WithTimeCostMs(time.Since(start).Milliseconds()), telemetry.WithErr(err))
+	if err := r.Session.AppendMessage(msg); err != nil {
 		return err
+	}
+	return r.persistMeta(ctx, msg)
+}
+
+// persistMeta 在消息改变了 token 账目时把 meta 落盘（meta.json）：只有 assistant
+// 消息携带模型返回的实测用量，user / tool 消息不影响账目，无需多写一次文件。
+// 落的是本次实测窗口值，不含压缩扣减：压缩只在内存生效，磁盘上的
+// history.jsonl 始终是未压缩原文，续聊时按原文重算才自洽。
+func (r *ReActService) persistMeta(ctx context.Context, msg *sharedkernel.Message) error {
+	if msg.Role != sharedkernel.RoleAssistant {
+		return nil
+	}
+	meta := r.Session.Meta()
+	if err := r.SessRepo.UpdateMeta(ctx, r.Session.ID, &meta); err != nil {
+		return fmt.Errorf("persist session meta: %w", err)
 	}
 	return nil
 }

@@ -26,29 +26,25 @@ func newTestSubAgent(parent *ReActService, workDir string) *SubAgent {
 	})
 }
 
-// childSysPrompt 从 repo 中取出子会话（ID 以 sub: 前缀）的 system 消息内容。
+// childSysPrompt 从 repo 中取出子会话（ID 以 sub: 前缀）的 system 消息内容：
+// 系统提示词独立存储（对齐 FsSessionRepo 的 sys_message.json），不在对话流水里。
 func childSysPrompt(t *testing.T, repo *memRepo) string {
 	t.Helper()
 	repo.mu.Lock()
 	defer repo.mu.Unlock()
-	for id, msgs := range repo.msgs {
-		if !strings.HasPrefix(id, "sub:") {
-			continue
-		}
-		for _, m := range msgs {
-			if m.Role == sharedkernel.RoleSystem {
-				return m.Content
-			}
+	for id, sys := range repo.sysMsgs {
+		if strings.HasPrefix(id, "sub:") {
+			return sys.Content
 		}
 	}
-	t.Fatalf("repo 中未找到子会话的 system 消息，实际会话桶: %v", sessionIDs(repo.msgs))
+	t.Fatalf("repo 中未找到子会话的 system 消息，实际会话桶: %v", sessionIDs(repo.sysMsgs))
 	return ""
 }
 
 // sessionIDs 抽出 repo 中已有的会话 ID，仅用于失败时的诊断输出。
-func sessionIDs(msgs map[string][]sharedkernel.Message) []string {
-	ids := make([]string, 0, len(msgs))
-	for id := range msgs {
+func sessionIDs[K any](m map[string]K) []string {
+	ids := make([]string, 0, len(m))
+	for id := range m {
 		ids = append(ids, id)
 	}
 	return ids
@@ -88,7 +84,7 @@ func TestSubAgentNameAndDefinition(t *testing.T) {
 func TestSubAgentExecuteBadJSON(t *testing.T) {
 	repo := newMemRepo()
 	sess := newTestSession("parent", repo)
-	parent := NewReActService(sess, &scriptedLLM{}, tools.NewDefaultRegistry(nil), nil, nil)
+	parent := NewReActService(sess, repo, &scriptedLLM{}, tools.NewDefaultRegistry(nil), nil, nil)
 	sa := newTestSubAgent(parent, "/tmp/wd")
 
 	_, err := sa.Execute(context.Background(), json.RawMessage(`{bad json`))
@@ -100,7 +96,7 @@ func TestSubAgentExecuteBadJSON(t *testing.T) {
 func TestSubAgentExecuteMissingTask(t *testing.T) {
 	repo := newMemRepo()
 	sess := newTestSession("parent", repo)
-	parent := NewReActService(sess, &scriptedLLM{}, tools.NewDefaultRegistry(nil), nil, nil)
+	parent := NewReActService(sess, repo, &scriptedLLM{}, tools.NewDefaultRegistry(nil), nil, nil)
 	sa := newTestSubAgent(parent, "/tmp/wd")
 
 	_, err := sa.Execute(context.Background(), json.RawMessage(`{"abstract":"x"}`))
@@ -115,7 +111,7 @@ func TestSubAgentExecuteHappyPath(t *testing.T) {
 	llm := &scriptedLLM{responses: []scriptedResp{
 		{msg: assistantMsg("child result")},
 	}}
-	parent := NewReActService(sess, llm, tools.NewDefaultRegistry(nil), nil, nil)
+	parent := NewReActService(sess, repo, llm, tools.NewDefaultRegistry(nil), nil, nil)
 	sa := newTestSubAgent(parent, "/tmp/wd")
 
 	out, err := sa.Execute(context.Background(), json.RawMessage(`{"task":"count files","abstract":"counting","work_dir":"/tmp/wd"}`))
@@ -129,8 +125,8 @@ func TestSubAgentExecuteHappyPath(t *testing.T) {
 	if len(sess.Messages) != 1 {
 		t.Errorf("父会话不应被写入，实际 %d 条：%+v", len(sess.Messages), sess.Messages)
 	}
-	// 子会话落在独立 ID（sub: 前缀）下，repo 中可读到
-	// system + user + assistant 共三条（Run 结束后结论一并持久化）
+	// 子会话落在独立 ID（sub: 前缀）下，repo 中可读到：
+	// 系统提示词单独一份，对话流水里是 user + assistant 两条
 	total := 0
 	roles := map[string]int{}
 	repo.mu.Lock()
@@ -142,9 +138,19 @@ func TestSubAgentExecuteHappyPath(t *testing.T) {
 			}
 		}
 	}
+	sysCnt := 0
+	for id, sys := range repo.sysMsgs {
+		if strings.HasPrefix(id, "sub:") {
+			sysCnt++
+			roles[sys.Role]++
+		}
+	}
 	repo.mu.Unlock()
-	if total != 3 {
-		t.Errorf("子会话应持久化三条消息（system/user/assistant），实际 %d", total)
+	if total != 2 {
+		t.Errorf("子会话对话流水应为 user/assistant 两条，实际 %d", total)
+	}
+	if sysCnt != 1 {
+		t.Errorf("子会话应单独存一份系统提示词，实际 %d", sysCnt)
 	}
 	if roles[sharedkernel.RoleSystem] != 1 || roles[sharedkernel.RoleUser] != 1 ||
 		roles[sharedkernel.RoleAssistant] != 1 {
@@ -158,7 +164,7 @@ func TestSubAgentExecuteChildFailureReturnsString(t *testing.T) {
 	llm := &scriptedLLM{responses: []scriptedResp{
 		{err: errors.New("child llm failed")},
 	}}
-	parent := NewReActService(sess, llm, tools.NewDefaultRegistry(nil), nil, nil)
+	parent := NewReActService(sess, repo, llm, tools.NewDefaultRegistry(nil), nil, nil)
 	sa := newTestSubAgent(parent, "/tmp/wd")
 
 	out, err := sa.Execute(context.Background(), json.RawMessage(`{"task":"x"}`))
@@ -186,7 +192,7 @@ func TestSubAgentChildPromptIncludesSkills(t *testing.T) {
 
 	repo := newMemRepo()
 	sess := newTestSession("parent", repo)
-	parent := NewReActService(sess, &scriptedLLM{
+	parent := NewReActService(sess, repo, &scriptedLLM{
 		responses: []scriptedResp{{msg: assistantMsg("ok")}},
 	}, tools.NewDefaultRegistry(nil), nil, nil)
 	// 构造时给一个不存在技能的目录，确保索引确实来自 work_dir 入参覆盖
@@ -218,7 +224,7 @@ func TestSubAgentChildPromptIncludesSkills(t *testing.T) {
 func TestSubAgentChildPromptNoSkillsNoIndex(t *testing.T) {
 	repo := newMemRepo()
 	sess := newTestSession("parent", repo)
-	parent := NewReActService(sess, &scriptedLLM{
+	parent := NewReActService(sess, repo, &scriptedLLM{
 		responses: []scriptedResp{{msg: assistantMsg("ok")}},
 	}, tools.NewDefaultRegistry(nil), nil, nil)
 	sa := newTestSubAgent(parent, t.TempDir())
@@ -252,7 +258,7 @@ func TestSubAgentBeforeAfterExecInfo(t *testing.T) {
 func TestSubAgentChildUsesWorkDirOverride(t *testing.T) {
 	repo := newMemRepo()
 	sess := newTestSession("parent", repo)
-	parent := NewReActService(sess, &scriptedLLM{
+	parent := NewReActService(sess, repo, &scriptedLLM{
 		responses: []scriptedResp{{msg: assistantMsg("ok")}},
 	}, tools.NewDefaultRegistry(nil), nil, nil)
 	// work_dir 入参覆盖构造时目录——子工具集以覆盖目录为工作区，
@@ -266,10 +272,10 @@ func TestSubAgentChildUsesWorkDirOverride(t *testing.T) {
 }
 
 func TestSubAgentWithParentSessionRepo(t *testing.T) {
-	// 显式验证 child 复用父 Repo：写出的消息能被同一 repo 检索到
+	// 显式验证 child 复用父 SessRepo：写出的消息能被同一 repo 检索到
 	repo := newMemRepo()
 	sess := newTestSession("parent-1", repo)
-	parent := NewReActService(sess, &scriptedLLM{
+	parent := NewReActService(sess, repo, &scriptedLLM{
 		responses: []scriptedResp{{msg: assistantMsg("result-1")}},
 	}, tools.NewDefaultRegistry(nil), nil, nil)
 	sa := newTestSubAgent(parent, "/wd")

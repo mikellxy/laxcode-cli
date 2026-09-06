@@ -39,7 +39,7 @@ type SubAgentDeps struct {
 
 // SubAgent 把「启动一个隔离子 Agent 跑子任务」包装成 tools.BaseTool 的适配器。
 // 它编排一个子 ReActService：
-//   - 全新子会话（id=sub:<ts>-<parentID>，复用父 Repo），历史独立，绝不写回父对话；
+//   - 全新子会话（id=sub:<ts>-<parentID>，复用父 SessRepo），历史独立，绝不写回父对话；
 //   - 受限工具集（仅 bash + read_file，且不含 sub-agent 自身 → 天然防递归）；
 //   - planMode=false，继承父的 LLMClient 与 tracer（子 span 树挂在同一 trace 下）；
 //   - 事件静默（子 Agent 中间过程不外发）。
@@ -53,7 +53,7 @@ type SubAgent struct {
 }
 
 // NewSubAgent 以父 ReActService、工作目录与端口集合构造子 Agent 工具。父的
-// LLMClient / tracer / Session.Repo 经 parent 复用；workDir 用于构建子 Agent 的
+// LLMClient / tracer / SessRepo 经 parent 复用；workDir 用于构建子 Agent 的
 // 受限工具集，子任务可通过 work_dir 入参覆盖。调用方须在 parent 装配完成后
 // 注册本工具。
 func NewSubAgent(parent *ReActService, workDir string, deps SubAgentDeps) *SubAgent {
@@ -88,10 +88,12 @@ func (s *SubAgent) Definition() sharedkernel.ToolDefinition {
 }
 
 // Execute 解析子任务、装配一个隔离子 ReActService 跑完后返回其结论文本。
-// 子 Agent 内部失败不返回 error（避免中断父的 ReAct 循环），而是把失败原因
-// （若 Run 交回了部分产出则一并）作为工具结果字符串返回，父 Agent 可据此判断
-// 补救方向——对齐老 subagent.go 的 (result, nil) 语义。仅入参解析 / 缺 task
-// 这类调用方错误才返回真正的 error。
+// 子 Agent 跑任务期间的失败（如 LLM 报错）不返回 error（避免中断父的 ReAct
+// 循环），而是把失败原因（若交回了部分产出则一并）作为工具结果字符串返回，
+// 父 Agent 可据此判断补救方向——对齐老 subagent.go 的 (result, nil) 语义。
+// 入参解析 / 缺 task / 子会话初始化落盘失败这类环境级故障则返回真正的
+// error：注册表会把它包成 IsError 的工具结果并记到 tool-exec span 上，
+// 同样不会中断父循环，但失败原因不会被当作“子任务结论”掩盖。
 func (s *SubAgent) Execute(ctx context.Context, args json.RawMessage) (string, error) {
 	var a subAgentArgs
 	if err := json.Unmarshal(args, &a); err != nil {
@@ -105,14 +107,15 @@ func (s *SubAgent) Execute(ctx context.Context, args json.RawMessage) (string, e
 		workDir = a.WorkDir
 	}
 
-	// 子会话：全新 id、复用父 Repo；不调用 Init（子会话从不续聊，无需加载历史）。
+	// 子会话：全新 id、复用父 SessRepo。InitSession 对全新 id 读不到任何历史，
+	// 两次读盘只为走同一条装配路径（与主 Agent 一致），不依赖“子会话为空”的假设。
 	// 注入人格系统提示词（含 workDir 沙箱约束）与子工作目录下的技能索引；
 	// plan 传 nil（子 Agent 不支持 Plan Mode），warn 传 nil（技能警告已在主 Agent
 	// 启动时针对主工作目录输出过，此处重复输出只会淹没子任务结果）。
 	childID := "sub:" + time.Now().Format("20060102-150405.000") + "-" + s.parent.Session.ID
 	childSess := session.NewSession(childID)
 	childSkills := prompt.LoadSkills(s.deps.SkillSrc, workDir, nil)
-	sysPromt := prompt.GetSysPrompt(workDir, childSkills, nil)
+	childSysPrompt := prompt.GetSysPrompt(workDir, childSkills, nil)
 
 	// 受限工具集：仅 bash + read_file，不含 sub-agent 自身 → 防递归。子 Agent
 	// 一次运行即完整生命周期，defer Close 回收 bash 后台进程与临时文件；
@@ -127,14 +130,14 @@ func (s *SubAgent) Execute(ctx context.Context, args json.RawMessage) (string, e
 	if err := childSvc.InitSession(ctx); err != nil {
 		return "", fmt.Errorf("init session: %w", err)
 	}
-	if err := childSvc.InitSysPrompt(ctx, sysPromt); err != nil {
+	if err := childSvc.InitSysPrompt(ctx, childSysPrompt); err != nil {
 		return "", fmt.Errorf("init sys prompt: %w", err)
 	}
 
 	msg, err := childSvc.Chat(ctx, a.Task)
 	if err != nil {
-		// 失败交还父 Agent（不中断父循环）；当前 Run 出错时 msg 为 nil，
-		// 若将来 Run 能交回部分产出，则一并附上供父判断补救方向。
+		// 失败交还父 Agent（不中断父循环）；当前 Chat 出错时 msg 为 nil，
+		// 若将来 Chat 能交回部分产出，则一并附上供父判断补救方向。
 		if msg != nil && msg.Content != "" {
 			return fmt.Sprintf("sub agent failed: %v\npartial result: %s", err, msg.Content), nil
 		}

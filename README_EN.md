@@ -103,7 +103,8 @@ Session directory layout
 ```text
 ${workdir}/.laxcode/.session/
 └── ${session_id}/
-    ├── history.jsonl           # conversation history, JSON LINES
+    ├── history.jsonl           # conversation history, JSON LINES (system prompt excluded)
+    ├── sys_message.json        # system prompt, wholly overwritten on each start
     ├── meta.json               # token usage stats, context window records
     ├── log/
     │   └── tracing.log         # OTel spans persisted locally as JSON LINES
@@ -210,9 +211,9 @@ LaxCode/
 │   │   ├── tools/         # tool registry & read/write/edit/bash behavioral contracts, WorkFS / ShellRunner ports
 │   │   ├── llmprovider/   # LLM client interface
 │   │   ├── prompt/        # system prompt assembly (persona / skill index / Plan Mode), SkillSource port
-│   │   ├── compactor/     # context compaction strategy & token estimation
+│   │   ├── compactor/     # context compaction strategy
 │   │   ├── telemetry/     # observability vocabulary: span names, attribute keys, tracing helpers
-│   │   └── sharedkernel/  # shared types: messages, tool definitions, token stats
+│   │   └── sharedkernel/  # shared types: messages, tool definitions, token stats & estimation
 │   └── infrastructure/
 │       ├── llmprovider/   # OpenAI Responses protocol implementation
 │       ├── sessionrepo/   # filesystem session repository (JSONL persistence)
@@ -239,6 +240,8 @@ Ports and their adapters:
 The layering criterion: **a tool's "behavioral contract" stays in domain** (`Definition` and JSON Schema, argument validation, error taxonomy, model-facing prompt text, pagination and other pure algorithms), while **OS mechanics sink into infrastructure** (`syscall`, `os.Open`, `exec`, process groups, directory scanning). That is why `domain/tools` contains `bash.go` but no `os/exec`; on-disk path segments are always taken from `infrastructure/layout` instead of being hardcoded elsewhere.
 
 domain has only two third-party dependencies, each quarantined in a single "vocabulary" package: `domain/telemetry` funnels the OpenTelemetry API, and `domain/prompt` uses `go.yaml.in/yaml/v4` to parse skill frontmatter. Across the whole repo, imports of `go.opentelemetry.io/` should appear only in `domain/telemetry` (instrumentation semantics: span names, attribute keys, tracing helpers) and `infrastructure/tracing` (assembly and export implementation); instrumentation sites in domain / application / cmd must go through `telemetry`, because importing OTel directly would reduce "switching observability vendors touches only two packages" to an empty claim.
+
+Dependencies inside `internal/domain/*` are funnelled the same way: a domain package may only depend on domain packages, cross-layer capabilities are defined as ports in domain and implemented in infrastructure, and pure algorithms plus shared types always live in `domain/sharedkernel` — so the domain layer never reaches back into out-of-layer grab bags such as `internal/utils`. The layering criteria above are enforced one by one by the guard tests in `cmd/agentasm/archguard_test.go`; violating them fails the test suite.
 
 ```mermaid
 flowchart TD

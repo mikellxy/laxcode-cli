@@ -103,7 +103,8 @@ session 目录结构
 ```text
 ${workdir}/.laxcode/.session/
 └── ${session_id}/
-    ├── history.jsonl           # 对话历史 JSON LINES
+    ├── history.jsonl           # 对话历史 JSON LINES（不含系统提示词）
+    ├── sys_message.json        # 系统提示词，每次启动整体覆盖
     ├── meta.json               # token 用量统计、上下文窗口记录
     ├── log/
     │   └── tracing.log         # OTel span 本地落盘 JSON LINES
@@ -210,9 +211,9 @@ LaxCode/
 │   │   ├── tools/         # 工具注册表与 read/write/edit/bash 行为契约，WorkFS / ShellRunner 端口
 │   │   ├── llmprovider/   # LLM 客户端接口
 │   │   ├── prompt/        # 系统提示词组装（人格 / Skill 索引 / Plan Mode），SkillSource 端口
-│   │   ├── compactor/     # 上下文压缩策略与 token 估算
+│   │   ├── compactor/     # 上下文压缩策略
 │   │   ├── telemetry/     # 观测词汇表：span 名、属性键、追踪辅助函数
-│   │   └── sharedkernel/  # 消息、工具定义、token 统计等共享类型
+│   │   └── sharedkernel/  # 消息、工具定义、token 统计与估算等共享类型
 │   └── infrastructure/
 │       ├── llmprovider/   # OpenAI Responses 协议实现
 │       ├── sessionrepo/   # 会话文件仓储（JSONL 落盘）
@@ -239,6 +240,8 @@ LaxCode/
 分层判据：**工具的“行为契约”留在 domain**（`Definition` 与 JSON Schema、参数校验、错误分类学、面向模型的提示文案、分页等纯算法），**OS 机制下沉 infrastructure**（`syscall`、`os.Open`、`exec`、进程组、目录扫描）。所以 `domain/tools` 里看得到 `bash.go`，却看不到 `os/exec`；磁盘路径片段一律向 `infrastructure/layout` 取，不在别处硬编码。
 
 domain 的第三方依赖只有两处，各自被隔离在一个“词汇表”包里：`domain/telemetry` 收口 OpenTelemetry API，`domain/prompt` 用 `go.yaml.in/yaml/v4` 解析 Skill 的 frontmatter。全仓对 `go.opentelemetry.io/` 的 import 只应出现在 `domain/telemetry`（埋点语义：span 名、属性键、追踪辅助函数）与 `infrastructure/tracing`（装配与导出实现）两处；domain / application / cmd 的埋点方一律经 `telemetry` 使用追踪能力，直接 import OTel 会让“换观测方案时只改两个包”变成空话。
+
+`internal/domain/*` 内部的依赖同样收口：领域包只能依赖领域包，跨层能力在 domain 定义端口交 infrastructure 实现，纯算法与共享类型一律放 `domain/sharedkernel`——避免出现领域层反向依赖 `internal/utils` 这类层外杂项包。上述分层判据由 `cmd/agentasm/archguard_test.go` 的守护测试逐条强制，违反即测试失败。
 
 ```mermaid
 flowchart TD

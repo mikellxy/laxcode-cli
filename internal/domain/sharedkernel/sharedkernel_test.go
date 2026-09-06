@@ -28,6 +28,81 @@ func TestTokenStatisticsJSONRoundTrip(t *testing.T) {
 	}
 }
 
+func TestTokenStatisticsArithmetic(t *testing.T) {
+	s := TokenStatistics{TokenInput: 10, TokenOutput: 4}
+
+	s.Add(TokenStatistics{TokenInput: 5, TokenOutput: 1})
+	if s != (TokenStatistics{TokenInput: 15, TokenOutput: 5}) {
+		t.Errorf("Add 应累加两侧，实际 %+v", s)
+	}
+
+	s.Minus(TokenStatistics{TokenInput: 3, TokenOutput: 2})
+	if s != (TokenStatistics{TokenInput: 12, TokenOutput: 3}) {
+		t.Errorf("Minus 应扣减两侧，实际 %+v", s)
+	}
+
+	s.OverWrite(TokenStatistics{TokenInput: 7, TokenOutput: 9})
+	if s != (TokenStatistics{TokenInput: 7, TokenOutput: 9}) {
+		t.Errorf("OverWrite 应整体覆盖，实际 %+v", s)
+	}
+
+	if s.Total() != 16 {
+		t.Errorf("Total() = %d, 期望 16", s.Total())
+	}
+	// 方法挂在指针接收者上，零值也可就地运算
+	var zero TokenStatistics
+	zero.Add(TokenStatistics{TokenInput: 1})
+	if zero.Total() != 1 {
+		t.Errorf("零值应可直接累加，实际 %+v", zero)
+	}
+}
+
+func TestEstimateTokenAsciiAndHan(t *testing.T) {
+	// 4 个 ASCII 字符 ≈ 1 token
+	if got := EstimateToken("abcd"); got < 0.9 || got > 1.1 {
+		t.Errorf("EstimateToken(abcd) = %v, 期望约 1", got)
+	}
+	// 3 个汉字 ≈ 2 token（1.5 rune/token）
+	if got := EstimateToken("三个字"); got < 1.9 || got > 2.1 {
+		t.Errorf("EstimateToken(三个字) = %v, 期望约 2", got)
+	}
+	// 空串 = 0
+	if got := EstimateToken(""); got != 0 {
+		t.Errorf("EstimateToken(\"\") = %v, 期望 0", got)
+	}
+	// 中英混排：8 个 ascii + 3 个汉字 = 2 + 2 = 4
+	if got := EstimateToken("abcdefgh三个字"); got < 3.9 || got > 4.1 {
+		t.Errorf("EstimateToken 混排 = %v, 期望约 4", got)
+	}
+}
+
+func TestEstimateTokenIntCeil(t *testing.T) {
+	if got := EstimateTokenInt(""); got != 1 {
+		t.Errorf("EstimateTokenInt(\"\") = %d, 期望 1（实现恒 +1 向上取整）", got)
+	}
+	if got := EstimateTokenInt("abcd"); got != 2 {
+		t.Errorf("EstimateTokenInt(abcd) = %d, 期望 2", got)
+	}
+	if got := EstimateTokenInt(strings.Repeat("a", 400)); got != 101 {
+		t.Errorf("EstimateTokenInt(400 ascii) = %d, 期望 101", got)
+	}
+	if got := EstimateTokenInt("三个字"); got != 3 {
+		t.Errorf("EstimateTokenInt(三个字) = %d, 期望 3（2+1 取整）", got)
+	}
+}
+
+// 估算值不是计费口径：系统提示词的本地估算不得写进 Message.TokenUsed，
+// 否则落盘的历史里会混入伪造的模型用量。
+func TestSystemMessageTokenUsedStaysZero(t *testing.T) {
+	msg := Message{Role: RoleSystem, Content: strings.Repeat("a", 400)}
+	if msg.TokenUsed != (TokenStatistics{}) {
+		t.Errorf("未显式赋值时 TokenUsed 应为零值，实际 %+v", msg.TokenUsed)
+	}
+	if EstimateTokenInt(msg.Content) <= 0 {
+		t.Error("估算函数应对系统提示词给出非零占用（供窗口预算使用）")
+	}
+}
+
 func TestMessageJSONRoundTrip(t *testing.T) {
 	msg := Message{
 		Role:             RoleAssistant,
