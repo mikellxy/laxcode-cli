@@ -4,6 +4,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/mikellxy/laxcode/internal/domain/session"
 	"github.com/mikellxy/laxcode/internal/domain/sharedkernel"
 )
 
@@ -168,6 +169,8 @@ func TestCompressKeepsSystemMessage(t *testing.T) {
 	}
 }
 
-func TestStrategyInterfaceSatisfied(t *testing.T) {
-	var _ Strategy = SimpleCompactor
+// 契约测试：SimpleCompactor 必须满足消费方（session 聚合）定义的 Compactor
+// 端口。两包互不 import，靠这条编译期断言守住签名不漂移。
+func TestSatisfiesSessionCompactorPort(t *testing.T) {
+	var _ session.Compactor = SimpleCompactor
 }

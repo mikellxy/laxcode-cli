@@ -12,7 +12,6 @@ import (
 	"errors"
 	"time"
 
-	"github.com/mikellxy/laxcode/internal/domain/compactor"
 	"github.com/mikellxy/laxcode/internal/domain/sharedkernel"
 )
 
@@ -141,13 +140,20 @@ func (s *Session) AppendMessage(msg *sharedkernel.Message) error {
 	return nil
 }
 
+// Compactor 是上下文压缩端口的消费者侧定义：接口由使用方（本包）声明，
+// domain/compactor 的实现按 Go 惯例结构化匹配，无需相互 import——
+// Compress 的签名全部由 sharedkernel 类型构成，天然可隐式满足。
+type Compactor interface {
+	Compress(msgs []sharedkernel.Message, maxToken int, winConsumed sharedkernel.TokenStatistics) ([]sharedkernel.Message, sharedkernel.TokenStatistics, error)
+}
+
 // Compact 按窗口预算压缩历史：策略在聚合内部改写消息序列，节省量同步从
 // WindowToken 扣除。触发判据用 WindowToken（当前窗口占用）而非 TokenUsed
 // （会话累计，只增不减）——后者会让长会话每轮都误触发压缩。
 //
 // 压缩结果只在内存生效：history.jsonl 始终保留完整原文，续聊后按原文重新
 // 压缩，故落盘的 meta 也不记压缩后的窗口值。
-func (s *Session) Compact(strategy compactor.Strategy, maxToken int) error {
+func (s *Session) Compact(strategy Compactor, maxToken int) error {
 	if strategy == nil {
 		return ErrNilCompactor
 	}

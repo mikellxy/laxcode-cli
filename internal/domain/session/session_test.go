@@ -8,7 +8,7 @@ import (
 	"github.com/mikellxy/laxcode/internal/domain/sharedkernel"
 )
 
-// fakeCompactor 是 compactor.Strategy 的测试替身：记录收到的窗口占用与阈值，
+// fakeCompactor 是 Compactor 端口的测试替身：记录收到的窗口占用与阈值，
 // 按预设返回压缩结果，用于验证聚合把哪些状态交给策略、又如何回收结果。
 type fakeCompactor struct {
 	gotMaxToken int

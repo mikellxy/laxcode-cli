@@ -5,6 +5,9 @@
 // 本包属领域层：“上下文窗口紧张时该保留什么、丢弃什么”是 agent 的业务策略，
 // 全部计算都在内存中完成（只用 fmt），不涉任何 I/O、OS 机制或
 // 第三方 SDK，故不是基础设施。仅依赖 domain/sharedkernel（token 估算也在那儿）。
+//
+// 端口由消费方 domain/session 定义（Compactor 接口），本包的实现通过
+// 结构化匹配隐式满足，两个包之间没有任何 import。
 package compactor
 
 import (
@@ -12,12 +15,6 @@ import (
 
 	"github.com/mikellxy/laxcode/internal/domain/sharedkernel"
 )
-
-// Strategy 是上下文压缩策略抽象。返回压缩后的消息、本次节省的 token 量
-// （输入侧 / 输出侧分列，未达阈值时为零值）。
-type Strategy interface {
-	Compress(msgs []sharedkernel.Message, maxToken int, winConsumed sharedkernel.TokenStatistics) ([]sharedkernel.Message, sharedkernel.TokenStatistics, error)
-}
 
 // simpleStrategy 是默认的简单压缩策略：无状态，可安全并发使用。
 type simpleStrategy struct {
@@ -28,9 +25,6 @@ type simpleStrategy struct {
 
 // SimpleCompactor 是默认的简单压缩策略实现。
 var SimpleCompactor simpleStrategy = simpleStrategy{inMemoryMsgsCnt: 1}
-
-// 编译期确保 simpleStrategy 满足 Strategy 接口。
-var _ Strategy = SimpleCompactor
 
 // Compress 在窗口占用达到 maxToken 的 80% 时裁剪 msgs：仅最后
 // s.inMemoryMsgsCnt 条消息视为"在内存中"完整保留，其余的工具输出 / 超长正文
