@@ -1,6 +1,8 @@
 // Package cliprinter 提供交互模式（cmd/run_cli）的终端 UI：基于 bubbletea 的
 // 多行输入框 + 流式回复渲染。用户输入经 OutChan 交给上层调用 Chat，上层的
-// ReAct 事件与每轮结束标志经 InChan 回流，由本包增量拼接并刷新。
+// ReAct 事件与每轮结束标志经 InChan 回流。已完成的历史（用户输入回显、对端整行）
+// 用 tea.Println 打印到终端 scrollback（受管视图上方、可上翻且持久保留），受管视图
+// 只保留正在流式的半行与输入区，行数恒定：既避免超屏每帧重绘闪烁，又保留完整可翻历史。
 package cliprinter
 
 import (
@@ -14,12 +16,6 @@ import (
 // StreamEnd 是 InChan 的流式终止符（EOT，U+0004），不会出现在正常文本中。
 // 上层在一轮回复结束后必须单独发送它一次，TUI 收到后回到用户输入阶段。
 const StreamEnd = "\x04"
-
-// message 表示一条历史记录：text 为内容，fromUser 区分用户输入与对端回复。
-type message struct {
-	text     string
-	fromUser bool
-}
 
 // phase 表示交互阶段，用于控制何时接受用户输入编辑。
 type phase int
@@ -60,16 +56,17 @@ func readIn(in <-chan string) tea.Cmd {
 }
 
 // model 是 bubbletea 的 Model：保存多行输入内容、光标坐标（row/col 以 rune 计）、
-// 历史记录、终端宽度、交互阶段与收发通道。
+// 终端宽高、交互阶段、流式缓冲（streamBuf）与收发通道。已完成内容不留在 model，
+// 而是即时打印到终端 scrollback（见 appendStream/flushStream）。
 type model struct {
-	lines    []string  // 输入区按行保存，行内按 rune 处理
-	row, col int       // 光标位置：lines[row] 中第 col 个 rune 之前
-	messages []message // 历史记录（含用户输入与对端流式回复）
-	width    int       // 终端宽度（列数），用于绘制与屏幕等宽的分隔线
-	height   int       // 终端高度（行数），用于限制 View 逻辑行数不超过屏幕，避免渲染器每帧全量重绘而闪烁
-	phase    phase     // 当前交互阶段
-	outChan  chan<- string
-	inChan   <-chan string
+	lines     []string // 输入区按行保存，行内按 rune 处理
+	row, col  int      // 光标位置：lines[row] 中第 col 个 rune 之前
+	width     int      // 终端宽度（列数），用于绘制与屏幕等宽的分隔线
+	height    int      // 终端高度（行数）：fitHeight 安全网，正常历史走 scrollback 不依赖它
+	phase     phase    // 当前交互阶段
+	streamBuf string   // 正在流式接收、尚未遇到换行的尾部：完整行即时打印到 scrollback，尾部半行由 View 实时显示
+	outChan   chan<- string
+	inChan    <-chan string
 }
 
 // Init 实现 tea.Model：启动时无需执行命令。
@@ -116,25 +113,25 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width = msg.Width
 		m.height = msg.Height
 	case outFlushedMsg:
-		// OutChan 已被上层消费：新建一条空的对端消息，开始从 InChan 流式读取
-		m.messages = append(m.messages, message{})
+		// OutChan 已被上层消费：开始从 InChan 流式读取本轮回复
 		m.phase = phaseStreaming
 		return m, readIn(m.inChan)
 	case inChunkMsg:
 		if msg.text == StreamEnd {
-			// 收到终止符：本轮回复结束，回到用户输入阶段
+			// 收到终止符：本轮回复结束，flush 残留半行后回到用户输入阶段
 			m.phase = phaseInput
-			return m, nil
+			return m, m.flushStream()
 		}
-		// 拼接到当前对端消息末尾（View 随之刷新），继续读取下一段
-		if n := len(m.messages); n > 0 {
-			m.messages[n-1].text += msg.text
-		}
-		return m, readIn(m.inChan)
+		// 累积到 streamBuf：切出的完整行即时打印到 scrollback（可上翻），尾部半行留在
+		// View 实时显示；随后继续读取下一段。用 Sequence 保证多行按序打印且先于下一次
+		// 读取，避免 Batch 的并发乱序。
+		cmds := m.appendStream(msg.text)
+		cmds = append(cmds, readIn(m.inChan))
+		return m, tea.Sequence(cmds...)
 	case inClosedMsg:
-		// InChan 已关闭：结束本轮，回到用户输入阶段
+		// InChan 已关闭：flush 残留半行，回到用户输入阶段
 		m.phase = phaseInput
-		return m, nil
+		return m, m.flushStream()
 	case tea.KeyPressMsg:
 		if msg.String() == "ctrl+c" {
 			return m, tea.Quit
@@ -152,12 +149,13 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.row, m.col = 0, 0
 				return m, nil
 			}
-			// 用户输入渲染为浅灰背景+黑字，随后阻塞写入 OutChan 等待上层消费
-			m.messages = append(m.messages, message{text: input, fromUser: true})
 			m.lines = []string{""}
 			m.row, m.col = 0, 0
 			m.phase = phaseSending
-			return m, sendOut(m.outChan, input)
+			// 用户输入以浅灰背景+黑字回显到 scrollback（可上翻），随后阻塞写入 OutChan
+			// 等待上层消费。用 Sequence 保证“先回显、后发送”的顺序。
+			echo := tea.Println(strings.TrimSuffix(m.userMessageView(input), "\n"))
+			return m, tea.Sequence(echo, sendOut(m.outChan, input))
 		case "alt+enter":
 			m.newline()
 		case "up":
@@ -225,6 +223,38 @@ func (m *model) fitHeight(content string) string {
 	return strings.Join(lines[len(lines)-m.height:], "\n")
 }
 
+// appendStream 把 chunk 追加到 streamBuf，并切出其中所有完整行（以 \n 结束）分别作为
+// tea.Println 命令返回——它们把已完成内容打印到终端 scrollback（受管视图上方，可上翻、
+// 持久保留）。未结束的尾部留在 streamBuf，由 View 实时显示。空行跳过（insertAbove 对空
+// 串是 no-op，且与“不渲染空历史行”的既有行为一致）。
+func (m *model) appendStream(chunk string) []tea.Cmd {
+	m.streamBuf += chunk
+	var cmds []tea.Cmd
+	for {
+		i := strings.IndexByte(m.streamBuf, '\n')
+		if i < 0 {
+			break
+		}
+		line := m.streamBuf[:i]
+		m.streamBuf = m.streamBuf[i+1:]
+		if line != "" {
+			cmds = append(cmds, tea.Println(line))
+		}
+	}
+	return cmds
+}
+
+// flushStream 把 streamBuf 中残留的半行（本轮结束时未以换行收尾的尾部）打印到
+// scrollback 并清空缓冲；无残留时返回 nil。
+func (m *model) flushStream() tea.Cmd {
+	if m.streamBuf == "" {
+		return nil
+	}
+	cmd := tea.Println(m.streamBuf)
+	m.streamBuf = ""
+	return cmd
+}
+
 // userMessageView 把用户输入渲染成浅灰背景+黑字，并按显示宽度补空格让背景铺满整行（多行逐行处理）。
 func (m *model) userMessageView(text string) string {
 	w := m.termWidth()
@@ -273,24 +303,17 @@ func (m *model) inputView() string {
 
 func (m *model) View() tea.View {
 	var b strings.Builder
-	for _, msg := range m.messages {
-		if msg.fromUser {
-			// 用户输入：浅灰背景+黑字，背景与屏幕等宽
-			b.WriteString(m.userMessageView(msg.text))
-			continue
-		}
-		// 对端回复：内容自带换行与颜色，原样渲染；仅在缺少结尾换行时补一个。
-		// 空消息（刚开始流式、尚未收到 chunk）不渲染，避免出现空行。
-		b.WriteString(msg.text)
-		if msg.text != "" && !strings.HasSuffix(msg.text, "\n") {
-			b.WriteString("\n")
-		}
+	// 已完成的历史（用户输入回显、对端整行）都已打印到 scrollback，可上翻；View 只保留
+	// 正在流式的半行 + 输入区，行数恒定不超屏，从根本上避免渲染器每帧全量重绘闪烁。
+	if m.streamBuf != "" {
+		// 正在流式接收、尚未换行的尾部：实时显示在输入区上方（完整后即滚入 scrollback）
+		b.WriteString(m.streamBuf + "\n")
 	}
 	// 输入区上下各画一条与屏幕等宽的实线分隔符
 	b.WriteString(m.hline() + "\n")
 	b.WriteString(m.inputView() + "\n")
 	b.WriteString(m.hline())
-	// 限制总逻辑行数不超过终端高度，避免渲染器超屏每帧全量重绘导致闪烁
+	// 安全网：多行输入过高时仍限制逻辑行数不超过终端高度，避免超屏重绘
 	return tea.NewView(m.fitHeight(b.String()))
 }
 

@@ -113,38 +113,54 @@ func TestInputViewPromptFixedOnFirstLine(t *testing.T) {
 	}
 }
 
-func TestUpdateRecordsWidth(t *testing.T) {
+func TestUpdateRecordsSize(t *testing.T) {
 	m, _, _ := newTestModel()
 	m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
-	if m.width != 100 {
-		t.Errorf("width=%d，期望 100", m.width)
+	if m.width != 100 || m.height != 30 {
+		t.Errorf("width=%d height=%d，期望 100/30", m.width, m.height)
 	}
 }
 
-func TestUpdateEnterSendsToOutChan(t *testing.T) {
-	m, out, _ := newTestModel()
+// TestSendOutWritesInputAndReturnsFlushed 单独验证发送命令：把输入写入 OutChan
+// （缓冲，不阻塞）并返回 outFlushedMsg。enter 路径正是用它与回显组成 Sequence。
+func TestSendOutWritesInputAndReturnsFlushed(t *testing.T) {
+	out := make(chan string, 1)
+	msg := sendOut(out, "hi")()
+	if _, ok := msg.(outFlushedMsg); !ok {
+		t.Errorf("sendOut 应返回 outFlushedMsg，got %T", msg)
+	}
+	if got := <-out; got != "hi" {
+		t.Errorf("outChan 收到 %q，期望 hi", got)
+	}
+}
+
+// TestReadInReturnsChunkThenClosed 验证读取命令：有内容返回 inChunkMsg，通道关闭返回 inClosedMsg。
+func TestReadInReturnsChunkThenClosed(t *testing.T) {
+	in := make(chan string, 1)
+	in <- "x"
+	close(in)
+	if cm, ok := readIn(in)().(inChunkMsg); !ok || cm.text != "x" {
+		t.Errorf("readIn 应先返回 inChunkMsg{x}，got %#v", cm)
+	}
+	if _, ok := readIn(in)().(inClosedMsg); !ok {
+		t.Error("通道关闭后 readIn 应返回 inClosedMsg")
+	}
+}
+
+func TestUpdateEnterClearsInputAndStartsSending(t *testing.T) {
+	m, _, _ := newTestModel()
 	m.insert("hi")
 	_, cmd := m.Update(keyEnter())
 
 	if m.phase != phaseSending {
 		t.Errorf("enter 后应进入 phaseSending，got %v", m.phase)
 	}
-	if len(m.messages) != 1 || m.messages[0].text != "hi" || !m.messages[0].fromUser {
-		t.Errorf("应追加用户消息 hi，got %+v", m.messages)
-	}
 	if len(m.lines) != 1 || m.lines[0] != "" || m.row != 0 || m.col != 0 {
 		t.Errorf("输入区应清空，got lines=%v row=%d col=%d", m.lines, m.row, m.col)
 	}
+	// 返回的是 Sequence(回显, 发送)：非 nil；发送本身由 TestSendOutWritesInputAndReturnsFlushed 覆盖
 	if cmd == nil {
-		t.Fatal("enter 应返回 sendOut 命令")
-	}
-	// 调用命令：应把输入写入 outChan（缓冲，不阻塞）并返回 outFlushedMsg
-	msg := cmd()
-	if _, ok := msg.(outFlushedMsg); !ok {
-		t.Errorf("sendOut 命令应返回 outFlushedMsg，got %T", msg)
-	}
-	if got := <-out; got != "hi" {
-		t.Errorf("outChan 收到 %q，期望 hi", got)
+		t.Error("enter 应返回回显用户消息并发送到 OutChan 的命令")
 	}
 }
 
@@ -155,9 +171,6 @@ func TestUpdateEnterSkipsEmptyInput(t *testing.T) {
 
 	if m.phase != phaseInput {
 		t.Errorf("空输入应保持 phaseInput，got %v", m.phase)
-	}
-	if len(m.messages) != 0 {
-		t.Errorf("空输入不应追加消息，got %+v", m.messages)
 	}
 	if cmd != nil {
 		t.Errorf("空输入不应返回命令")
@@ -175,49 +188,110 @@ func TestUpdateOutFlushedStartsStreaming(t *testing.T) {
 	if m.phase != phaseStreaming {
 		t.Errorf("outFlushed 后应进入 phaseStreaming，got %v", m.phase)
 	}
-	if len(m.messages) != 1 || m.messages[0].text != "" || m.messages[0].fromUser {
-		t.Errorf("应追加一条空的对端消息，got %+v", m.messages)
-	}
 	if cmd == nil {
 		t.Error("应返回 readIn 命令开始流式读取")
 	}
 }
 
-func TestUpdateInChunkAppendsAndContinues(t *testing.T) {
+// TestAppendStreamSplitsCompleteLines 是本次修复的核心：完整行被切出交给打印命令
+// （随后滚入 scrollback，可上翻），未结束的尾部留在 streamBuf。
+func TestAppendStreamSplitsCompleteLines(t *testing.T) {
 	m, _, _ := newTestModel()
-	m.messages = append(m.messages, message{}) // 模拟已开始流式的对端消息
-	_, cmd := m.Update(inChunkMsg{text: "hello"})
-	if cmd == nil {
-		t.Error("收到普通 chunk 应继续 readIn")
+	cmds := m.appendStream("l1\nl2\npartial")
+	if m.streamBuf != "partial" {
+		t.Errorf("尾部半行应留在 streamBuf，got %q", m.streamBuf)
 	}
-	m.Update(inChunkMsg{text: " world"})
-	if got := m.messages[len(m.messages)-1].text; got != "hello world" {
-		t.Errorf("chunk 应不断拼接，got %q", got)
+	if len(cmds) != 2 {
+		t.Errorf("应切出两个完整行 → 2 个打印命令，got %d", len(cmds))
 	}
 }
 
-func TestUpdateInChunkStreamEndReturnsToInput(t *testing.T) {
+func TestAppendStreamNoNewlineKeepsBuffer(t *testing.T) {
+	m, _, _ := newTestModel()
+	cmds := m.appendStream("partial")
+	if m.streamBuf != "partial" {
+		t.Errorf("无换行应全部留在 streamBuf，got %q", m.streamBuf)
+	}
+	if len(cmds) != 0 {
+		t.Errorf("无完整行不应产生打印命令，got %d", len(cmds))
+	}
+}
+
+func TestAppendStreamSkipsEmptyLines(t *testing.T) {
+	m, _, _ := newTestModel()
+	cmds := m.appendStream("a\n\nb\n")
+	if len(cmds) != 2 {
+		t.Errorf("空行应跳过，期望 2 个打印命令，got %d", len(cmds))
+	}
+	if m.streamBuf != "" {
+		t.Errorf("全部内容以 \\n 结束，streamBuf 应清空，got %q", m.streamBuf)
+	}
+}
+
+func TestFlushStreamClearsBuffer(t *testing.T) {
+	m, _, _ := newTestModel()
+	m.streamBuf = "tail"
+	if cmd := m.flushStream(); cmd == nil {
+		t.Error("有残留半行时 flushStream 应返回打印命令")
+	}
+	if m.streamBuf != "" {
+		t.Errorf("flush 后 streamBuf 应清空，got %q", m.streamBuf)
+	}
+	if cmd := m.flushStream(); cmd != nil {
+		t.Error("无残留时 flushStream 应返回 nil")
+	}
+}
+
+func TestUpdateInChunkBuffersPartialLine(t *testing.T) {
 	m, _, _ := newTestModel()
 	m.phase = phaseStreaming
-	m.messages = append(m.messages, message{text: "done\n"})
+	_, cmd := m.Update(inChunkMsg{text: "hel"})
+	if m.streamBuf != "hel" {
+		t.Errorf("未遇换行的 chunk 应留在 streamBuf，got %q", m.streamBuf)
+	}
+	if cmd == nil {
+		t.Error("收到 chunk 应返回继续读取的命令")
+	}
+}
+
+func TestUpdateInChunkStreamEndFlushesAndReturnsToInput(t *testing.T) {
+	m, _, _ := newTestModel()
+	m.phase = phaseStreaming
+	m.streamBuf = "partial"
+	_, cmd := m.Update(inChunkMsg{text: StreamEnd})
+	if m.phase != phaseInput {
+		t.Errorf("收到终止符应回到 phaseInput，got %v", m.phase)
+	}
+	if m.streamBuf != "" {
+		t.Errorf("终止符应 flush 残留半行并清空 streamBuf，got %q", m.streamBuf)
+	}
+	if cmd == nil {
+		t.Error("有残留半行时应返回打印命令")
+	}
+}
+
+func TestUpdateStreamEndWithoutBufferReturnsNilCmd(t *testing.T) {
+	m, _, _ := newTestModel()
+	m.phase = phaseStreaming
 	_, cmd := m.Update(inChunkMsg{text: StreamEnd})
 	if m.phase != phaseInput {
 		t.Errorf("收到终止符应回到 phaseInput，got %v", m.phase)
 	}
 	if cmd != nil {
-		t.Error("终止符应返回 nil 命令（本轮结束）")
-	}
-	if got := m.messages[len(m.messages)-1].text; got != "done\n" {
-		t.Errorf("终止符不应被拼进内容，got %q", got)
+		t.Error("无残留半行时终止符应返回 nil 命令")
 	}
 }
 
-func TestUpdateInClosedReturnsToInput(t *testing.T) {
+func TestUpdateInClosedFlushesAndReturnsToInput(t *testing.T) {
 	m, _, _ := newTestModel()
 	m.phase = phaseStreaming
+	m.streamBuf = "tail"
 	m.Update(inClosedMsg{})
 	if m.phase != phaseInput {
 		t.Errorf("inChan 关闭应回到 phaseInput，got %v", m.phase)
+	}
+	if m.streamBuf != "" {
+		t.Errorf("inChan 关闭应 flush 残留半行，got %q", m.streamBuf)
 	}
 }
 
@@ -242,38 +316,34 @@ func TestUpdateIgnoresEditingWhileNotInput(t *testing.T) {
 	}
 }
 
-func TestViewRendersHistoryAndSeparators(t *testing.T) {
+func TestViewRendersStreamBufferAndSeparators(t *testing.T) {
 	m, _, _ := newTestModel()
 	m.width = 30
-	m.messages = []message{
-		{text: "q1", fromUser: true},
-		{text: "[LaxCode] thinking: ...\n"},
-	}
+	m.streamBuf = "[LaxCode] thinking: ..."
 	content := m.View().Content
 
-	if !strings.Contains(content, "\x1b[48;5;250m") {
-		t.Error("View 应把用户输入渲染为浅灰背景")
-	}
 	if !strings.Contains(content, "[LaxCode] thinking: ...") {
-		t.Error("View 应包含对端回复内容")
+		t.Error("View 应实时显示正在流式的半行")
 	}
-	// 输入区上下各一条与屏幕等宽的实线分隔符
 	if n := strings.Count(content, strings.Repeat("─", 30)); n != 2 {
 		t.Errorf("应有两条等宽实线分隔符，got %d", n)
 	}
 	if !strings.Contains(content, "> ") {
 		t.Error("View 应包含固定在第一行的提示符 '> '")
 	}
+	// 流式半行应显示在输入区分隔符上方（更早出现）
+	if strings.Index(content, "[LaxCode]") > strings.Index(content, strings.Repeat("─", 30)) {
+		t.Error("流式半行应显示在输入区分隔符上方")
+	}
 }
 
-func TestViewSkipsEmptyAssistantMessage(t *testing.T) {
+func TestViewOmitsEmptyStreamBuffer(t *testing.T) {
 	m, _, _ := newTestModel()
 	m.width = 10
-	m.messages = []message{{text: "", fromUser: false}}
 	content := m.View().Content
-	// 空的对端消息不应产生多余空行：分隔符前不应有两个连续换行
-	if strings.Contains(content, "\n\n"+strings.Repeat("─", 10)) {
-		t.Errorf("空对端消息不应渲染出空行，got %q", content)
+	// streamBuf 为空时 View 应直接以分隔符开头，不多出前导空行
+	if !strings.HasPrefix(content, strings.Repeat("─", 10)) {
+		t.Errorf("空 streamBuf 时 View 应以分隔符开头，got %q", content)
 	}
 }
 
@@ -301,21 +371,25 @@ func TestFitHeightNoCapWhenHeightUnknown(t *testing.T) {
 	}
 }
 
-// TestViewHeightNeverExceedsTerminal 是防闪烁回归：多轮对话后历史消息会堆高，
-// View 逻辑行数（与渲染器 content.Height() 口径一致）必须不超过终端高度，
-// 否则渲染器会因超屏而每帧全量重绘，表现为持续闪烁。
-func TestViewHeightNeverExceedsTerminal(t *testing.T) {
+// TestViewStaysSmallAsHistoryGrows 同时是防闪烁与"历史可上翻"的回归：多轮流式后，
+// 已完成行必须被切出（打印到 scrollback），而不是堆在 View 里——View 逻辑行数应恒定
+// 不超屏，且不含任何已完成的历史行。
+func TestViewStaysSmallAsHistoryGrows(t *testing.T) {
 	m, _, _ := newTestModel()
 	m.width = 40
 	m.height = 6
+	m.phase = phaseStreaming
 	for i := 0; i < 50; i++ {
-		m.messages = append(m.messages, message{text: "assistant line\n"})
+		m.Update(inChunkMsg{text: "assistant line\n"})
 	}
 	content := m.View().Content
 	if h := strings.Count(content, "\n") + 1; h > m.height {
-		t.Errorf("View 逻辑行数=%d 超过终端高度 %d，会触发渲染器每帧重绘闪烁", h, m.height)
+		t.Errorf("View 逻辑行数=%d 超过终端高度 %d（历史应进 scrollback 而非堆在 View）", h, m.height)
 	}
-	if !strings.Contains(content, "> ") {
-		t.Error("限高后仍应保留底部输入区提示符 '> '")
+	if strings.Contains(content, "assistant line") {
+		t.Error("已完成的历史行不应留在 View（应已切出打印到 scrollback）")
+	}
+	if m.streamBuf != "" {
+		t.Errorf("每个 chunk 都以 \\n 结束，streamBuf 应始终为空，got %q", m.streamBuf)
 	}
 }
