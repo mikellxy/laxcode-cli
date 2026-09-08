@@ -66,6 +66,7 @@ type model struct {
 	row, col int       // 光标位置：lines[row] 中第 col 个 rune 之前
 	messages []message // 历史记录（含用户输入与对端流式回复）
 	width    int       // 终端宽度（列数），用于绘制与屏幕等宽的分隔线
+	height   int       // 终端高度（行数），用于限制 View 逻辑行数不超过屏幕，避免渲染器每帧全量重绘而闪烁
 	phase    phase     // 当前交互阶段
 	outChan  chan<- string
 	inChan   <-chan string
@@ -111,8 +112,9 @@ func (m *model) newline() {
 func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
-		// 记录终端宽度，供 View 绘制等宽分隔线使用
+		// 记录终端宽高，供 View 绘制等宽分隔线与限制高度使用
 		m.width = msg.Width
+		m.height = msg.Height
 	case outFlushedMsg:
 		// OutChan 已被上层消费：新建一条空的对端消息，开始从 InChan 流式读取
 		m.messages = append(m.messages, message{})
@@ -208,6 +210,21 @@ func (m *model) hline() string {
 	return strings.Repeat("─", m.termWidth())
 }
 
+// fitHeight 把内容裁剪到不超过终端高度的逻辑行数，只保留底部（最近的消息与输入
+// 区）。bubbletea 标准渲染器在内容高于屏幕时会丢弃顶部行并每帧全量重绘，导致
+// 持续闪烁，故必须限高。超宽行由渲染器截断（非折叠），逻辑行数即视觉行数；
+// 且各行内 ANSI 均自成一段（以 reset 收尾），按行裁剪不会破坏样式状态。
+func (m *model) fitHeight(content string) string {
+	if m.height <= 0 {
+		return content
+	}
+	lines := strings.Split(content, "\n")
+	if len(lines) <= m.height {
+		return content
+	}
+	return strings.Join(lines[len(lines)-m.height:], "\n")
+}
+
 // userMessageView 把用户输入渲染成浅灰背景+黑字，并按显示宽度补空格让背景铺满整行（多行逐行处理）。
 func (m *model) userMessageView(text string) string {
 	w := m.termWidth()
@@ -273,7 +290,8 @@ func (m *model) View() tea.View {
 	b.WriteString(m.hline() + "\n")
 	b.WriteString(m.inputView() + "\n")
 	b.WriteString(m.hline())
-	return tea.NewView(b.String())
+	// 限制总逻辑行数不超过终端高度，避免渲染器超屏每帧全量重绘导致闪烁
+	return tea.NewView(m.fitHeight(b.String()))
 }
 
 // TUI 封装 bubbletea Program，对外提供阻塞式 Run。它只持有 send 端的 OutChan

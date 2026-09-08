@@ -276,3 +276,46 @@ func TestViewSkipsEmptyAssistantMessage(t *testing.T) {
 		t.Errorf("空对端消息不应渲染出空行，got %q", content)
 	}
 }
+
+func TestFitHeightCapsToTerminalHeight(t *testing.T) {
+	m, _, _ := newTestModel()
+	m.height = 3
+	if got := m.fitHeight("l1\nl2\nl3\nl4\nl5"); got != "l3\nl4\nl5" {
+		t.Errorf("应只保留底部 3 行，got %q", got)
+	}
+}
+
+func TestFitHeightKeepsContentWhenFits(t *testing.T) {
+	m, _, _ := newTestModel()
+	m.height = 10
+	if got := m.fitHeight("l1\nl2"); got != "l1\nl2" {
+		t.Errorf("未超高应原样返回，got %q", got)
+	}
+}
+
+func TestFitHeightNoCapWhenHeightUnknown(t *testing.T) {
+	m, _, _ := newTestModel()
+	m.height = 0
+	if got := m.fitHeight("l1\nl2\nl3"); got != "l1\nl2\nl3" {
+		t.Errorf("高度未知时应原样返回，got %q", got)
+	}
+}
+
+// TestViewHeightNeverExceedsTerminal 是防闪烁回归：多轮对话后历史消息会堆高，
+// View 逻辑行数（与渲染器 content.Height() 口径一致）必须不超过终端高度，
+// 否则渲染器会因超屏而每帧全量重绘，表现为持续闪烁。
+func TestViewHeightNeverExceedsTerminal(t *testing.T) {
+	m, _, _ := newTestModel()
+	m.width = 40
+	m.height = 6
+	for i := 0; i < 50; i++ {
+		m.messages = append(m.messages, message{text: "assistant line\n"})
+	}
+	content := m.View().Content
+	if h := strings.Count(content, "\n") + 1; h > m.height {
+		t.Errorf("View 逻辑行数=%d 超过终端高度 %d，会触发渲染器每帧重绘闪烁", h, m.height)
+	}
+	if !strings.Contains(content, "> ") {
+		t.Error("限高后仍应保留底部输入区提示符 '> '")
+	}
+}
