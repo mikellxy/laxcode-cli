@@ -8,6 +8,7 @@ import (
 
 	"github.com/mikellxy/laxcode/cmd/agentasm"
 	"github.com/mikellxy/laxcode/internal/application/reactservice"
+	"github.com/mikellxy/laxcode/internal/domain/sharedkernel"
 	"github.com/mikellxy/laxcode/internal/infrastructure/cliprinter"
 	"github.com/mikellxy/laxcode/internal/infrastructure/config"
 )
@@ -43,6 +44,33 @@ func fatal(err error) {
 	os.Exit(1)
 }
 
+// newEventConsumer 将流式边界和增量转换为 TUI 文本；每段只输出一次前缀。
+func newEventConsumer(sendIn func(string)) func(*reactservice.ReactEvent) {
+	return func(e *reactservice.ReactEvent) {
+		switch e.Type {
+		case reactservice.ReActEventTypeChunk:
+			chunk := e.ChunkEvent
+			if chunk == nil {
+				return
+			}
+			switch chunk.Kind {
+			case sharedkernel.ChunkReasoningStart:
+				sendIn(ColorGray + "[LaxCode] thinking: ")
+			case sharedkernel.ChunkTextStart:
+				sendIn(ColorGreen + "[LaxCode] LLM generates: ")
+			case sharedkernel.ChunkReasoningDelta, sharedkernel.ChunkTextDelta:
+				sendIn(chunk.Delta)
+			case sharedkernel.ChunkReasoningEnd, sharedkernel.ChunkTextEnd:
+				sendIn(ColorReset + "\n")
+			case sharedkernel.ChunkToolCall:
+				// 参数已就绪；执行提示由后续 tool_call 事件在执行前显示。
+			}
+		case reactservice.ReActEventTypeToolCall:
+			sendIn(fmt.Sprintf("%s[LaxCode] tool execute... %s%s\n", ColorYellow, e.Content, ColorReset))
+		}
+	}
+}
+
 func Run() {
 	if err := checkConfig(); err != nil {
 		fatal(err)
@@ -75,16 +103,7 @@ func Run() {
 	// rcf：交互模式的事件呈现——把 ReAct 中间过程格式化后经 inChan 回流给 TUI 增量
 	// 渲染（替代原先直接打印 stdout）。作为 Consumer 注入装配，与 one-shot 的静默
 	// 丢弃回调形成对照。
-	rcf := func(e *reactservice.ReactEvent) {
-		switch e.Type {
-		case reactservice.ReActEventTypeReasoning:
-			sendIn(fmt.Sprintf("%s[LaxCode] thinking: %s%s\n", ColorGray, e.Content, ColorReset))
-		case reactservice.ReActEventTypeMsg:
-			sendIn(fmt.Sprintf("%s[LaxCode] LLM generates: %s%s\n", ColorGreen, e.Content, ColorReset))
-		case reactservice.ReActEventTypeToolCall:
-			sendIn(fmt.Sprintf("%s[LaxCode] tool execute... %s%s\n", ColorYellow, e.Content, ColorReset))
-		}
-	}
+	rcf := newEventConsumer(sendIn)
 
 	// 装配（会话 / tracer / 工具集含子 Agent / provider / ReActService）收口到
 	// cmd/agentasm 组合根，与 one-shot 共用。Cleanup 幂等（sync.Once），defer 一次。
@@ -114,7 +133,7 @@ func Run() {
 			case input := <-outChan:
 				if _, err := assembled.Service.Chat(ctx, input); err != nil {
 					// 运行期错误经 inChan 回流到 TUI 呈现，本轮仍以终止符收尾
-					sendIn(fmt.Sprintf("%s[LaxCode] error: %v%s\n", ColorRed, err, ColorReset))
+					sendIn(fmt.Sprintf("%s\n%s[LaxCode] error: %v%s\n", ColorReset, ColorRed, err, ColorReset))
 				}
 				sendIn(cliprinter.StreamEnd)
 			}

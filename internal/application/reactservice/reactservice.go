@@ -28,9 +28,8 @@ type ReActService struct {
 }
 
 const (
-	ReActEventTypeMsg       = "msg"
-	ReActEventTypeReasoning = "reasoning"
-	ReActEventTypeToolCall  = "tool_call"
+	ReActEventTypeChunk    = "chunk"
+	ReActEventTypeToolCall = "tool_call"
 )
 
 // maxWindowToken 是触发上下文压缩的窗口 token 预算，暂写死 200k，
@@ -38,8 +37,9 @@ const (
 const maxWindowToken = 200_000
 
 type ReactEvent struct {
-	Type    string
-	Content string
+	Type       string
+	Content    string                    // 工具执行提示
+	ChunkEvent *sharedkernel.StreamChunk // LLM 流式增量，仅 chunk 事件携带
 }
 
 func NewReActService(sess *session.Session,
@@ -48,6 +48,9 @@ func NewReActService(sess *session.Session,
 	toolRegistry tools.Registry,
 	reActEventConsumerF func(reactEvent *ReactEvent),
 	tracer telemetry.Tracer) *ReActService {
+	if reActEventConsumerF == nil {
+		reActEventConsumerF = func(*ReactEvent) {}
+	}
 	return &ReActService{
 		Session:             sess,
 		SessRepo:            sessRepo,
@@ -139,7 +142,9 @@ func (r *ReActService) think(ctx context.Context) (*sharedkernel.Message, error)
 			return nil, err
 		}
 
-		msg, err := r.LLMClient.Generate(turnCtx, r.Session.Messages, r.ToolRegistry.GetAvailableTools())
+		msg, err := r.LLMClient.GenerateStream(turnCtx, r.Session.Messages, r.ToolRegistry.GetAvailableTools(), func(chunkEvent sharedkernel.StreamChunk) {
+			r.ReActEventConsumerF(&ReactEvent{Type: ReActEventTypeChunk, ChunkEvent: &chunkEvent})
+		})
 		if err != nil {
 			reActErr = err
 			closeTurn(err)
@@ -150,13 +155,6 @@ func (r *ReActService) think(ctx context.Context) (*sharedkernel.Message, error)
 			closeTurn(err)
 			return nil, err
 		}
-		if msg.ReasoningContent != "" {
-			r.ReActEventConsumerF(&ReactEvent{Type: ReActEventTypeReasoning, Content: msg.ReasoningContent})
-		}
-		if msg.Content != "" {
-			r.ReActEventConsumerF(&ReactEvent{Type: ReActEventTypeMsg, Content: msg.Content})
-		}
-
 		// llm-turn / ReAct 级 token 用量统计
 		reActInput += msg.TokenUsed.TokenInput
 		reActOutput += msg.TokenUsed.TokenOutput

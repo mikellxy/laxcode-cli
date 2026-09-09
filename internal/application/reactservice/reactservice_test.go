@@ -3,6 +3,7 @@ package reactservice
 import (
 	"context"
 	"errors"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -47,16 +48,11 @@ func TestRunReturnsImmediateAnswer(t *testing.T) {
 	if sess.Messages[1].Role != sharedkernel.RoleAssistant || sess.Messages[1].Content != "final answer" {
 		t.Errorf("追加的消息不符：%+v", sess.Messages[1])
 	}
-	// 事件：应推送正文消息事件
-	var hasMsg bool
-	for _, e := range rec.events {
-		if e.Type == ReActEventTypeMsg && e.Content == "final answer" {
-			hasMsg = true
-		}
-	}
-	if !hasMsg {
-		t.Errorf("应推送正文事件，实际 %+v", rec.events)
-	}
+	assertChunks(t, rec.events, []sharedkernel.StreamChunk{
+		{Kind: sharedkernel.ChunkTextStart},
+		{Kind: sharedkernel.ChunkTextDelta, Delta: "final answer"},
+		{Kind: sharedkernel.ChunkTextEnd},
+	})
 }
 
 func TestRunEmitsReasoningEvent(t *testing.T) {
@@ -75,16 +71,14 @@ func TestRunEmitsReasoningEvent(t *testing.T) {
 	if _, err := svc.think(context.Background()); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	types := map[string]string{}
-	for _, e := range rec.events {
-		types[e.Type] = e.Content
-	}
-	if types[ReActEventTypeReasoning] != "thinking" {
-		t.Errorf("应推送 reasoning 事件，实际 %+v", rec.events)
-	}
-	if types[ReActEventTypeMsg] != "answer" {
-		t.Errorf("应推送正文事件，实际 %+v", rec.events)
-	}
+	assertChunks(t, rec.events, []sharedkernel.StreamChunk{
+		{Kind: sharedkernel.ChunkReasoningStart},
+		{Kind: sharedkernel.ChunkReasoningDelta, Delta: "thinking"},
+		{Kind: sharedkernel.ChunkReasoningEnd},
+		{Kind: sharedkernel.ChunkTextStart},
+		{Kind: sharedkernel.ChunkTextDelta, Delta: "answer"},
+		{Kind: sharedkernel.ChunkTextEnd},
+	})
 }
 
 func TestRunToolCallLoop(t *testing.T) {
@@ -133,6 +127,84 @@ func TestRunToolCallLoop(t *testing.T) {
 	}
 	if !sawToolCall {
 		t.Errorf("应推送 tool_call 事件，实际 %+v", rec.events)
+	}
+	if len(rec.events) != 5 || rec.events[0].ChunkEvent == nil ||
+		!reflect.DeepEqual(*rec.events[0].ChunkEvent, sharedkernel.StreamChunk{
+			Kind: sharedkernel.ChunkToolCall, ToolCall: &llm.responses[0].msg.ToolCalls[0],
+		}) || rec.events[1].Type != ReActEventTypeToolCall {
+		t.Errorf("完整工具调用 chunk 应先于执行提示，且正文不得重复推送：%+v", rec.events)
+	}
+}
+
+func assertChunks(t *testing.T, events []ReactEvent, want []sharedkernel.StreamChunk) {
+	t.Helper()
+	var got []sharedkernel.StreamChunk
+	for _, e := range events {
+		if e.Type != ReActEventTypeChunk || e.ChunkEvent == nil {
+			t.Fatalf("应仅包含 chunk 事件，实际 %+v", e)
+		}
+		got = append(got, *e.ChunkEvent)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("chunk 序列不符：got %+v, want %+v", got, want)
+	}
+}
+
+type streamFunc func(context.Context, []sharedkernel.Message, []sharedkernel.ToolDefinition, func(sharedkernel.StreamChunk)) (*sharedkernel.Message, error)
+
+func (f streamFunc) Generate(context.Context, []sharedkernel.Message, []sharedkernel.ToolDefinition) (*sharedkernel.Message, error) {
+	panic("ReAct 应调用 GenerateStream")
+}
+
+func (f streamFunc) GenerateStream(ctx context.Context, msgs []sharedkernel.Message, defs []sharedkernel.ToolDefinition, emit func(sharedkernel.StreamChunk)) (*sharedkernel.Message, error) {
+	return f(ctx, msgs, defs, emit)
+}
+
+func TestRunForwardsChunksBeforeStreamReturns(t *testing.T) {
+	for _, streamErr := range []error{nil, errors.New("stream interrupted"), context.Canceled} {
+		name := "success"
+		if streamErr != nil {
+			name = streamErr.Error()
+		}
+		t.Run(name, func(t *testing.T) {
+			repo := newMemRepo()
+			sess := newTestSession("s-stream", repo)
+			rec := &eventRecorder{}
+			chunks := []sharedkernel.StreamChunk{
+				{Kind: sharedkernel.ChunkTextStart},
+				{Kind: sharedkernel.ChunkTextDelta, Delta: "hel"},
+				{Kind: sharedkernel.ChunkTextDelta, Delta: "lo"},
+			}
+			if streamErr == nil {
+				chunks = append(chunks, sharedkernel.StreamChunk{Kind: sharedkernel.ChunkTextEnd})
+			}
+			llm := streamFunc(func(_ context.Context, _ []sharedkernel.Message, _ []sharedkernel.ToolDefinition, emit func(sharedkernel.StreamChunk)) (*sharedkernel.Message, error) {
+				for i, chunk := range chunks {
+					emit(chunk)
+					assertChunks(t, rec.events, chunks[:i+1])
+					if len(sess.Messages) != 1 || len(repo.storedMsgs(sess.ID)) != 0 {
+						t.Fatal("生成完成前不得持久化或追加部分消息")
+					}
+				}
+				if streamErr != nil {
+					return nil, streamErr
+				}
+				return assistantMsg("hello"), nil
+			})
+			svc := NewReActService(sess, repo, llm, tools.NewDefaultRegistry(nil), rec.record, nil)
+			msg, err := svc.think(context.Background())
+			if !errors.Is(err, streamErr) {
+				t.Fatalf("错误未透传：%v", err)
+			}
+			assertChunks(t, rec.events, chunks)
+			if streamErr != nil {
+				if msg != nil || len(sess.Messages) != 1 || len(repo.storedMsgs(sess.ID)) != 0 {
+					t.Fatal("流式失败不得保存不完整回复")
+				}
+			} else if msg.Content != "hello" || len(sess.Messages) != 2 || len(repo.storedMsgs(sess.ID)) != 1 {
+				t.Fatal("流式完成后应返回并保存一条完整回复")
+			}
+		})
 	}
 }
 
