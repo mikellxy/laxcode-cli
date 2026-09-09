@@ -53,13 +53,20 @@ git config --get commit.template
   - subject：英文、祈使句、首字母小写、结尾不加句号
 - **正文**（选填）：说明"做了什么与为什么"，不写代码细节；与标题间隔一个空行；每行 ≤ 72 字符
 - **页脚**（选填）：`Closes #123` / `Refs #456` / `BREAKING CHANGE: ...`
+- **共同作者**（必加）：正文之后（或直接在标题之后，与正文之间空一行）追加一行 trailer，用于把提交归署到组织 bot：
+  ```
+  Co-Authored-By: laxcode-cli <326837968+laxcode-cli[bot]@users.noreply.github.com>
+  ```
+  GitHub 只按**邮箱**归署，trailer 前的显示名可自定义（此处用 `laxcode-cli`，不带 `[bot]` 后缀）；邮箱是 GitHub App bot 的 noreply 地址（`ID+name[bot]@users.noreply.github.com`），必须精确匹配，改组织或 bot 时需同步更新。
 - 若模板规定了语言（如英文），即便用户说"中文描述"也以模板语言为主；用户附加要求（如"简洁"）在满足模板的前提下体现
+- 无论有无正文，`Co-Authored-By: laxcode-cli <...>` 都必须出现在提交信息末尾，独占一行、前后留空行
 
 ### 4. 执行提交
 
-- 提交信息包含正文时，用多个 `-m` 分段（标题 / 正文 / 页脚各一个 `-m`），或用 heredoc 写到临时文件后 `git commit -F`：
+- 提交信息包含正文时，用多个 `-m` 分段（标题 / 正文 / 共同作者各一个 `-m`），或用 heredoc 写到临时文件后 `git commit -F`：
   ```bash
-  git commit -m "feat(tui): <subject>" -m "<body>"
+  git commit -m "feat(tui): <subject>" -m "<body>" \
+    -m "Co-Authored-By: laxcode-cli <326837968+laxcode-cli[bot]@users.noreply.github.com>"
   ```
 - **不要把模板里以 `#` 开头的注释行写入提交信息**（git 会自动忽略，但别手动带进去）
 - 提交后向用户汇报：commit hash（前 7 位）、改动统计（X files changed, +Y/−Z）
