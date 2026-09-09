@@ -19,6 +19,8 @@ func newTestModel() (*model, chan string, chan string) {
 
 func keyEnter() tea.KeyPressMsg { return tea.KeyPressMsg{Code: tea.KeyEnter} }
 func keyCtrlC() tea.KeyPressMsg { return tea.KeyPressMsg{Code: 'c', Mod: tea.ModCtrl} }
+func keyCtrlA() tea.KeyPressMsg { return tea.KeyPressMsg{Code: 'a', Mod: tea.ModCtrl} }
+func keyCtrlE() tea.KeyPressMsg { return tea.KeyPressMsg{Code: 'e', Mod: tea.ModCtrl} }
 func keyText(s string) tea.KeyPressMsg {
 	r := []rune(s)[0]
 	return tea.KeyPressMsg{Code: r, Text: s}
@@ -67,6 +69,106 @@ func TestNewlineSplitsAtCursor(t *testing.T) {
 	m.newline()
 	if len(m.lines) != 2 || m.lines[0] != "ab" || m.lines[1] != "cd" || m.row != 1 || m.col != 0 {
 		t.Fatalf("newline 后 lines=%v row=%d col=%d", m.lines, m.row, m.col)
+	}
+}
+
+// TestUpdateCtrlAGoesToLineStart 验证 Ctrl+A 跳到当前行行首且幂等，不返回命令、不改文本。
+func TestUpdateCtrlAGoesToLineStart(t *testing.T) {
+	m, _, _ := newTestModel()
+	m.lines = []string{"hello world"}
+	m.row, m.col = 0, 7
+	if _, cmd := m.Update(keyCtrlA()); cmd != nil {
+		t.Error("Ctrl+A 不应返回命令")
+	}
+	if m.row != 0 || m.col != 0 {
+		t.Fatalf("Ctrl+A 后光标=(%d,%d)，期望 (0,0)", m.row, m.col)
+	}
+	if m.lines[0] != "hello world" {
+		t.Errorf("跳转不应改动文本，got %q", m.lines[0])
+	}
+	// 已处行首再按应保持幂等
+	m.Update(keyCtrlA())
+	if m.col != 0 {
+		t.Errorf("行首再按 Ctrl+A 应保持 col=0，got %d", m.col)
+	}
+}
+
+// TestUpdateCtrlEGoesToLineEnd 验证 Ctrl+E 跳到当前行行尾（rune 计）且幂等（含 CJK）。
+func TestUpdateCtrlEGoesToLineEnd(t *testing.T) {
+	m, _, _ := newTestModel()
+	m.lines = []string{"你好abc"} // 2 个 CJK + 3 个 ASCII = 5 个 rune
+	m.row, m.col = 0, 1
+	if _, cmd := m.Update(keyCtrlE()); cmd != nil {
+		t.Error("Ctrl+E 不应返回命令")
+	}
+	if m.row != 0 || m.col != 5 {
+		t.Fatalf("Ctrl+E 后光标=(%d,%d)，期望 (0,5)", m.row, m.col)
+	}
+	if m.lines[0] != "你好abc" {
+		t.Errorf("跳转不应改动文本，got %q", m.lines[0])
+	}
+	m.Update(keyCtrlE())
+	if m.col != 5 {
+		t.Errorf("行尾再按 Ctrl+E 应保持 col=5，got %d", m.col)
+	}
+}
+
+// TestCtrlAEStaysOnCurrentRow 验证 Ctrl+A/E 是行级跳转：只动 col 不动 row，
+// 光标在其他行时不会跨行跳回文档首/尾。
+func TestCtrlAEStaysOnCurrentRow(t *testing.T) {
+	m, _, _ := newTestModel()
+	m.lines = []string{"first line", "second"}
+	m.row, m.col = 0, 3
+	m.Update(keyCtrlE()) // 第 0 行行尾
+	if m.row != 0 || m.col != len([]rune("first line")) {
+		t.Fatalf("第 0 行 Ctrl+E 应停在行尾，got (%d,%d)", m.row, m.col)
+	}
+	m.Update(keyCtrlA()) // 第 0 行行首
+	if m.row != 0 || m.col != 0 {
+		t.Fatalf("第 0 行 Ctrl+A 应停在行首，got (%d,%d)", m.row, m.col)
+	}
+	m.row, m.col = 1, 2
+	m.Update(keyCtrlA())
+	if m.row != 1 || m.col != 0 {
+		t.Fatalf("第 1 行 Ctrl+A 应停在 (1,0)，got (%d,%d)", m.row, m.col)
+	}
+	m.Update(keyCtrlE())
+	if m.row != 1 || m.col != len([]rune("second")) {
+		t.Fatalf("第 1 行 Ctrl+E 应停在行尾，got (%d,%d)", m.row, m.col)
+	}
+	m.View() // 跳转后渲染应安全
+}
+
+// TestUpdateIgnoresCtrlAEWhileNotInput 验证发送/流式阶段 Ctrl+A/E 不生效。
+func TestUpdateIgnoresCtrlAEWhileNotInput(t *testing.T) {
+	for _, p := range []phase{phaseSending, phaseStreaming} {
+		m, _, _ := newTestModel()
+		m.phase, m.lines = p, []string{"abcdef"}
+		m.row, m.col = 0, 3
+		for _, k := range []tea.KeyPressMsg{keyCtrlA(), keyCtrlE()} {
+			_, cmd := m.Update(k)
+			if cmd != nil {
+				t.Fatalf("phase=%v 不应因 %q 返回命令", p, k.String())
+			}
+			if m.col != 3 || m.lines[0] != "abcdef" {
+				t.Fatalf("phase=%v 下 %q 不应移动光标或改文本，col=%d", p, k.String(), m.col)
+			}
+		}
+	}
+}
+
+// TestCtrlShiftAIsNotLineStart 防回归：Ctrl+Shift+A（全选）String() 为 "ctrl+shift+a"，
+// 不应误命中 Ctrl+A 触发跳转或插入文本。
+func TestCtrlShiftAIsNotLineStart(t *testing.T) {
+	m, _, _ := newTestModel()
+	m.lines = []string{"abcdef"}
+	m.row, m.col = 0, 3
+	_, cmd := m.Update(tea.KeyPressMsg{Code: 'a', Mod: tea.ModCtrl | tea.ModShift})
+	if cmd != nil {
+		t.Error("Ctrl+Shift+A 不应返回命令")
+	}
+	if m.col != 3 || m.lines[0] != "abcdef" {
+		t.Fatalf("Ctrl+Shift+A 不应移动光标或改文本，col=%d lines=%q", m.col, m.lines[0])
 	}
 }
 

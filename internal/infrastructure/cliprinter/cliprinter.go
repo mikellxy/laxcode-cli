@@ -126,6 +126,12 @@ func (m *model) newline() {
 	m.col = 0
 }
 
+// startOfLine 把光标移到当前行行首（row 不变，col=0）。
+func (m *model) startOfLine() { m.col = 0 }
+
+// endOfLine 把光标移到当前行行尾（row 不变，col 以 rune 计）。
+func (m *model) endOfLine() { m.col = len([]rune(m.lines[m.row])) }
+
 func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
@@ -227,6 +233,13 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.row++
 				m.col = 0
 			}
+		case "ctrl+a":
+			// 跳到当前行行首（readline 惯例）；Ctrl+Shift+A（全选）不会误命中，
+			// 其 String() 为 "ctrl+shift+a"。
+			m.startOfLine()
+		case "ctrl+e":
+			// 跳到当前行行尾（readline 惯例）。
+			m.endOfLine()
 		case "backspace":
 			m.deleteBackspace()
 		default:
