@@ -46,6 +46,7 @@ export OPENAI_MODEL=gpt-4o-mini
 ```
 
 ### 1.3 终端交互模式
+<img src="examples/laxcode_intro.gif" alt="LaxCode 终端交互演示" width="960" style="max-width: 100%; height: auto;">
 ```shell
 make build
 
@@ -58,8 +59,6 @@ make build
 | `-session <id>` | 空 | 续聊指定会话；空则新建（id 为毫秒精度时间串） |
 | `-plan` | false | 开启 Plan Mode（见下）                        |
 | `-workdir` | cwd | 工作目录                                      |
-
-<a href="examples/laxcode_terminal_interaction.png"><img src="examples/laxcode_terminal_interaction.png" alt="LaxCode 终端交互演示" width="480"></a>
 
 ### 1.4 one-shot 模式
 ```shell

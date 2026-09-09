@@ -46,6 +46,7 @@ export OPENAI_MODEL=gpt-4o-mini
 ```
 
 ### 1.3 Interactive Terminal Mode
+<img src="examples/laxcode_intro.gif" alt="LaxCode interactive terminal demo" width="960" style="max-width: 100%; height: auto;">
 ```shell
 make build
 
