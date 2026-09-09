@@ -37,14 +37,21 @@ func TestCompressZeroSavingsIsNoopAndDoesNotAliasSlice(t *testing.T) {
 
 func TestCompressUsesRoleToolAndKeepsLatestParallelSpan(t *testing.T) {
 	oldOutput := strings.Repeat("旧结果", 500)
+	midOutput := strings.Repeat("中", 800)
 	latestA := strings.Repeat("A", 800)
 	latestB := strings.Repeat("B", 800)
+	// 4 个工具调用轮次 > reActToolCallTurnKept(3)：最旧 span 应被清理，
+	// 最近 3 个 span（含最新并行 span）的结果完整保留。
 	msgs := []sharedkernel.Message{
 		{Role: sharedkernel.RoleUser, Content: "q"},
-		assistantToolTurn("old"),
+		assistantToolTurn("old"), // span0：最旧，窗口之外，应被清理
 		{Role: sharedkernel.RoleTool, ToolCallID: "old", Content: oldOutput},
 		{Role: sharedkernel.RoleAssistant, Content: "old done"},
-		assistantToolTurn("new-a", "new-b"),
+		assistantToolTurn("mid"), // span1：最近 3 之内
+		{Role: sharedkernel.RoleTool, ToolCallID: "mid", Content: midOutput},
+		assistantToolTurn("mid2"), // span2：最近 3 之内
+		{Role: sharedkernel.RoleTool, ToolCallID: "mid2", Content: midOutput},
+		assistantToolTurn("new-a", "new-b"), // span3：最新并行 span
 		{Role: sharedkernel.RoleTool, ToolCallID: "new-a", Content: latestA},
 		{Role: sharedkernel.RoleTool, ToolCallID: "new-b", Content: latestB},
 	}
@@ -54,13 +61,17 @@ func TestCompressUsesRoleToolAndKeepsLatestParallelSpan(t *testing.T) {
 		t.Fatalf("Compress: %v", err)
 	}
 	if saved <= 0 || !strings.Contains(out[2].Content, "早期工具输出已清理") {
-		t.Fatalf("真实 RoleTool 的旧 span 应被清理：saved=%d content=%q", saved, out[2].Content)
+		t.Fatalf("窗口之外的旧 span 应被清理：saved=%d content=%q", saved, out[2].Content)
 	}
-	if out[5].Content != latestA || out[6].Content != latestB {
+	if out[9].Content != latestA || out[10].Content != latestB {
 		t.Fatal("同一最新并行 tool-call span 的所有结果应一起完整保留")
 	}
-	if len(out[4].ToolCalls) != 2 || out[5].ToolCallID != "new-a" || out[6].ToolCallID != "new-b" {
-		t.Fatalf("function call/result 配对被破坏：%+v", out[4:])
+	if len(out[8].ToolCalls) != 2 || out[9].ToolCallID != "new-a" || out[10].ToolCallID != "new-b" {
+		t.Fatalf("function call/result 配对被破坏：%+v", out[8:])
+	}
+	// 最近窗口之内、但不是最新的 span 结果不应被“已清理”占位符替换
+	if strings.Contains(out[5].Content, "早期工具输出已清理") {
+		t.Fatal("最近 reActToolCallTurnKept 个 span 的结果不应被清理")
 	}
 }
 
@@ -95,20 +106,58 @@ func TestCompressLatestParallelSpanTruncatesEveryLargeResultUTF8Safely(t *testin
 }
 
 func TestCompressClearsOldReasoningWithinSingleUserTask(t *testing.T) {
+	oldReasoning := strings.Repeat("old reasoning", 200)
+	turn := func(id, reasoning string) sharedkernel.Message {
+		m := assistantToolTurn(id)
+		m.ReasoningContent = reasoning
+		return m
+	}
+	// 4 个工具调用轮次 > reActToolCallTurnKept(3)：最旧轮次的 reasoning 应被回收，
+	// 最近 3 轮的 reasoning 完整保留。
 	msgs := []sharedkernel.Message{
 		{Role: sharedkernel.RoleUser, Content: "one long task"},
-		{Role: sharedkernel.RoleAssistant, ReasoningContent: strings.Repeat("old reasoning", 200)},
-		{Role: sharedkernel.RoleAssistant, ReasoningContent: "latest reasoning"},
+		turn("t1", oldReasoning), // 最旧，窗口之外，应被回收
+		{Role: sharedkernel.RoleTool, ToolCallID: "t1", Content: "r1"},
+		turn("t2", "keep reasoning 2"),
+		{Role: sharedkernel.RoleTool, ToolCallID: "t2", Content: "r2"},
+		turn("t3", "keep reasoning 3"),
+		{Role: sharedkernel.RoleTool, ToolCallID: "t3", Content: "r3"},
+		turn("t4", "keep reasoning 4"),
+		{Role: sharedkernel.RoleTool, ToolCallID: "t4", Content: "r4"},
 	}
 	out, saved, err := SimpleCompactor.Compress(msgs, 1)
 	if err != nil {
 		t.Fatalf("Compress: %v", err)
 	}
 	if saved <= 0 || out[1].ReasoningContent != "" {
-		t.Fatal("old reasoning must be cleared within a single long user task")
+		t.Fatalf("窗口之外的旧 reasoning 必须被回收：saved=%d reasoning=%q", saved, out[1].ReasoningContent)
 	}
-	if out[2].ReasoningContent != "latest reasoning" {
-		t.Fatal("the latest assistant reasoning must be retained")
+	for _, idx := range []int{3, 5, 7} {
+		if out[idx].ReasoningContent == "" {
+			t.Fatalf("最近 reActToolCallTurnKept 轮的 reasoning 应保留：idx=%d", idx)
+		}
+	}
+}
+
+func TestCompressKeepsEverythingAndDoesNotPanicWithoutToolSpans(t *testing.T) {
+	// 无任何工具调用、但消息数 >= reActToolCallTurnKept：旧实现会因
+	// len(out) 误用于索引 spans 而 panic；修复后应正常返回，且因边界为 -1
+	// 保留全部 assistant 正文（无“旧工具轮次”可锚定裁剪）。
+	msgs := []sharedkernel.Message{
+		{Role: sharedkernel.RoleUser, Content: strings.Repeat("a", 2000)},
+		{Role: sharedkernel.RoleAssistant, Content: strings.Repeat("b", 2000)},
+		{Role: sharedkernel.RoleAssistant, Content: strings.Repeat("c", 2000)},
+		{Role: sharedkernel.RoleUser, Content: strings.Repeat("d", 2000)},
+	}
+	out, _, err := SimpleCompactor.Compress(msgs, 1)
+	if err != nil {
+		t.Fatalf("Compress: %v", err)
+	}
+	if len(out) != len(msgs) {
+		t.Fatalf("消息数量不应变化：%d != %d", len(out), len(msgs))
+	}
+	if out[1].Content != msgs[1].Content || out[2].Content != msgs[2].Content {
+		t.Fatal("无工具调用轮次时不应裁剪 assistant 正文")
 	}
 }
 

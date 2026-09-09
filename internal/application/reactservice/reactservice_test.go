@@ -529,6 +529,12 @@ func TestRunCompactsHistoryBeforeGenerate(t *testing.T) {
 	appendOrFatal(t, sess, &sharedkernel.Message{
 		Role: sharedkernel.RoleTool, ToolCallID: "old", Content: strings.Repeat("工具输出", 2000),
 	})
+	// 4 个工具调用轮次 > reActToolCallTurnKept(3)：最旧的 old span 落在最近窗口之外会被清理，
+	// 最近 3 轮（m1/m2/latest）完整保留。
+	appendOrFatal(t, sess, assistantMsgWithTool(sharedkernel.ToolCall{ID: "m1", Name: "mid-tool"}))
+	appendOrFatal(t, sess, &sharedkernel.Message{Role: sharedkernel.RoleTool, ToolCallID: "m1", Content: "x1"})
+	appendOrFatal(t, sess, assistantMsgWithTool(sharedkernel.ToolCall{ID: "m2", Name: "mid-tool"}))
+	appendOrFatal(t, sess, &sharedkernel.Message{Role: sharedkernel.RoleTool, ToolCallID: "m2", Content: "x2"})
 	appendOrFatal(t, sess, assistantMsgWithTool(sharedkernel.ToolCall{ID: "latest", Name: "latest-tool"}))
 	appendOrFatal(t, sess, &sharedkernel.Message{Role: sharedkernel.RoleTool, ToolCallID: "latest", Content: "fresh"})
 
@@ -549,13 +555,13 @@ func TestRunCompactsHistoryBeforeGenerate(t *testing.T) {
 		t.Fatalf("think: %v", err)
 	}
 
-	if len(llm.lastMsgs) != 6 {
+	if len(llm.lastMsgs) != 10 {
 		t.Fatalf("发给模型的消息数不符，实际 %d", len(llm.lastMsgs))
 	}
 	if !strings.Contains(llm.lastMsgs[3].Content, "早期工具输出已清理") {
 		t.Errorf("早给模型前应清理早期超长工具输出，实际：%q", llm.lastMsgs[3].Content)
 	}
-	if llm.lastMsgs[5].Content != "fresh" {
+	if llm.lastMsgs[9].Content != "fresh" {
 		t.Fatal("最新工具 span 的结果不应随旧 span 被清理")
 	}
 	if !strings.Contains(sess.Messages[3].Content, "早期工具输出已清理") {
@@ -577,6 +583,12 @@ func TestRunDoesNotGenerateWhenCompactionCannotReachExactTarget(t *testing.T) {
 	appendOrFatal(t, sess, &sharedkernel.Message{
 		Role: sharedkernel.RoleTool, ToolCallID: "old", Content: strings.Repeat("large-output", 1000),
 	})
+	// 4 个工具调用轮次 > reActToolCallTurnKept(3)：old span 会被清理（→ 70），
+	// 但仍高于精确目标，且此后再无可节省项，压缩无法达标。
+	appendOrFatal(t, sess, assistantMsgWithTool(sharedkernel.ToolCall{ID: "m1", Name: "mid-tool"}))
+	appendOrFatal(t, sess, &sharedkernel.Message{Role: sharedkernel.RoleTool, ToolCallID: "m1", Content: "x1"})
+	appendOrFatal(t, sess, assistantMsgWithTool(sharedkernel.ToolCall{ID: "m2", Name: "mid-tool"}))
+	appendOrFatal(t, sess, &sharedkernel.Message{Role: sharedkernel.RoleTool, ToolCallID: "m2", Content: "x2"})
 	appendOrFatal(t, sess, assistantMsgWithTool(sharedkernel.ToolCall{ID: "latest", Name: "latest-tool"}))
 	appendOrFatal(t, sess, &sharedkernel.Message{Role: sharedkernel.RoleTool, ToolCallID: "latest", Content: "fresh"})
 

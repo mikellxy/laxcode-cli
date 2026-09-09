@@ -34,6 +34,7 @@ type toolSpan struct {
 // → 最新工具 span 的超长输出。工具调用消息和所有对应结果消息
 // 始终保留，从而不破坏 function_call/function_call_output 配对。
 func (simpleStrategy) Compress(msgs []sharedkernel.Message, minTokenSavings int) ([]sharedkernel.Message, int, error) {
+	const reActToolCallTurnKept = 3
 	if minTokenSavings < 0 {
 		return nil, 0, fmt.Errorf("compactor: min token savings must not be negative")
 	}
@@ -48,7 +49,7 @@ func (simpleStrategy) Compress(msgs []sharedkernel.Message, minTokenSavings int)
 
 	// 以 span 为原子单位处理：同一 assistant turn 发出的并行工具
 	// 结果一起保留或一起清理，不会出现“只留最后一个结果”。
-	for i := 0; i+1 < len(spans); i++ {
+	for i := 0; i+reActToolCallTurnKept < len(spans); i++ {
 		for _, idx := range spans[i].resultIdxs {
 			if sharedkernel.EstimateTokenInt(out[idx].Content) <= oldToolOutputTokenThreshold {
 				continue
@@ -73,14 +74,24 @@ func (simpleStrategy) Compress(msgs []sharedkernel.Message, minTokenSavings int)
 		}
 	}
 
-	lastAssistantIdx := -1
-	for i := range out {
-		if out[i].Role == sharedkernel.RoleAssistant {
-			lastAssistantIdx = i
+	// 从最新往回定位第 reActToolCallTurnKept+1 个“带工具调用的 assistant”，
+	// 它及其之前都属于旧轮次；下标更大的才是需要完整保留的最近区间。
+	// 工具调用轮次不足时保持 -1，表示最近区间覆盖到开头、无需裁剪。
+	lastToolCallAssistantIdx := -1
+	assistantToolCallSeen := 0
+	for i := len(out) - 1; i >= 0; i-- {
+		if out[i].Role == sharedkernel.RoleAssistant && len(out[i].ToolCalls) > 0 {
+			assistantToolCallSeen++
+			if assistantToolCallSeen > reActToolCallTurnKept {
+				lastToolCallAssistantIdx = i
+				break
+			}
 		}
 	}
+
+	// 回收 reActTurnKept 之外的 reasoning_content
 	for i := range out {
-		if out[i].Role != sharedkernel.RoleAssistant || i == lastAssistantIdx || out[i].ReasoningContent == "" {
+		if out[i].Role != sharedkernel.RoleAssistant || i > lastToolCallAssistantIdx || out[i].ReasoningContent == "" {
 			continue
 		}
 		old := out[i].ReasoningContent
@@ -91,8 +102,9 @@ func (simpleStrategy) Compress(msgs []sharedkernel.Message, minTokenSavings int)
 		}
 	}
 
+	// 剪裁 reActTurnKept 之外的 assistant 消息的 content
 	for i := range out {
-		if out[i].Role != sharedkernel.RoleAssistant || i == lastAssistantIdx {
+		if out[i].Role != sharedkernel.RoleAssistant || i > lastToolCallAssistantIdx {
 			continue
 		}
 		if truncated, ok := truncateMiddleRunes(out[i].Content, recentContentRuneLimit); ok {
@@ -103,11 +115,12 @@ func (simpleStrategy) Compress(msgs []sharedkernel.Message, minTokenSavings int)
 		}
 	}
 
-	// 最新 span 是当前 ReAct 轮次马上要消费的结果：保留全部
-	// call/result 结构，仅对每个超长结果做 UTF-8 安全的头尾截断。
-	if len(spans) > 0 {
-		latest := spans[len(spans)-1]
-		for _, idx := range latest.resultIdxs {
+	// 最近 reActToolCallTurnKept 个 span 是当前 ReAct 轮次马上要消费的结果：
+	// 保留全部 call/result 结构，仅对每个超长结果做 UTF-8 安全的头尾截断。
+	// 用 len(spans) 而非 len(out) 索引，并夹住下界，避免越界与重复处理旧 span。
+	for i := len(spans) - 1; i >= 0 && i >= len(spans)-reActToolCallTurnKept; i-- {
+		span := spans[i]
+		for _, idx := range span.resultIdxs {
 			if truncated, ok := truncateMiddleRunes(out[idx].Content, recentContentRuneLimit); ok {
 				saved += replaceContent(&out[idx], truncated)
 			}
