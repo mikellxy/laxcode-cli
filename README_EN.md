@@ -194,7 +194,7 @@ laxcode only depends on the OpenTelemetry API module and does not ship an implem
 4. A registered custom Handle is automatically preferred over the built-in filetrace (no startup argument needed); when nothing is registered, the default is local filetrace persistence.
 
 ## 7. Architecture
-The codebase follows DDD layering, with dependencies flowing `cmd → application → domain ← infrastructure`. Neither domain nor application imports infrastructure: whenever an OS capability is needed (files, processes, directory scanning), domain declares a port interface, infrastructure implements it, and the composition root `cmd/agentasm` wires them together.
+The codebase follows DDD layering, with dependencies flowing `cmd → application → domain ← infrastructure`.
 
 ```
 LaxCode/
@@ -226,22 +226,6 @@ LaxCode/
 │       └── tracing/       # OTel wrapper, filetrace persistence, custom extension point
 └── openspec/              # change-management docs produced during development
 ```
-
-Ports and their adapters:
-
-| Port (declared in domain) | Adapter (implemented in infrastructure) |
-| --- | --- |
-| `session.SessionRepository` | `sessionrepo` |
-| `llmprovider.LLMClient` | `llmprovider` |
-| `tools.WorkFS` | `workfs` |
-| `tools.ShellRunner` | `shell` |
-| `prompt.SkillSource` | `skillrepo` |
-
-The layering criterion: **a tool's "behavioral contract" stays in domain** (`Definition` and JSON Schema, argument validation, error taxonomy, model-facing prompt text, pagination and other pure algorithms), while **OS mechanics sink into infrastructure** (`syscall`, `os.Open`, `exec`, process groups, directory scanning). That is why `domain/tools` contains `bash.go` but no `os/exec`; on-disk path segments are always taken from `infrastructure/layout` instead of being hardcoded elsewhere.
-
-domain has only two third-party dependencies, each quarantined in a single "vocabulary" package: `domain/telemetry` funnels the OpenTelemetry API, and `domain/prompt` uses `go.yaml.in/yaml/v4` to parse skill frontmatter. Across the whole repo, imports of `go.opentelemetry.io/` should appear only in `domain/telemetry` (instrumentation semantics: span names, attribute keys, tracing helpers) and `infrastructure/tracing` (assembly and export implementation); instrumentation sites in domain / application / cmd must go through `telemetry`, because importing OTel directly would reduce "switching observability vendors touches only two packages" to an empty claim.
-
-Dependencies inside `internal/domain/*` are funnelled the same way: a domain package may only depend on domain packages, cross-layer capabilities are defined as ports in domain and implemented in infrastructure, and pure algorithms plus shared types always live in `domain/sharedkernel` — so the domain layer never reaches back into out-of-layer grab bags such as `internal/utils`. The layering criteria above are enforced one by one by the guard tests in `cmd/agentasm/archguard_test.go`; violating them fails the test suite.
 
 ```mermaid
 flowchart TD

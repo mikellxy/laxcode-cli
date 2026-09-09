@@ -194,7 +194,7 @@ laxcode 只依赖 OpenTelemetry API 模块，本体不提供真实上报后端�
 4. 注册成功的自定义 Handle 自动优先于默认 filetrace 被选用（无需启动参数）；未注册任何实现时缺省为 filetrace 本地落盘。
 
 ## 7. 架构
-代码按 DDD 分层组织，依赖方向为 `cmd → application → domain ← infrastructure`。domain 与 application 都不 import infrastructure：凡需触达 OS 的能力（文件、进程、目录扫描），由 domain 定义端口接口、infrastructure 提供实现，组合根 `cmd/agentasm` 负责装配。
+代码按 DDD 分层组织，依赖方向为 `cmd → application → domain ← infrastructure`。
 
 ```
 LaxCode/
@@ -226,22 +226,6 @@ LaxCode/
 │       └── tracing/       # OTel 封装、filetrace 落盘、custom 扩展点
 └── openspec/              # 开发过程中的变更管理文档
 ```
-
-端口与适配器对应关系：
-
-| 端口（domain 定义） | 适配器（infrastructure 实现） |
-| --- | --- |
-| `session.SessionRepository` | `sessionrepo` |
-| `llmprovider.LLMClient` | `llmprovider` |
-| `tools.WorkFS` | `workfs` |
-| `tools.ShellRunner` | `shell` |
-| `prompt.SkillSource` | `skillrepo` |
-
-分层判据：**工具的“行为契约”留在 domain**（`Definition` 与 JSON Schema、参数校验、错误分类学、面向模型的提示文案、分页等纯算法），**OS 机制下沉 infrastructure**（`syscall`、`os.Open`、`exec`、进程组、目录扫描）。所以 `domain/tools` 里看得到 `bash.go`，却看不到 `os/exec`；磁盘路径片段一律向 `infrastructure/layout` 取，不在别处硬编码。
-
-domain 的第三方依赖只有两处，各自被隔离在一个“词汇表”包里：`domain/telemetry` 收口 OpenTelemetry API，`domain/prompt` 用 `go.yaml.in/yaml/v4` 解析 Skill 的 frontmatter。全仓对 `go.opentelemetry.io/` 的 import 只应出现在 `domain/telemetry`（埋点语义：span 名、属性键、追踪辅助函数）与 `infrastructure/tracing`（装配与导出实现）两处；domain / application / cmd 的埋点方一律经 `telemetry` 使用追踪能力，直接 import OTel 会让“换观测方案时只改两个包”变成空话。
-
-`internal/domain/*` 内部的依赖同样收口：领域包只能依赖领域包，跨层能力在 domain 定义端口交 infrastructure 实现，纯算法与共享类型一律放 `domain/sharedkernel`——避免出现领域层反向依赖 `internal/utils` 这类层外杂项包。上述分层判据由 `cmd/agentasm/archguard_test.go` 的守护测试逐条强制，违反即测试失败。
 
 ```mermaid
 flowchart TD
