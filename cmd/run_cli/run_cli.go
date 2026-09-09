@@ -58,8 +58,10 @@ func newEventConsumer(sendIn func(string)) func(*reactservice.ReactEvent) {
 				sendIn(ColorGray + "[LaxCode] thinking: ")
 			case sharedkernel.ChunkTextStart:
 				sendIn(ColorGreen + "[LaxCode] LLM generates: ")
-			case sharedkernel.ChunkReasoningDelta, sharedkernel.ChunkTextDelta:
-				sendIn(chunk.Delta)
+			case sharedkernel.ChunkReasoningDelta:
+				sendIn(ColorGray + chunk.Delta + ColorReset)
+			case sharedkernel.ChunkTextDelta:
+				sendIn(ColorGreen + chunk.Delta + ColorReset)
 			case sharedkernel.ChunkReasoningEnd, sharedkernel.ChunkTextEnd:
 				sendIn(ColorReset + "\n")
 			case sharedkernel.ChunkToolCall:

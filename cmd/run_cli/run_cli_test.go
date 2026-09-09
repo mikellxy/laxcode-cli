@@ -22,8 +22,8 @@ func TestEventConsumerStreamsTextAndReasoning(t *testing.T) {
 		{Kind: sharedkernel.ChunkTextEnd},
 	}
 	want := []string{
-		ColorGray + "[LaxCode] thinking: ", "先思考", "再回答", ColorReset + "\n",
-		ColorGreen + "[LaxCode] LLM generates: ", "hello", " world", ColorReset + "\n",
+		ColorGray + "[LaxCode] thinking: ", ColorGray + "先思考" + ColorReset, ColorGray + "再回答" + ColorReset, ColorReset + "\n",
+		ColorGreen + "[LaxCode] LLM generates: ", ColorGreen + "hello" + ColorReset, ColorGreen + " world" + ColorReset, ColorReset + "\n",
 	}
 	for i, chunk := range chunks {
 		rcf(&reactservice.ReactEvent{Type: reactservice.ReActEventTypeChunk, ChunkEvent: &chunk})
