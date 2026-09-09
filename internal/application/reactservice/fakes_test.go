@@ -139,6 +139,27 @@ func (s *scriptedLLM) Generate(_ context.Context, msgs []sharedkernel.Message, _
 	return r.msg, r.err
 }
 
+func (s *scriptedLLM) GenerateStream(ctx context.Context, msgs []sharedkernel.Message, tools []sharedkernel.ToolDefinition, emit func(chunk sharedkernel.StreamChunk)) (*sharedkernel.Message, error) {
+	msg, err := s.Generate(ctx, msgs, tools)
+	if err != nil {
+		return nil, err
+	}
+	if msg.ReasoningContent != "" {
+		emit(sharedkernel.StreamChunk{Kind: sharedkernel.ChunkReasoningStart})
+		emit(sharedkernel.StreamChunk{Kind: sharedkernel.ChunkReasoningDelta, Delta: msg.ReasoningContent})
+		emit(sharedkernel.StreamChunk{Kind: sharedkernel.ChunkReasoningEnd})
+	}
+	if msg.Content != "" {
+		emit(sharedkernel.StreamChunk{Kind: sharedkernel.ChunkTextStart})
+		emit(sharedkernel.StreamChunk{Kind: sharedkernel.ChunkTextDelta, Delta: msg.Content})
+		emit(sharedkernel.StreamChunk{Kind: sharedkernel.ChunkTextEnd})
+	}
+	for _, tc := range msg.ToolCalls {
+		emit(sharedkernel.StreamChunk{Kind: sharedkernel.ChunkToolCall, ToolCall: &tc})
+	}
+	return msg, nil
+}
+
 func assistantMsg(content string) *sharedkernel.Message {
 	return &sharedkernel.Message{
 		Role:    sharedkernel.RoleAssistant,

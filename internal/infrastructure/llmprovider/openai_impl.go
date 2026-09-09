@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 
+	domainllm "github.com/mikellxy/laxcode/internal/domain/llmprovider"
 	"github.com/mikellxy/laxcode/internal/domain/sharedkernel"
 	"github.com/openai/openai-go/v3"
 	"github.com/openai/openai-go/v3/option"
@@ -14,6 +15,9 @@ type OpenApiProvider struct {
 	client openai.Client
 	model  string
 }
+
+// 编译期契约：基础设施 provider 必须满足领域层 LLMClient 接口。
+var _ domainllm.LLMClient = (*OpenApiProvider)(nil)
 
 func NewOpenApiProvider(apiKey, baseURL, model string) *OpenApiProvider {
 	return &OpenApiProvider{

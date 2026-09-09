@@ -4,13 +4,8 @@ import (
 	"encoding/json"
 	"testing"
 
-	domainllm "github.com/mikellxy/laxcode/internal/domain/llmprovider"
 	"github.com/mikellxy/laxcode/internal/domain/sharedkernel"
 )
-
-// 编译期契约：基础设施 provider 必须满足领域层 LLMClient 接口
-// （不含任何网络/API Key 依赖，仅验证方法签名）。
-var _ domainllm.LLMClient = (*OpenApiProvider)(nil)
 
 func TestNewOpenApiProvider(t *testing.T) {
 	// 仅验证构造装配，不发起任何网络请求
