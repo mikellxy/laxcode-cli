@@ -29,12 +29,8 @@ var (
 
 type Session struct {
 	ID string
-	// Messages 是发给 LLM 的消息序列；系统提示词（若已设置）恒为首元素。
-	Messages []sharedkernel.Message
-	// 会话累计 token 使用量
-	TokenUsed sharedkernel.TokenStatistics
-	// 窗口占用，发给 LLM 的 token 大小
-	WindowToken sharedkernel.TokenStatistics
+	// 嵌入保持 Messages/TokenUsed 等读侧访问兼容，内存只有一份工作集。
+	RequestContext
 	// sysToken 是当前系统提示词的本地估算占用，仅用于替换提示词时校正
 	// WindowToken（扣旧加新）。刻意不导出、也不写进 Message.TokenUsed：
 	// 那是模型返回的实测计费口径，混入估算值会污染落盘的历史。
@@ -48,27 +44,46 @@ func NewSession(sessionID string) *Session {
 		sessionID = time.Now().Format("20060102-150405.000")
 	}
 	return &Session{
-		ID: sessionID,
+		ID:             sessionID,
+		RequestContext: RequestContext{Version: RequestContextVersion},
 	}
 }
 
-// LoadMessages 用仓储读回的历史重建消息序列（装配 / 续聊期调用一次）。
+// LoadMessages 仅用于旧格式迁移和构造历史；正常续聊使用 Restore。
 // 首元素为系统消息时认领其估算占用，否则清零——避免留下上一次加载的悬挂值。
 func (s *Session) LoadMessages(msgs []sharedkernel.Message) {
-	s.Messages = msgs
+	loaded := sharedkernel.CloneMessages(msgs)
+	s.Messages = nil
+	s.LastSeq = 0
+	for i := range loaded {
+		if loaded[i].Role == sharedkernel.RoleSystem {
+			s.Messages = append(s.Messages, loaded[i])
+			continue
+		}
+		// 旧格式只在首次迁移时补齐标识；新格式由 Restore 校验。
+		_ = s.identify(&loaded[i])
+		if loaded[i].Seq > s.LastSeq {
+			s.LastSeq = loaded[i].Seq
+		}
+		s.Messages = append(s.Messages, loaded[i])
+	}
+	s.refreshSysToken()
+}
+
+func (s *Session) refreshSysToken() {
 	s.sysToken = 0
-	if len(msgs) > 0 && msgs[0].Role == sharedkernel.RoleSystem {
-		s.sysToken = sharedkernel.EstimateTokenInt(msgs[0].Content)
+	if len(s.Messages) > 0 && s.Messages[0].Role == sharedkernel.RoleSystem {
+		s.sysToken = sharedkernel.EstimateTokenInt(s.Messages[0].Content)
 	}
 }
 
-// LoadMeta 用仓储读回的 meta 重建 token 账目（装配 / 续聊期调用一次）。
+// LoadMeta 仅用于旧格式迁移时认领原有 token 账目。
 func (s *Session) LoadMeta(meta sharedkernel.SessionMeta) {
 	s.TokenUsed.OverWrite(meta.TokenUsed)
 	s.WindowToken.OverWrite(meta.WindowToken)
 }
 
-// Meta 返回当前 token 账目快照，供 application 层落盘（meta.json）。
+// Meta 返回 token 账目视图；新格式随 RequestContext 一起落盘。
 func (s *Session) Meta() sharedkernel.SessionMeta {
 	return sharedkernel.SessionMeta{
 		TokenUsed:   s.TokenUsed,
@@ -108,7 +123,7 @@ func (s *Session) UpsertSysMessage(content string) sharedkernel.Message {
 }
 
 // BuildUserMessage 构造一条用户消息（不落盘、不入序列），由 application 层
-// 先写仓储再交 AppendMessage。
+// 在候选 Session 追加后，将原始消息和候选快照一起交给仓储。
 func (s *Session) BuildUserMessage(content string) sharedkernel.Message {
 	return sharedkernel.Message{
 		Role:    sharedkernel.RoleUser,
@@ -129,13 +144,17 @@ func (s *Session) AppendMessage(msg *sharedkernel.Message) error {
 	if msg.Role == sharedkernel.RoleSystem {
 		return ErrSystemViaAppend
 	}
+	if err := s.identify(msg); err != nil {
+		return err
+	}
 
 	if msg.Role == sharedkernel.RoleAssistant {
 		s.WindowToken.OverWrite(msg.TokenUsed)
 		s.TokenUsed.Add(msg.TokenUsed)
 	}
 
-	s.Messages = append(s.Messages, *msg)
+	s.Messages = append(s.Messages, msg.Clone())
+	s.LastSeq = msg.Seq
 
 	return nil
 }
@@ -150,8 +169,7 @@ type Compactor interface {
 // Compact 要求策略尝试节省指定 token，并在聚合内采纳新的
 // 消息序列。触发判断和最终精确重计数由 application 层完成。
 //
-// 压缩结果只在内存生效：history.jsonl 始终保留完整原文，续聊后按原文重新
-// 压缩，故落盘的 meta 也不记压缩后的窗口值。
+// application 在候选 Session 上执行并计数，确认达标后提交 RequestContext。
 func (s *Session) Compact(strategy Compactor, minTokenSavings int) (int, error) {
 	if strategy == nil {
 		return 0, ErrNilCompactor
@@ -160,13 +178,12 @@ func (s *Session) Compact(strategy Compactor, minTokenSavings int) (int, error) 
 	if err != nil {
 		return 0, err
 	}
-	s.LoadMessages(msgs)
+	s.Messages = sharedkernel.CloneMessages(msgs)
 	return saved, nil
 }
 
 // ReconcileWindowInput 用 provider 对“下一个完整请求”的精确计数
-// 校正内存窗口账目。该值不单独落盘，下一条 assistant 消息
-// 会用 API 实测 usage 再次覆盖它。
+// 校正窗口账目；随 RequestContext 落盘，下一条 assistant 用实测 usage 覆盖。
 func (s *Session) ReconcileWindowInput(inputTokens int) {
 	s.WindowToken = sharedkernel.TokenStatistics{TokenInput: inputTokens}
 }

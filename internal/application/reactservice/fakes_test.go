@@ -2,6 +2,7 @@ package reactservice
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -18,10 +19,14 @@ import (
 // 存储形态对齐 FsSessionRepo：系统提示词独立一份，GetMessages 时居首。
 // fail* 开关用于验证仓储故障能沿 application 层透传，而不是被静默吞掉。
 type memRepo struct {
-	mu      sync.Mutex
-	msgs    map[string][]sharedkernel.Message
-	sysMsgs map[string]sharedkernel.Message
-	metas   map[string]sharedkernel.SessionMeta
+	mu              sync.Mutex
+	msgs            map[string][]sharedkernel.Message
+	sysMsgs         map[string]sharedkernel.Message
+	metas           map[string]sharedkernel.SessionMeta
+	contexts        map[string]session.RequestContext
+	artifacts       map[string]map[string]string
+	failSaveContext bool
+	failArtifact    bool
 
 	failAppend      bool
 	failUpsertSys   bool
@@ -35,10 +40,75 @@ var errRepo = errors.New("repo failure")
 
 func newMemRepo() *memRepo {
 	return &memRepo{
-		msgs:    make(map[string][]sharedkernel.Message),
-		sysMsgs: make(map[string]sharedkernel.Message),
-		metas:   make(map[string]sharedkernel.SessionMeta),
+		msgs:      make(map[string][]sharedkernel.Message),
+		sysMsgs:   make(map[string]sharedkernel.Message),
+		metas:     make(map[string]sharedkernel.SessionMeta),
+		contexts:  make(map[string]session.RequestContext),
+		artifacts: make(map[string]map[string]string),
 	}
+}
+
+func (m *memRepo) GetRequestContext(ctx context.Context, id string) (session.RequestContext, error) {
+	if snapshot, ok := m.contexts[id]; ok {
+		return snapshot.Clone(), nil
+	}
+	msgs, err := m.GetMessages(ctx, id)
+	if err != nil {
+		return session.RequestContext{}, err
+	}
+	meta, err := m.GetMeta(ctx, id)
+	if err != nil {
+		return session.RequestContext{}, err
+	}
+	s := session.NewSession(id)
+	s.LoadMessages(msgs)
+	s.LoadMeta(meta)
+	return s.Snapshot(), nil
+}
+
+func (m *memRepo) SaveRequestContext(ctx context.Context, id string, snapshot session.RequestContext, original *sharedkernel.Message) error {
+	if m.failSaveContext || (original != nil && (m.failAppend || m.failUpdateMeta)) || (original == nil && m.failUpsertSys) {
+		return errRepo
+	}
+	if err := snapshot.Validate(); err != nil {
+		return err
+	}
+	if original != nil {
+		if err := m.AppendMessage(ctx, id, original); err != nil {
+			return err
+		}
+	}
+	m.contexts[id] = snapshot.Clone()
+	m.metas[id] = sharedkernel.SessionMeta{TokenUsed: snapshot.TokenUsed, WindowToken: snapshot.WindowToken}
+	if len(snapshot.Messages) > 0 && snapshot.Messages[0].Role == sharedkernel.RoleSystem {
+		m.sysMsgs[id] = snapshot.Messages[0]
+	}
+	return nil
+}
+
+func (m *memRepo) PutArtifact(_ context.Context, sid, content string) (sharedkernel.ArtifactRef, error) {
+	if m.failArtifact {
+		return sharedkernel.ArtifactRef{}, errRepo
+	}
+	id := fmt.Sprintf("%x", sha256.Sum256([]byte(content)))
+	if m.artifacts[sid] == nil {
+		m.artifacts[sid] = make(map[string]string)
+	}
+	m.artifacts[sid][id] = content
+	return sharedkernel.ArtifactRef{ID: id, ByteSize: len(content)}, nil
+}
+
+func (m *memRepo) ReadArtifact(_ context.Context, sid, id string, offset, limit int) (tools.ArtifactPage, error) {
+	content, ok := m.artifacts[sid][id]
+	if !ok {
+		return tools.ArtifactPage{}, errors.New("artifact missing")
+	}
+	runes := []rune(content)
+	if offset < 0 || offset > len(runes) || limit < 1 {
+		return tools.ArtifactPage{}, errors.New("invalid range")
+	}
+	end := min(len(runes), offset+limit)
+	return tools.ArtifactPage{ID: id, Content: string(runes[offset:end]), Offset: offset, NextOffset: end, TotalRunes: len(runes), EOF: end == len(runes)}, nil
 }
 
 func (m *memRepo) AppendMessage(_ context.Context, sessionID string, msg *sharedkernel.Message) error {
@@ -47,7 +117,7 @@ func (m *memRepo) AppendMessage(_ context.Context, sessionID string, msg *shared
 	if m.failAppend {
 		return errRepo
 	}
-	m.msgs[sessionID] = append(m.msgs[sessionID], *msg)
+	m.msgs[sessionID] = append(m.msgs[sessionID], msg.Clone())
 	return nil
 }
 
@@ -258,8 +328,8 @@ func (fatalTool) AfterExecInfo(json.RawMessage) string { return "" }
 // 聚合先落定状态并交出快照，再由调用方（平时是 ReActService.InitSysPrompt）落盘。
 func newTestSession(id string, repo session.SessionRepository) *session.Session {
 	sess := session.NewSession(id)
-	sysMsg := sess.UpsertSysMessage("system prompt")
-	if err := repo.UpsertSysMessage(context.Background(), id, &sysMsg); err != nil {
+	sess.UpsertSysMessage("system prompt")
+	if err := repo.SaveRequestContext(context.Background(), id, sess.Snapshot(), nil); err != nil {
 		panic(err)
 	}
 	return sess

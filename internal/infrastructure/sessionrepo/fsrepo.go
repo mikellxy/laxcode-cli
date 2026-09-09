@@ -5,8 +5,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 
 	"github.com/mikellxy/laxcode/internal/domain/session"
 	"github.com/mikellxy/laxcode/internal/domain/sharedkernel"
@@ -25,6 +27,7 @@ const tmpPattern = "*.tmp"
 
 type FsSessionRepo struct {
 	Dir string
+	mu  sync.Mutex
 }
 
 func NewFsSessionRepo(dir string) *FsSessionRepo {
@@ -80,6 +83,9 @@ func (r *FsSessionRepo) UpdateMeta(ctx context.Context, sessionID string, meta *
 
 // writeFile 以“临时文件 + rename”原子替换 path，避免写一半被读到。
 func (r *FsSessionRepo) writeFile(ctx context.Context, path string, data []byte) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	dir := filepath.Dir(path)
 
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -90,9 +96,14 @@ func (r *FsSessionRepo) writeFile(ctx context.Context, path string, data []byte)
 		return err
 	}
 	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
 	if _, err := tmp.Write(append(data, '\n')); err != nil {
 		tmp.Close()
 		os.Remove(tmpName)
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
 		return err
 	}
 	if err := tmp.Close(); err != nil {
@@ -103,8 +114,7 @@ func (r *FsSessionRepo) writeFile(ctx context.Context, path string, data []byte)
 		os.Remove(tmpName)
 		return err
 	}
-
-	return nil
+	return syncDir(dir)
 }
 
 // GetMessages 读回完整消息序列：系统提示词（sys_message.json）居首，
@@ -114,6 +124,10 @@ func (r *FsSessionRepo) writeFile(ctx context.Context, path string, data []byte)
 // 存在时以 sys_message.json 为准，跳过 history 里的 system 行：否则续聊会
 // 向模型发送两条系统提示词（新的一条 + 陈旧的一条）。
 func (r *FsSessionRepo) GetMessages(ctx context.Context, sessionID string) ([]sharedkernel.Message, error) {
+	return r.getMessages(ctx, sessionID, false)
+}
+
+func (r *FsSessionRepo) getMessages(ctx context.Context, sessionID string, strict bool) ([]sharedkernel.Message, error) {
 	var msgs []sharedkernel.Message
 	hasSysFile := false
 	{
@@ -151,6 +165,9 @@ func (r *FsSessionRepo) GetMessages(ctx context.Context, sessionID string) ([]sh
 		}
 		var msg sharedkernel.Message
 		if err := json.Unmarshal(line, &msg); err != nil {
+			if strict {
+				return nil, fmt.Errorf("migrate history line %d: %w", lineNo, err)
+			}
 			continue
 		}
 		if hasSysFile && msg.Role == sharedkernel.RoleSystem {

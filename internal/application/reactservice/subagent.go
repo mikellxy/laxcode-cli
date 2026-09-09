@@ -107,8 +107,7 @@ func (s *SubAgent) Execute(ctx context.Context, args json.RawMessage) (string, e
 		workDir = a.WorkDir
 	}
 
-	// 子会话：全新 id、复用父 SessRepo。InitSession 对全新 id 读不到任何历史，
-	// 两次读盘只为走同一条装配路径（与主 Agent 一致），不依赖“子会话为空”的假设。
+	// 子会话：全新 id、复用父 SessRepo，使用与主 Agent 相同的快照恢复入口。
 	// 注入人格系统提示词（含 workDir 沙箱约束）与子工作目录下的技能索引；
 	// plan 传 nil（子 Agent 不支持 Plan Mode），warn 传 nil（技能警告已在主 Agent
 	// 启动时针对主工作目录输出过，此处重复输出只会淹没子任务结果）。
@@ -117,7 +116,8 @@ func (s *SubAgent) Execute(ctx context.Context, args json.RawMessage) (string, e
 	childSkills := prompt.LoadSkills(s.deps.SkillSrc, workDir, nil)
 	childSysPrompt := prompt.GetSysPrompt(workDir, childSkills, nil)
 
-	// 受限工具集：仅 bash + read_file，不含 sub-agent 自身 → 防递归。子 Agent
+	// 受限工具集：bash + read_file；构造服务时另注册会话级 read_artifact。
+	// 不含 sub-agent 自身，避免递归。子 Agent
 	// 一次运行即完整生命周期，defer Close 回收 bash 后台进程与临时文件；
 	// 命令执行端口按子 Agent 新建，以免回收波及父 Agent 的后台进程。
 	childReg := tools.NewDefaultRegistry(s.parent.tracer)

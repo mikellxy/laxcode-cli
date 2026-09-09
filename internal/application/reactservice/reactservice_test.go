@@ -470,30 +470,23 @@ func TestRunPersistsMetaAfterAssistantMessage(t *testing.T) {
 	}
 }
 
-func TestPersistMetaOnlyForAssistantMessages(t *testing.T) {
+func TestRequestContextIncludesUserMessagesAndUsage(t *testing.T) {
 	ctx := context.Background()
 	repo := newMemRepo()
 	sess := newTestSession("s-persist", repo)
 	svc := NewReActService(sess, repo, &scriptedLLM{}, tools.NewDefaultRegistry(nil), nil, nil)
 
-	// user / tool 消息不影响 token 账目，不应多写一次文件
-	for _, role := range []string{sharedkernel.RoleUser, sharedkernel.RoleTool} {
-		if err := svc.persistMeta(ctx, &sharedkernel.Message{Role: role}); err != nil {
-			t.Fatalf("persistMeta(%s): %v", role, err)
-		}
+	if err := svc.handleTurnMsg(ctx, &sharedkernel.Message{Role: sharedkernel.RoleUser, Content: "q"}); err != nil {
+		t.Fatal(err)
 	}
-	if _, ok := repo.storedMeta("s-persist"); ok {
-		t.Error("非 assistant 消息不应触发 meta 落盘")
+	if len(repo.contexts[sess.ID].Messages) != 2 {
+		t.Fatal("user message must checkpoint immediately")
 	}
-
-	if err := sess.AppendMessage(&sharedkernel.Message{
+	if err := svc.handleTurnMsg(ctx, &sharedkernel.Message{
 		Role:      sharedkernel.RoleAssistant,
 		TokenUsed: sharedkernel.TokenStatistics{TokenInput: 7, TokenOutput: 3},
 	}); err != nil {
 		t.Fatalf("append assistant: %v", err)
-	}
-	if err := svc.persistMeta(ctx, &sharedkernel.Message{Role: sharedkernel.RoleAssistant}); err != nil {
-		t.Fatalf("persistMeta(assistant): %v", err)
 	}
 	meta, ok := repo.storedMeta("s-persist")
 	if !ok || meta.TokenUsed != (sharedkernel.TokenStatistics{TokenInput: 7, TokenOutput: 3}) {
@@ -515,7 +508,7 @@ func TestRunPropagatesMetaPersistError(t *testing.T) {
 	if !errors.Is(err, errRepo) {
 		t.Fatalf("meta 落盘失败应透传，实际 %v", err)
 	}
-	if !strings.Contains(err.Error(), "persist session meta") {
+	if !strings.Contains(err.Error(), "persist request context") {
 		t.Errorf("错误应带上阶段信息便于定位，实际 %v", err)
 	}
 }
@@ -543,7 +536,7 @@ func TestRunCompactsHistoryBeforeGenerate(t *testing.T) {
 		budget:    llmprovider.ContextBudget{ContextWindow: 100, ReservedOutputTokens: 10},
 		countFn: func(msgs []sharedkernel.Message, _ []sharedkernel.ToolDefinition) (int, error) {
 			for _, msg := range msgs {
-				if strings.Contains(msg.Content, "早期工具输出已清理") {
+				if strings.Contains(msg.Content, "read_artifact") {
 					return 50, nil
 				}
 			}
@@ -558,13 +551,13 @@ func TestRunCompactsHistoryBeforeGenerate(t *testing.T) {
 	if len(llm.lastMsgs) != 10 {
 		t.Fatalf("发给模型的消息数不符，实际 %d", len(llm.lastMsgs))
 	}
-	if !strings.Contains(llm.lastMsgs[3].Content, "早期工具输出已清理") {
+	if !strings.Contains(llm.lastMsgs[3].Content, "read_artifact") {
 		t.Errorf("早给模型前应清理早期超长工具输出，实际：%q", llm.lastMsgs[3].Content)
 	}
 	if llm.lastMsgs[9].Content != "fresh" {
 		t.Fatal("最新工具 span 的结果不应随旧 span 被清理")
 	}
-	if !strings.Contains(sess.Messages[3].Content, "早期工具输出已清理") {
+	if !strings.Contains(sess.Messages[3].Content, "read_artifact") {
 		t.Errorf("压缩结果应回写聚合，实际：%q", sess.Messages[3].Content[:40])
 	}
 	if llm.countCalls != 2 {
@@ -597,7 +590,7 @@ func TestRunDoesNotGenerateWhenCompactionCannotReachExactTarget(t *testing.T) {
 		budget:    llmprovider.ContextBudget{ContextWindow: 100, ReservedOutputTokens: 10},
 		countFn: func(msgs []sharedkernel.Message, _ []sharedkernel.ToolDefinition) (int, error) {
 			for _, msg := range msgs {
-				if strings.Contains(msg.Content, "早期工具输出已清理") {
+				if strings.Contains(msg.Content, "read_artifact") {
 					return 70, nil
 				}
 			}

@@ -10,18 +10,14 @@ import (
 // 落盘形态（JSONL、独立文件、目录布局）由 infrastructure/sessionrepo 决定。
 // 加载与写回由 application 层编排，聚合自身不持有本端口。
 //
-// 契约：GetMessages 返回的序列以系统消息为首（若该会话已设置系统提示词），
-// 其后是 AppendMessage 写入的对话消息；系统消息只经 UpsertSysMessage 写入，
-// 不得经 AppendMessage 追加，否则续聊会读回两条系统提示词。
+// 运行时只读写最新 RequestContext。原文追加和旧格式迁移由仓储实现负责，
+// application 不再分别更新 history、system prompt 和 token meta。
 type SessionRepository interface {
-	// AppendMessage 追加一条对话消息（user / assistant / tool）。
-	AppendMessage(ctx context.Context, sessionID string, msg *sharedkernel.Message) error
-	// UpsertSysMessage 写入或覆盖会话的系统提示词（update or insert）。
-	UpsertSysMessage(ctx context.Context, sessionID string, msg *sharedkernel.Message) error
-	// UpdateMeta 覆盖写入会话的 token 账目。
-	UpdateMeta(ctx context.Context, sessionID string, meta *sharedkernel.SessionMeta) error
-	// GetMessages 读回完整消息序列（系统消息居首）；会话不存在时返回空序列而非错误。
-	GetMessages(ctx context.Context, sessionID string) ([]sharedkernel.Message, error)
-	// GetMeta 读回 token 账目；会话不存在时返回零值而非错误。
-	GetMeta(ctx context.Context, sessionID string) (sharedkernel.SessionMeta, error)
+	// GetRequestContext 读取最新工作集；无快照的旧会话只迁移一次原始历史。
+	GetRequestContext(ctx context.Context, sessionID string) (RequestContext, error)
+	// SaveRequestContext 提交工作集。original 非 nil 时同时追加原始消息，
+	// 仓储必须支持中断恢复；original 为 nil 用于压缩和系统提示词更新。
+	// 参数在同步调用期间只读借用。实现不得修改或在返回后保留任何切片、
+	// 指针引用；内存存储或异步处理须自行复制。调用方在返回前也不得修改参数。
+	SaveRequestContext(ctx context.Context, sessionID string, snapshot RequestContext, original *sharedkernel.Message) error
 }

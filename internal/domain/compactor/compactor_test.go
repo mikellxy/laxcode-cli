@@ -2,9 +2,9 @@ package compactor
 
 import (
 	"encoding/json"
+	"reflect"
 	"strings"
 	"testing"
-	"unicode/utf8"
 
 	"github.com/mikellxy/laxcode/internal/domain/session"
 	"github.com/mikellxy/laxcode/internal/domain/sharedkernel"
@@ -45,7 +45,7 @@ func TestCompressUsesRoleToolAndKeepsLatestParallelSpan(t *testing.T) {
 	msgs := []sharedkernel.Message{
 		{Role: sharedkernel.RoleUser, Content: "q"},
 		assistantToolTurn("old"), // span0：最旧，窗口之外，应被清理
-		{Role: sharedkernel.RoleTool, ToolCallID: "old", Content: oldOutput},
+		{Role: sharedkernel.RoleTool, ToolCallID: "old", Content: oldOutput, Artifact: &sharedkernel.ArtifactRef{ID: strings.Repeat("a", 64), ByteSize: len(oldOutput)}},
 		{Role: sharedkernel.RoleAssistant, Content: "old done"},
 		assistantToolTurn("mid"), // span1：最近 3 之内
 		{Role: sharedkernel.RoleTool, ToolCallID: "mid", Content: midOutput},
@@ -60,7 +60,7 @@ func TestCompressUsesRoleToolAndKeepsLatestParallelSpan(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Compress: %v", err)
 	}
-	if saved <= 0 || !strings.Contains(out[2].Content, "早期工具输出已清理") {
+	if saved <= 0 || !strings.Contains(out[2].Content, "read_artifact") {
 		t.Fatalf("窗口之外的旧 span 应被清理：saved=%d content=%q", saved, out[2].Content)
 	}
 	if out[9].Content != latestA || out[10].Content != latestB {
@@ -75,7 +75,7 @@ func TestCompressUsesRoleToolAndKeepsLatestParallelSpan(t *testing.T) {
 	}
 }
 
-func TestCompressLatestParallelSpanTruncatesEveryLargeResultUTF8Safely(t *testing.T) {
+func TestCompressNeverTruncatesProtectedParallelResults(t *testing.T) {
 	largeA := strings.Repeat("你🙂", 900)
 	largeB := strings.Repeat("界🚀", 900)
 	msgs := []sharedkernel.Message{
@@ -89,16 +89,8 @@ func TestCompressLatestParallelSpanTruncatesEveryLargeResultUTF8Safely(t *testin
 	if err != nil {
 		t.Fatalf("Compress: %v", err)
 	}
-	if saved <= 0 {
-		t.Fatal("large latest tool results should be truncated")
-	}
-	for _, idx := range []int{2, 3} {
-		if !utf8.ValidString(out[idx].Content) {
-			t.Fatalf("result %d is not valid UTF-8", idx)
-		}
-		if !strings.Contains(out[idx].Content, "...") {
-			t.Fatalf("result %d was not truncated", idx)
-		}
+	if saved != 0 || !reflect.DeepEqual(out, msgs) {
+		t.Fatal("protected messages must remain byte-for-byte unchanged")
 	}
 	if len(out[1].ToolCalls) != 2 || out[2].ToolCallID != "a" || out[3].ToolCallID != "b" {
 		t.Fatal("truncation must preserve the complete tool-call span")

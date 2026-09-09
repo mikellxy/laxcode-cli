@@ -108,8 +108,9 @@ session 目录结构
 ${workdir}/.laxcode/.session/
 └── ${session_id}/
     ├── history.jsonl           # 对话历史 JSON LINES（不含系统提示词）
-    ├── sys_message.json        # 系统提示词，每次启动整体覆盖
-    ├── meta.json               # token 用量统计、上下文窗口记录
+    ├── request_context.json    # 最新工作集、系统提示词、稳定序号和 token 账目
+    ├── request_context.pending.json # 提交中断恢复记录，仅提交期间存在
+    ├── artifacts/             # 按内容 SHA-256 保存的不可变工具输出
     ├── log/
     │   └── tracing.log         # OTel span 本地落盘 JSON LINES
     ├── plan.md                 # [Plan Mode] 任务规划（agent 生成）
@@ -175,13 +176,13 @@ LaxCode 在 ReAct 循环中完整实现 openai function call 协议。启动时�
 
 ## 4. 上下文压缩
 
-The context budget is configured per model deployment. Before each generation call, the provider counts the exact request, including messages and tool definitions. Compression starts at 80% of available input capacity and is recounted until it reaches 60%. Tool calls and results are handled as complete spans, and truncation is UTF-8 safe. If compaction cannot reach the target, the request is not sent.
+每次调用 LLM 前，按当前模型预算计算下一请求占用，包含消息与工具定义。触发阈值仍是可用输入容量的 80%，压缩目标仍是 60%。兼容 provider 不支持远端计数时使用本地估算，估算不等同于精确计数。整个过程使用确定性的 `simpleStrategy`，不调用额外模型生成摘要。
 
-压缩器在每次调用 LLM 前检查窗口占用，达到阈值（默认窗口的 80%）时分层清理：  
-- 近期工具输出做内容截断保留关键头尾；
-- 更早的工具输出替换为带 call ID 的清理标记；
-- 过期的模型推理思考链（reasoning‑content）直接清除；
-- 压缩仅作用于发送给大模型的内存视图，原始会话历史完整保存在磁盘。
+- 一条 assistant 发起的全部工具调用及其结果组成一个 `ToolCallGroup`。从最近第三组的起点到历史末尾，所有消息保持原样，区间内的 assistant 消息可以超过三条；未完成或跨界调用组使保护区向前扩展。
+- 保护区之前的大工具输出先存入 artifact，再替换为带 `artifact_id` 和 `read_artifact` 调用提示的引用。读取工具按 Unicode 字符偏移分页，单次最多 4000 字符，校验内容摘要并限制在当前会话内。
+- 旧 reasoning 可清除，旧 assistant 正文做 UTF-8 安全的头尾裁剪。系统和用户消息不裁剪。候选上下文重新计数达标后才提交；失败保留当前上下文，且不发送生成请求。
+- `Session` 只持有最新 `RequestContext`。每次消息追加和压缩成功都提交 `request_context.json`；原始消息另行追加到 `history.jsonl`。启动读取快照，提交中断时按 pending 记录补齐，避免重复追加原文。旧会话在没有快照时从历史及旧版 `sys_message.json`、`meta.json` 迁移一次。
+- 非系统消息携带 session 内递增的 `Seq`。每个 assistant 响应有独立 `TurnID`，对应工具结果继承它和 `ToolCallGroupID`；普通 assistant 没有调用组，user/system 没有 `TurnID`。
 
 ## 5. Plan Mode
 

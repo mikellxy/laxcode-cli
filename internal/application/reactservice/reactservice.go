@@ -21,6 +21,7 @@ type ReActService struct {
 	SessRepo            session.SessionRepository
 	LLMClient           llmprovider.LLMClient
 	ToolRegistry        tools.Registry
+	Artifacts           tools.ArtifactStore
 	ReActEventConsumerF func(reactEvent *ReactEvent)
 	// tracer 是 ReAct/llm-turn span 的追踪注入点，经构造注入；nil 缺省
 	// noop，不产生任何观测输出。类型经 telemetry 别名持有，本包不直接
@@ -55,7 +56,7 @@ func NewReActService(sess *session.Session,
 	if reActEventConsumerF == nil {
 		reActEventConsumerF = func(*ReactEvent) {}
 	}
-	return &ReActService{
+	r := &ReActService{
 		Session:             sess,
 		SessRepo:            sessRepo,
 		LLMClient:           llmClient,
@@ -63,31 +64,28 @@ func NewReActService(sess *session.Session,
 		ReActEventConsumerF: reActEventConsumerF,
 		tracer:              telemetry.OrNoop(tracer),
 	}
+	// FS 仓储同时提供会话级 artifact 存储；子服务绑定自己的 session ID。
+	if store, ok := sessRepo.(tools.ArtifactStore); ok {
+		r.Artifacts = store
+		toolRegistry.Register(tools.NewReadArtifactTool(store, sess.ID))
+	}
+	return r
 }
 
-// InitSession 从仓储读回历史与 token 账目，重建聚合状态（装配 / 续聊期一次）。
+// InitSession 只恢复最新工作集；旧格式迁移及未完成提交恢复由仓储处理。
 func (r *ReActService) InitSession(ctx context.Context) error {
-	msgs, err := r.SessRepo.GetMessages(ctx, r.Session.ID)
+	snapshot, err := r.SessRepo.GetRequestContext(ctx, r.Session.ID)
 	if err != nil {
 		return err
 	}
-	r.Session.LoadMessages(msgs)
-
-	meta, err := r.SessRepo.GetMeta(ctx, r.Session.ID)
-	if err != nil {
-		return err
-	}
-	r.Session.LoadMeta(meta)
-
-	return nil
+	return r.Session.Restore(snapshot)
 }
 
-// InitSysPrompt 写入本次运行的系统提示词：聚合先落定状态并交出消息快照，
-// 再由本服务落盘。token 账目不在此写 meta：系统提示词的估算占用每次启动
-// 都会重算，真正需要持久化的账目随首条 assistant 消息一起落盘。
+// InitSysPrompt 将本次系统提示词和账目一起提交到工作集快照。
 func (r *ReActService) InitSysPrompt(ctx context.Context, p string) error {
-	sysMsg := r.Session.UpsertSysMessage(p)
-	return r.SessRepo.UpsertSysMessage(ctx, r.Session.ID, &sysMsg)
+	candidate := r.Session.Clone()
+	candidate.UpsertSysMessage(p)
+	return r.commitContext(ctx, candidate, nil)
 }
 
 // Chat 追加一条用户消息并跑一轮 ReAct 循环，直到模型给出无工具调用的回答。
@@ -215,8 +213,20 @@ func (r *ReActService) compactContext(ctx context.Context, toolDefs []sharedkern
 		return nil
 	}
 
+	// 所有修改都在候选工作集上进行；计数失败或未达标时不污染当前上下文。
+	candidate := r.Session.Clone()
+	for _, idx := range compactor.ArtifactCandidates(candidate.Messages) {
+		if r.Artifacts == nil {
+			return errors.New("artifact store required for tool output compaction")
+		}
+		ref, err := r.Artifacts.PutArtifact(ctx, r.Session.ID, candidate.Messages[idx].Content)
+		if err != nil {
+			return fmt.Errorf("archive tool output: %w", err)
+		}
+		candidate.Messages[idx].Artifact = &ref
+	}
 	for current > target {
-		saved, compactErr := r.Session.Compact(compactor.SimpleCompactor, current-target)
+		saved, compactErr := candidate.Compact(compactor.SimpleCompactor, current-target)
 		if compactErr != nil {
 			return compactErr
 		}
@@ -224,7 +234,7 @@ func (r *ReActService) compactContext(ctx context.Context, toolDefs []sharedkern
 			return fmt.Errorf("%w: current=%d target=%d", ErrContextTargetNotReach, current, target)
 		}
 
-		next, countErr := r.LLMClient.CountInputTokens(ctx, r.Session.Messages, toolDefs)
+		next, countErr := r.LLMClient.CountInputTokens(ctx, candidate.Messages, toolDefs)
 		if countErr != nil {
 			return fmt.Errorf("count context after compaction: %w", countErr)
 		}
@@ -235,34 +245,25 @@ func (r *ReActService) compactContext(ctx context.Context, toolDefs []sharedkern
 		current = next
 	}
 
-	r.Session.ReconcileWindowInput(current)
-	return nil
+	candidate.ReconcileWindowInput(current)
+	return r.commitContext(ctx, candidate, nil)
 }
 
-// handleTurnMsg 把一条消息落盘、同步进聚合，并在 token 账目变化时写回 meta。
-// 顺序是“先磁盘后内存”：写盘失败时聚合状态不动，内存与续聊读回的历史
-// 不会分叉。本函数只返回 error，span 收尾由调用方的 closeTurn 统一负责。
+// handleTurnMsg 先在候选中赋予稳定标识，再提交原始流水与工作集。
+// 仓储通过提交记录恢复中断写入；成功提交后内存才切换。
 func (r *ReActService) handleTurnMsg(ctx context.Context, msg *sharedkernel.Message) error {
-	if err := r.SessRepo.AppendMessage(ctx, r.Session.ID, msg); err != nil {
+	candidate, err := r.Session.WithAppendedMessage(msg)
+	if err != nil {
 		return err
 	}
-	if err := r.Session.AppendMessage(msg); err != nil {
-		return err
-	}
-	return r.persistMeta(ctx, msg)
+	return r.commitContext(ctx, candidate, msg)
 }
 
-// persistMeta 在消息改变了 token 账目时把 meta 落盘（meta.json）：只有 assistant
-// 消息携带模型返回的实测用量，user / tool 消息不影响账目，无需多写一次文件。
-// 落的是本次实测窗口值，不含压缩扣减：压缩只在内存生效，磁盘上的
-// history.jsonl 始终是未压缩原文，续聊时按原文重算才自洽。
-func (r *ReActService) persistMeta(ctx context.Context, msg *sharedkernel.Message) error {
-	if msg.Role != sharedkernel.RoleAssistant {
-		return nil
+func (r *ReActService) commitContext(ctx context.Context, candidate *session.Session, original *sharedkernel.Message) error {
+	// 同步提交只读借用候选工作集，无需再次深复制；仓储返回后才切换内存。
+	if err := r.SessRepo.SaveRequestContext(ctx, r.Session.ID, candidate.RequestContext, original); err != nil {
+		return fmt.Errorf("persist request context: %w", err)
 	}
-	meta := r.Session.Meta()
-	if err := r.SessRepo.UpdateMeta(ctx, r.Session.ID, &meta); err != nil {
-		return fmt.Errorf("persist session meta: %w", err)
-	}
+	*r.Session = *candidate
 	return nil
 }
