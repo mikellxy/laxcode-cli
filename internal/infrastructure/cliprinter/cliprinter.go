@@ -8,6 +8,7 @@ package cliprinter
 import (
 	"errors"
 	"strings"
+	"unicode"
 
 	tea "charm.land/bubbletea/v2"
 	"github.com/charmbracelet/x/ansi"
@@ -59,14 +60,15 @@ func readIn(in <-chan string) tea.Cmd {
 // 终端宽高、交互阶段、流式缓冲（streamBuf）与收发通道。已完成内容不留在 model，
 // 而是即时打印到终端 scrollback（见 appendStream/flushStream）。
 type model struct {
-	lines     []string // 输入区按行保存，行内按 rune 处理
-	row, col  int      // 光标位置：lines[row] 中第 col 个 rune 之前
-	width     int      // 终端宽度（列数），用于绘制与屏幕等宽的分隔线
-	height    int      // 终端高度（行数）：fitHeight 安全网，正常历史走 scrollback 不依赖它
-	phase     phase    // 当前交互阶段
-	streamBuf string   // 正在流式接收、尚未遇到换行的尾部：完整行即时打印到 scrollback，尾部半行由 View 实时显示
-	outChan   chan<- string
-	inChan    <-chan string
+	lines            []string // 输入区按行保存，行内按 rune 处理
+	row, col         int      // 光标位置：lines[row] 中第 col 个 rune 之前
+	width            int      // 终端宽度（列数），用于绘制与屏幕等宽的分隔线
+	height           int      // 终端高度（行数）：fitHeight 安全网，正常历史走 scrollback 不依赖它
+	phase            phase    // 当前交互阶段
+	streamBuf        string   // 正在流式接收、尚未遇到换行的尾部：完整行即时打印到 scrollback，尾部半行由 View 实时显示
+	outChan          chan<- string
+	inChan           <-chan string
+	clipboardPending bool // 等待由 Cmd+V 发起的剪贴板读取结果
 }
 
 // Init 实现 tea.Model：启动时无需执行命令。
@@ -78,6 +80,24 @@ func (m *model) insert(text string) {
 	runes = append(runes[:m.col], append([]rune(text), runes[m.col:]...)...)
 	m.lines[m.row] = string(runes)
 	m.col += len([]rune(text))
+}
+
+// paste 在光标处插入整段文本；换行只拆分输入行，不触发发送。
+func (m *model) paste(text string) {
+	text = strings.ReplaceAll(text, "\r\n", "\n")
+	text = strings.ReplaceAll(text, "\r", "\n")
+	text = strings.Map(func(r rune) rune {
+		if r != '\n' && r != '\t' && unicode.IsControl(r) {
+			return -1
+		}
+		return r
+	}, text)
+	for i, line := range strings.Split(text, "\n") {
+		if i > 0 {
+			m.newline()
+		}
+		m.insert(line)
+	}
 }
 
 // deleteBackspace 删除光标前一个 rune；若在行首则与上一行合并。
@@ -132,6 +152,18 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// InChan 已关闭：flush 残留半行，回到用户输入阶段
 		m.phase = phaseInput
 		return m, m.flushStream()
+	case tea.PasteMsg:
+		// 终端通常自行处理 Cmd+V，再通过 bracketed paste 发送文本。
+		if m.phase == phaseInput {
+			m.paste(msg.Content)
+		}
+	case tea.ClipboardMsg:
+		if m.clipboardPending && msg.Selection == 'c' {
+			m.clipboardPending = false
+			if m.phase == phaseInput {
+				m.paste(msg.Content)
+			}
+		}
 	case tea.KeyPressMsg:
 		if msg.String() == "ctrl+c" {
 			return m, tea.Quit
@@ -141,7 +173,20 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		switch msg.String() {
+		case "super+c":
+			// 支持将 Command 键直接上报的终端；输入框没有内部选区，复制整个草稿。
+			// 普通终端的鼠标选择 + Cmd+C 由终端自身处理。
+			if input := strings.Join(m.lines, "\n"); input != "" {
+				return m, tea.SetClipboard(input)
+			}
+		case "super+v":
+			// 直接上报按键时通过 OSC52 读取（需要终端支持）；普通粘贴走 PasteMsg。
+			if !m.clipboardPending {
+				m.clipboardPending = true
+				return m, tea.ReadClipboard
+			}
 		case "enter":
+			m.clipboardPending = false
 			input := strings.Join(m.lines, "\n")
 			if strings.TrimSpace(input) == "" {
 				// 空输入不发送，仅清空输入区（对齐原 CLI 跳过空行的行为）
