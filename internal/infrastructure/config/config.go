@@ -31,12 +31,18 @@ var EnvOrFile = viper.New()
 
 type cliConf struct {
 	Oneshot  bool   `mapstructure:"oneshot"`
+	SSE      bool   `mapstructure:"sse"`
+	Addr     string `mapstructure:"addr"`
 	WorkDir  string `mapstructure:"workdir"`
 	Task     string `mapstructure:"task"`
 	TaskFile string `mapstructure:"task-file"`
 	Session  string `mapstructure:"session"`
 	Plan     bool   `mapstructure:"plan"`
 }
+
+// DefaultSSEAddr 是 sse server 模式的缺省监听地址：仅绑定本地回环，因为
+// Agent 具备 bash / 写文件能力，默认不对外暴露；需要对外时以 -addr 覆盖。
+const DefaultSSEAddr = "127.0.0.1:8080"
 
 var CliConf cliConf
 
@@ -95,6 +101,8 @@ func ParseEnvAndFile() error {
 // 参数”直接退出（老 internal/config 亦是由 main 显式调用 Parse）。
 func ParseCli() error {
 	oneshot := flag.Bool("oneshot", false, "one-shot mode: run a single task and print structured JSON to stdout")
+	sse := flag.Bool("sse", false, "sse server mode: serve HTTP POST /chat and stream ReAct events over SSE")
+	addr := flag.String("addr", DefaultSSEAddr, "sse server listen address")
 	workDir := flag.String("workdir", "", "working directory; required in one-shot mode, defaults to cwd otherwise")
 	task := flag.String("task", "", "one-shot task prompt text")
 	taskFile := flag.String("task-file", "", "one-shot task prompt file path; takes precedence over -task")
@@ -103,6 +111,8 @@ func ParseCli() error {
 	flag.Parse()
 
 	Cli.Set("oneshot", *oneshot)
+	Cli.Set("sse", *sse)
+	Cli.Set("addr", *addr)
 	Cli.Set("workdir", *workDir)
 	Cli.Set("task", *task)
 	Cli.Set("task-file", *taskFile)
