@@ -46,7 +46,8 @@ export OPENAI_MODEL=gpt-4o-mini
 ```
 
 ### 1.3 终端交互模式
-<img src="examples/laxcode_intro.gif" alt="LaxCode 终端交互演示" width="960" style="max-width: 100%; height: auto;">
+<img src="examples/laxcode_intro.gif" alt="LaxCode 终端交互演示" width="960" style="max-width: 100%; height: auto;">  
+
 ```shell
 make build
 
