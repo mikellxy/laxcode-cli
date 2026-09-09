@@ -1,0 +1,28 @@
+# <type>(<scope>): <subject>
+#
+# ── 标题行（必填，<= 72 字符）────────────────────────────────────────────
+#  type    : feat | fix | chore | ci | docs | refactor | test | perf
+#  scope   : 受影响的模块/功能，尽量与 Go 包或 DDD 分层对齐
+#            例：llmprovider、context-compactor、session、tui、
+#                stream-generate、ddd-arch、telemetry、tools
+#  subject : 英文、祈使句、首字母小写、结尾不加句号
+#            例：fall back to local tiktoken for CountInputTokens
+#
+# ── 正文（选填，每行 <= 72 字符）─────────────────────────────────────────
+#  说明「做了什么」与「为什么」，而非「怎么做」的代码细节。
+#  与标题行之间保留一个空行。
+#
+# ── 页脚（选填）──────────────────────────────────────────────────────────
+#  关联 issue：Closes #123 / Refs #456
+#  破坏性变更：BREAKING CHANGE: <说明>
+#
+# ── 示例 ─────────────────────────────────────────────────────────────────
+#  feat(llmprovider): fall back to local tiktoken for CountInputTokens
+#
+#  Compatible endpoints such as DeepSeek do not implement the Responses
+#  /responses/input_tokens counting endpoint and return 404, which aborted
+#  the ReAct loop during compaction. CountInputTokens now falls back to a
+#  local cl100k_base tiktoken estimate that reuses buildResponseParams for
+#  a consistent request shape.
+#
+#  提示：以 # 开头的行不会写入提交信息。
