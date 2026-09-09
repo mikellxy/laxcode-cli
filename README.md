@@ -46,6 +46,7 @@ export OPENAI_MODEL=gpt-4o-mini
 ```
 
 ### 1.3 终端交互模式
+<img src="examples/laxcode_intro.gif" alt="LaxCode 终端交互演示" width="960" style="max-width: 100%; height: auto;">
 ```shell
 make build
 
@@ -58,8 +59,6 @@ make build
 | `-session <id>` | 空 | 续聊指定会话；空则新建（id 为毫秒精度时间串） |
 | `-plan` | false | 开启 Plan Mode（见下）                        |
 | `-workdir` | cwd | 工作目录                                      |
-
-<a href="examples/laxcode_terminal_interaction.png"><img src="examples/laxcode_terminal_interaction.png" alt="LaxCode 终端交互演示" width="480"></a>
 
 ### 1.4 one-shot 模式
 ```shell
@@ -103,7 +102,8 @@ session 目录结构
 ```text
 ${workdir}/.laxcode/.session/
 └── ${session_id}/
-    ├── history.jsonl           # 对话历史 JSON LINES
+    ├── history.jsonl           # 对话历史 JSON LINES（不含系统提示词）
+    ├── sys_message.json        # 系统提示词，每次启动整体覆盖
     ├── meta.json               # token 用量统计、上下文窗口记录
     ├── log/
     │   └── tracing.log         # OTel span 本地落盘 JSON LINES
@@ -188,24 +188,41 @@ LaxCode 在 ReAct 循环中完整实现 openai function call 协议。启动时�
 laxcode 只依赖 OpenTelemetry API 模块，本体不提供真实上报后端的实现。默认由内置 filetrace 把 span 以 JSON Lines 落盘到 `${workdir}/.laxcode/.session/${session_id}/log/tracing.log`（见 2.1 节）。如需把 trace 上报到自建监控后端，按以下规范实现自定义 Handle：
 
 1. 实现 `trace.TracerProvider` / `trace.Tracer` / `trace.Span` 三个接口。接口是密封的（含未导出标记方法），须内嵌 `go.opentelemetry.io/otel/trace/embedded` 包中的对应接口来满足。`Span.End()` 是上报触发点——每次 span 结束被同步调用一次，实现内不要做阻塞 IO（建议只入队，后台 goroutine 批量发送）。
-2. 入口文件放入 `internal/tracing/custom/` 包，在 `func init()` 中调用 `tracing.Register("<name>", tracing.New(provider))` 注册——main.go 已空导入该包，init 随进程启动自动执行。
+2. 入口文件放入 `internal/infrastructure/tracing/custom/` 包，在 `func init()` 中调用 `tracing.Register("<name>", tracing.New(provider))` 注册——组合根 cmd/agentasm 已空导入该包，init 随进程启动自动执行。
 3. provider 实现 `Shutdown(context.Context) error` 方法时，进程退出前会被自动探测调用，用于 flush 尾部 span（one-shot 进程存活时间可能短于批量导出周期，必须靠它兜底）。
-4. 启动时加 `-trace_hanle_name=<name>` 选用注册的实现；缺省为 filetrace 本地落盘（当前仅终端交互模式支持该参数选用）。
-
-完整可编译示例（OTLP/HTTP JSON 批量上报至 Jaeger / Tempo / otel-collector 等协议兼容后端）见 [examples/tracing/](examples/tracing/)：拷入 `internal/tracing/custom/` 重新编译即可用。
+4. 注册成功的自定义 Handle 自动优先于默认 filetrace 被选用（无需启动参数）；未注册任何实现时缺省为 filetrace 本地落盘。
 
 ## 7. 架构
+代码按 DDD 分层组织，依赖方向为 `cmd → application → domain ← infrastructure`。
+
 ```
 LaxCode/
-├── cmd/main/              # 入口：装配 registry、provider、engine
+├── cmd/
+│   ├── main/              # 入口：解析配置，分流交互 / one-shot 模式
+│   ├── agentasm/          # 组合根：装配 session/tracer/tools/provider/ReActService
+│   ├── run_cli/           # 交互模式前端（REPL 循环、信号处理）
+│   └── run_oneshot/       # one-shot 模式前端（结果 JSON 契约输出、exit code）
 ├── internal/
-│   ├── engine/            # ReAct 循环、会话管理、工具调度、子 Agent
-│   ├── provider/          # LLM 接口抽象 + OpenAI 兼容 / Anthropic 双实现
-│   ├── context/           # 系统提示词组装、Skill 索引、上下文压缩、错误提示协议
-│   ├── tools/             # 工具注册表与 read/write/edit/bash 实现
-│   ├── schema/            # 与模型交互的消息、工具定义等中立数据结构
-│   ├── utils/             # 分页读取等无状态基础设施
-│   └── config/               # 配置加载
+│   ├── application/
+│   │   └── reactservice/  # ReAct 推理循环、子 Agent 委派
+│   ├── domain/
+│   │   ├── session/       # 会话聚合、SessionRepository 仓储接口
+│   │   ├── tools/         # 工具注册表与 read/write/edit/bash 行为契约，WorkFS / ShellRunner 端口
+│   │   ├── llmprovider/   # LLM 客户端接口
+│   │   ├── prompt/        # 系统提示词组装（人格 / Skill 索引 / Plan Mode），SkillSource 端口
+│   │   ├── compactor/     # 上下文压缩策略
+│   │   ├── telemetry/     # 观测词汇表：span 名、属性键、追踪辅助函数
+│   │   └── sharedkernel/  # 消息、工具定义、token 统计与估算等共享类型
+│   └── infrastructure/
+│       ├── llmprovider/   # OpenAI Responses 协议实现
+│       ├── sessionrepo/   # 会话文件仓储（JSONL 落盘）
+│       ├── workfs/        # WorkFS 端口的真实文件系统实现
+│       ├── shell/         # ShellRunner 端口实现：exec、进程组、超时杀进程
+│       ├── skillrepo/     # SkillSource 端口实现：扫描 .laxcode/skills
+│       ├── layout/        # 磁盘布局单一真源（.laxcode / .session / skills / tracing.log）
+│       ├── config/        # 配置加载（环境变量 / 配置文件 / CLI 参数）
+│       ├── cliprinter/    # 终端打印
+│       └── tracing/       # OTel 封装、filetrace 落盘、custom 扩展点
 └── openspec/              # 开发过程中的变更管理文档
 ```
 
@@ -220,7 +237,7 @@ flowchart TD
         direction TB
         compact["上下文压缩<br/>窗口占用 ≥ 80% 时触发"] --> gen["调用 LLM"]
         gen --> judge{"返回中是否<br/>携带工具调用"}
-        judge -->|"是"| exec["执行工具<br/>read_file 批次自动并行"]
+        judge -->|"是"| exec["执行工具"]
         exec --> writeback["工具结果写回会话"]
         writeback --> compact
     end
