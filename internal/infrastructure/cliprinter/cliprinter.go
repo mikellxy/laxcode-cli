@@ -3,6 +3,8 @@
 // ReAct 事件与每轮结束标志经 InChan 回流。已完成的历史（用户输入回显、对端整行）
 // 用 tea.Println 打印到终端 scrollback（受管视图上方、可上翻且持久保留），受管视图
 // 只保留正在流式的半行与输入区，行数恒定：既避免超屏每帧重绘闪烁，又保留完整可翻历史。
+// 输入光标由终端硬件光标（View.Cursor）呈现，不在内容里画反色块：inline 模式的单元格
+// 差分渲染在含宽字符的行上清除反色易打偏，按住方向键会留下成片残留高亮。
 package cliprinter
 
 import (
@@ -63,7 +65,7 @@ type model struct {
 	lines            []string // 输入区按行保存，行内按 rune 处理
 	row, col         int      // 光标位置：lines[row] 中第 col 个 rune 之前
 	width            int      // 终端宽度（列数），用于绘制与屏幕等宽的分隔线
-	height           int      // 终端高度（行数）：fitHeight 安全网，正常历史走 scrollback 不依赖它
+	height           int      // 终端高度（行数）：clipLines 安全网，正常历史走 scrollback 不依赖它
 	phase            phase    // 当前交互阶段
 	streamBuf        string   // 正在流式接收、尚未遇到换行的尾部：完整行即时打印到 scrollback，尾部半行由 View 实时显示
 	outChan          chan<- string
@@ -266,19 +268,19 @@ func (m *model) hline() string {
 	return strings.Repeat("─", m.termWidth())
 }
 
-// fitHeight 把内容裁剪到不超过终端高度的逻辑行数，只保留底部（最近的消息与输入
-// 区）。bubbletea 标准渲染器在内容高于屏幕时会丢弃顶部行并每帧全量重绘，导致
-// 持续闪烁，故必须限高。超宽行由渲染器截断（非折叠），逻辑行数即视觉行数；
-// 且各行内 ANSI 均自成一段（以 reset 收尾），按行裁剪不会破坏样式状态。
-func (m *model) fitHeight(content string) string {
-	if m.height <= 0 {
-		return content
+// clipLines 把行集裁剪到不超过终端高度的逻辑行数，只保留底部（最近的消息与输入区）。
+// bubbletea 标准渲染器在内容高于屏幕时会丢弃顶部行并每帧全量重绘，导致持续闪烁，
+// 故必须限高。超宽行由渲染器截断（非折叠），逻辑行数即视觉行数；且各行内 ANSI 均
+// 自成一段（以 reset 收尾），按行裁剪不会破坏样式状态。
+//
+// 返回保留的行与实际丢弃的行数：View 需要丢弃数把硬件光标行号同步下移。高度未知
+// （0）或未超高时原样返回，dropped 为 0。
+func (m *model) clipLines(lines []string) (kept []string, dropped int) {
+	if m.height <= 0 || len(lines) <= m.height {
+		return lines, 0
 	}
-	lines := strings.Split(content, "\n")
-	if len(lines) <= m.height {
-		return content
-	}
-	return strings.Join(lines[len(lines)-m.height:], "\n")
+	dropped = len(lines) - m.height
+	return lines[dropped:], dropped
 }
 
 // appendStream 把 chunk 追加到 streamBuf，并切出其中所有完整行（以 \n 结束）分别作为
@@ -328,8 +330,15 @@ func (m *model) userMessageView(text string) string {
 	return b.String()
 }
 
-// inputView 渲染输入区：提示符 ">" 固定在输入区第一行（不跟随光标行），
-// 光标所在字符用反色块高亮（行尾高亮空白），其余行缩进与 "> " 对齐。
+// inputView 渲染输入区：提示符 ">" 固定在输入区第一行（不跟随光标行），其余行缩进
+// 与 "> " 对齐。输出为纯文本，不含任何光标绘制。
+//
+// 光标不在这里画，而由 View 交给终端硬件光标（View.Cursor）。早期实现用行内反色
+// （SGR 7）高亮光标字符：inline 模式下 bubbletea 对 View 内容做单元格级差分渲染，
+// 反色高亮意味着每帧都要重写「新高亮 + 清除旧高亮」两个字符；含宽字符（CJK）的行
+// 在这种差分下清除写容易打偏（依赖渲染器光标模型与终端宽字符擦除语义严格一致），
+// 按住方向键时会累积出成片残留反色块。硬件光标移动不改动任何单元格，帧间差分天然
+// 为零，从源头消除该问题。
 func (m *model) inputView() string {
 	var b strings.Builder
 	for i, line := range m.lines {
@@ -339,19 +348,7 @@ func (m *model) inputView() string {
 		} else {
 			b.WriteString("  ")
 		}
-		if i == m.row {
-			// 光标所在行：反色显示光标处字符，行尾高亮一个空格占位
-			runes := []rune(line)
-			b.WriteString(string(runes[:m.col]))
-			if m.col < len(runes) {
-				b.WriteString("\x1b[7m" + string(runes[m.col]) + "\x1b[0m")
-				b.WriteString(string(runes[m.col+1:]))
-			} else {
-				b.WriteString("\x1b[7m \x1b[0m")
-			}
-		} else {
-			b.WriteString(line)
-		}
+		b.WriteString(line)
 		if i < len(m.lines)-1 {
 			b.WriteString("\n")
 		}
@@ -359,20 +356,55 @@ func (m *model) inputView() string {
 	return b.String()
 }
 
+// promptWidth 是输入行提示符（"> " / "  "）占用的列数。
+const promptWidth = 2
+
+// cursorCell 返回硬件光标在帧内的坐标：inputStart 为输入区首行在帧内的行号（裁剪前）。
+// 列号 = 提示符宽度 + 光标前文本的显示宽度（宽字符按 2 列计）；位于行尾时光标落在
+// 文本右侧的空白单元格上。ok 为 false 表示输入区为空、无处安放光标（此时不设置
+// View.Cursor，保持光标隐藏）。
+//
+// row/col 先夹到合法区间：View 必须永不 panic（调用方可能给出越界坐标）。
+func (m *model) cursorCell(inputStart int) (x, y int, ok bool) {
+	if len(m.lines) == 0 {
+		return 0, 0, false
+	}
+	row := min(max(m.row, 0), len(m.lines)-1)
+	runes := []rune(m.lines[row])
+	col := min(max(m.col, 0), len(runes))
+	return promptWidth + ansi.StringWidth(string(runes[:col])), inputStart + row, true
+}
+
+// View 组装流式缓冲行与输入区（上下各一条等宽分隔线），并把光标位置交给终端硬件光标。
+//
+// 帧布局（行号自 0 起）：[流式半行?] [分隔线] [输入区 len(m.lines) 行] [分隔线]，
+// 故光标行号 = 输入区起始行 + 当前行；内容超高被裁剪时再按丢弃行数下移。
 func (m *model) View() tea.View {
-	var b strings.Builder
+	lines := make([]string, 0, len(m.lines)+3)
 	// 已完成的历史（用户输入回显、对端整行）都已打印到 scrollback，可上翻；View 只保留
 	// 正在流式的半行 + 输入区，行数恒定不超屏，从根本上避免渲染器每帧全量重绘闪烁。
 	if m.streamBuf != "" {
 		// 正在流式接收、尚未换行的尾部：实时显示在输入区上方（完整后即滚入 scrollback）
-		b.WriteString(m.streamBuf + "\n")
+		lines = append(lines, m.streamBuf)
 	}
 	// 输入区上下各画一条与屏幕等宽的实线分隔符
-	b.WriteString(m.hline() + "\n")
-	b.WriteString(m.inputView() + "\n")
-	b.WriteString(m.hline())
-	// 安全网：多行输入过高时仍限制逻辑行数不超过终端高度，避免超屏重绘
-	return tea.NewView(m.fitHeight(b.String()))
+	lines = append(lines, m.hline())
+	inputStart := len(lines)
+	lines = append(lines, strings.Split(m.inputView(), "\n")...)
+	lines = append(lines, m.hline())
+
+	// 安全网：多行输入过高时仍限制逻辑行数不超过终端高度，避免超屏重绘；裁剪会丢弃
+	// 顶部行，故光标行号同步下移，光标行本身被裁掉时不显示硬件光标（避免指向帧外）。
+	lines, dropped := m.clipLines(lines)
+	v := tea.NewView(strings.Join(lines, "\n"))
+	if x, y, ok := m.cursorCell(inputStart); ok && y-dropped >= 0 {
+		cur := tea.NewCursor(x, y-dropped)
+		// 稳定（不闪烁）块状光标：贴近原来反色块的观感；且因为不是终端默认的
+		// “闪烁块”（DECSCUSR 1），bubbletea 退出时会把光标形状还原为终端默认。
+		cur.Blink = false
+		v.Cursor = cur
+	}
+	return v
 }
 
 // TUI 封装 bubbletea Program，对外提供阻塞式 Run。它只持有 send 端的 OutChan
