@@ -11,10 +11,19 @@ import (
 )
 
 type envAndFileConf struct {
-	OpenaiApiKey  string `mapstructure:"openai_api_key"`
-	OpenaiBaseUrl string `mapstructure:"openai_base_url"`
-	OpenaiModel   string `mapstructure:"openai_model"`
+	OpenaiApiKey          string `mapstructure:"openai_api_key"`
+	OpenaiBaseUrl         string `mapstructure:"openai_base_url"`
+	OpenaiModel           string `mapstructure:"openai_model"`
+	OpenaiContextWindow   int    `mapstructure:"openai_context_window"`
+	OpenaiMaxOutputTokens int    `mapstructure:"openai_max_output_tokens"`
 }
+
+const (
+	// 兼容端点的 /models 响应不会标准化暴露 context window，
+	// 因此给出保守默认值，并允许按实际部署显式配置。
+	DefaultContextWindow   = 128_000
+	DefaultMaxOutputTokens = 16_384
+)
 
 var EnvAndFileConf envAndFileConf
 
@@ -52,13 +61,24 @@ func ParseEnvAndFile() error {
 		}
 	}
 
+	EnvOrFile.SetDefault("openai_context_window", DefaultContextWindow)
+	EnvOrFile.SetDefault("openai_max_output_tokens", DefaultMaxOutputTokens)
 	EnvOrFile.BindEnv("openai_api_key", "OPENAI_API_KEY")
 	EnvOrFile.BindEnv("openai_base_url", "OPENAI_BASE_URL")
 	EnvOrFile.BindEnv("openai_model", "OPENAI_MODEL")
+	EnvOrFile.BindEnv("openai_context_window", "OPENAI_CONTEXT_WINDOW")
+	EnvOrFile.BindEnv("openai_max_output_tokens", "OPENAI_MAX_OUTPUT_TOKENS")
 	EnvOrFile.SetEnvKeyReplacer(strings.NewReplacer("_", "_"))
 
 	if err = EnvOrFile.Unmarshal(&EnvAndFileConf); err != nil {
 		return err
+	}
+	if EnvAndFileConf.OpenaiContextWindow <= 0 {
+		return errors.New("openai_context_window must be positive")
+	}
+	if EnvAndFileConf.OpenaiMaxOutputTokens <= 0 ||
+		EnvAndFileConf.OpenaiMaxOutputTokens >= EnvAndFileConf.OpenaiContextWindow {
+		return errors.New("openai_max_output_tokens must be positive and smaller than openai_context_window")
 	}
 
 	return nil

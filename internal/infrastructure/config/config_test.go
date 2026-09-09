@@ -51,6 +51,10 @@ func TestParseEnvAndFileFromEnv(t *testing.T) {
 		EnvAndFileConf.OpenaiModel != "gpt-env" {
 		t.Errorf("base url/model 应从环境读取，实际 %+v", EnvAndFileConf)
 	}
+	if EnvAndFileConf.OpenaiContextWindow != DefaultContextWindow ||
+		EnvAndFileConf.OpenaiMaxOutputTokens != DefaultMaxOutputTokens {
+		t.Errorf("context budget defaults not applied: %+v", EnvAndFileConf)
+	}
 }
 
 func TestParseEnvAndFileEnvOverridesFile(t *testing.T) {
@@ -98,6 +102,29 @@ func TestParseEnvAndFileCorruptFileReturnsError(t *testing.T) {
 
 	if err := ParseEnvAndFile(); err == nil {
 		t.Fatal("settings.json 非法时应返回错误")
+	}
+}
+
+func TestParseEnvAndFileContextBudgetFromEnv(t *testing.T) {
+	swapConfigGlobals(t)
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("OPENAI_CONTEXT_WINDOW", "1000000")
+	t.Setenv("OPENAI_MAX_OUTPUT_TOKENS", "32768")
+	if err := ParseEnvAndFile(); err != nil {
+		t.Fatalf("ParseEnvAndFile: %v", err)
+	}
+	if EnvAndFileConf.OpenaiContextWindow != 1_000_000 || EnvAndFileConf.OpenaiMaxOutputTokens != 32_768 {
+		t.Fatalf("context budget env was not applied: %+v", EnvAndFileConf)
+	}
+}
+
+func TestParseEnvAndFileRejectsInvalidContextBudget(t *testing.T) {
+	swapConfigGlobals(t)
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("OPENAI_CONTEXT_WINDOW", "1000")
+	t.Setenv("OPENAI_MAX_OUTPUT_TOKENS", "1000")
+	if err := ParseEnvAndFile(); err == nil {
+		t.Fatal("max output equal to context window must fail")
 	}
 }
 

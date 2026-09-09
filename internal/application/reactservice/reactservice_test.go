@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/mikellxy/laxcode/internal/domain/llmprovider"
 	"github.com/mikellxy/laxcode/internal/domain/session"
 	"github.com/mikellxy/laxcode/internal/domain/sharedkernel"
 	"github.com/mikellxy/laxcode/internal/domain/tools"
@@ -158,6 +159,19 @@ func (f streamFunc) Generate(context.Context, []sharedkernel.Message, []sharedke
 
 func (f streamFunc) GenerateStream(ctx context.Context, msgs []sharedkernel.Message, defs []sharedkernel.ToolDefinition, emit func(sharedkernel.StreamChunk)) (*sharedkernel.Message, error) {
 	return f(ctx, msgs, defs, emit)
+}
+
+func (f streamFunc) CountInputTokens(_ context.Context, msgs []sharedkernel.Message, _ []sharedkernel.ToolDefinition) (int, error) {
+	count := 0
+	for _, msg := range msgs {
+		count += sharedkernel.EstimateTokenInt(msg.Content)
+		count += sharedkernel.EstimateTokenInt(msg.ReasoningContent)
+	}
+	return count, nil
+}
+
+func (f streamFunc) ContextBudget() llmprovider.ContextBudget {
+	return llmprovider.ContextBudget{ContextWindow: 200_000, ReservedOutputTokens: 20_000}
 }
 
 func TestRunForwardsChunksBeforeStreamReturns(t *testing.T) {
@@ -506,39 +520,85 @@ func TestRunPropagatesMetaPersistError(t *testing.T) {
 	}
 }
 
-// 窗口占用顶到阈值以上时，压缩应在聚合内完成、再把裁剪后的序列发给模型。
+// provider 对完整下一请求的计数达到高水位时，应压缩并重计数。
 func TestRunCompactsHistoryBeforeGenerate(t *testing.T) {
 	repo := newMemRepo()
 	sess := newTestSession("s-compact", repo)
 	appendOrFatal(t, sess, &sharedkernel.Message{Role: sharedkernel.RoleUser, Content: "q"})
+	appendOrFatal(t, sess, assistantMsgWithTool(sharedkernel.ToolCall{ID: "old", Name: "old-tool"}))
 	appendOrFatal(t, sess, &sharedkernel.Message{
-		Role: sharedkernel.RoleUser, ToolCallID: "c1", Content: strings.Repeat("工具输出", 2000),
+		Role: sharedkernel.RoleTool, ToolCallID: "old", Content: strings.Repeat("工具输出", 2000),
 	})
-	// 本轮实测用量顶到 maxWindowToken(200k) 的 80% 以上 → 下一轮开始前必须压缩
-	appendOrFatal(t, sess, &sharedkernel.Message{
-		Role:      sharedkernel.RoleAssistant,
-		Content:   "a",
-		TokenUsed: sharedkernel.TokenStatistics{TokenInput: 190_000, TokenOutput: 1_000},
-	})
+	appendOrFatal(t, sess, assistantMsgWithTool(sharedkernel.ToolCall{ID: "latest", Name: "latest-tool"}))
+	appendOrFatal(t, sess, &sharedkernel.Message{Role: sharedkernel.RoleTool, ToolCallID: "latest", Content: "fresh"})
 
-	llm := &scriptedLLM{responses: []scriptedResp{{msg: assistantMsg("done")}}}
+	llm := &scriptedLLM{
+		responses: []scriptedResp{{msg: assistantMsg("done")}},
+		budget:    llmprovider.ContextBudget{ContextWindow: 100, ReservedOutputTokens: 10},
+		countFn: func(msgs []sharedkernel.Message, _ []sharedkernel.ToolDefinition) (int, error) {
+			for _, msg := range msgs {
+				if strings.Contains(msg.Content, "早期工具输出已清理") {
+					return 50, nil
+				}
+			}
+			return 80, nil
+		},
+	}
 	svc := NewReActService(sess, repo, llm, tools.NewDefaultRegistry(nil), func(*ReactEvent) {}, nil)
 	if _, err := svc.think(context.Background()); err != nil {
 		t.Fatalf("think: %v", err)
 	}
 
-	if len(llm.lastMsgs) != 4 {
-		t.Fatalf("发给模型的消息数不符（system+user+tool+assistant），实际 %d", len(llm.lastMsgs))
+	if len(llm.lastMsgs) != 6 {
+		t.Fatalf("发给模型的消息数不符，实际 %d", len(llm.lastMsgs))
 	}
-	if !strings.Contains(llm.lastMsgs[2].Content, "已被系统清理") {
-		t.Errorf("早期超长工具输出应在发给模型前被清理，实际：%q", llm.lastMsgs[2].Content[:40])
+	if !strings.Contains(llm.lastMsgs[3].Content, "早期工具输出已清理") {
+		t.Errorf("早给模型前应清理早期超长工具输出，实际：%q", llm.lastMsgs[3].Content)
 	}
-	// 聚合内序列与发给模型的一致（压缩改写发生在聚合内）
-	if !strings.Contains(sess.Messages[2].Content, "已被系统清理") {
-		t.Errorf("压缩结果应回写聚合，实际：%q", sess.Messages[2].Content[:40])
+	if llm.lastMsgs[5].Content != "fresh" {
+		t.Fatal("最新工具 span 的结果不应随旧 span 被清理")
+	}
+	if !strings.Contains(sess.Messages[3].Content, "早期工具输出已清理") {
+		t.Errorf("压缩结果应回写聚合，实际：%q", sess.Messages[3].Content[:40])
+	}
+	if llm.countCalls != 2 {
+		t.Fatalf("压缩前后应各精确计数一次，实际 %d", llm.countCalls)
 	}
 	if sess.Messages[0].Role != sharedkernel.RoleSystem {
 		t.Errorf("压缩不得弄丢系统提示词，实际首条：%+v", sess.Messages[0])
+	}
+}
+
+func TestRunDoesNotGenerateWhenCompactionCannotReachExactTarget(t *testing.T) {
+	repo := newMemRepo()
+	sess := newTestSession("s-compact-unreachable", repo)
+	appendOrFatal(t, sess, &sharedkernel.Message{Role: sharedkernel.RoleUser, Content: "q"})
+	appendOrFatal(t, sess, assistantMsgWithTool(sharedkernel.ToolCall{ID: "old", Name: "old-tool"}))
+	appendOrFatal(t, sess, &sharedkernel.Message{
+		Role: sharedkernel.RoleTool, ToolCallID: "old", Content: strings.Repeat("large-output", 1000),
+	})
+	appendOrFatal(t, sess, assistantMsgWithTool(sharedkernel.ToolCall{ID: "latest", Name: "latest-tool"}))
+	appendOrFatal(t, sess, &sharedkernel.Message{Role: sharedkernel.RoleTool, ToolCallID: "latest", Content: "fresh"})
+
+	llm := &scriptedLLM{
+		responses: []scriptedResp{{msg: assistantMsg("must not be generated")}},
+		budget:    llmprovider.ContextBudget{ContextWindow: 100, ReservedOutputTokens: 10},
+		countFn: func(msgs []sharedkernel.Message, _ []sharedkernel.ToolDefinition) (int, error) {
+			for _, msg := range msgs {
+				if strings.Contains(msg.Content, "早期工具输出已清理") {
+					return 70, nil
+				}
+			}
+			return 80, nil
+		},
+	}
+	svc := NewReActService(sess, repo, llm, tools.NewDefaultRegistry(nil), func(*ReactEvent) {}, nil)
+	_, err := svc.think(context.Background())
+	if !errors.Is(err, ErrContextTargetNotReach) {
+		t.Fatalf("expected target-not-reached error, got %v", err)
+	}
+	if llm.calls != 0 {
+		t.Fatalf("generation must not run above exact target, calls=%d", llm.calls)
 	}
 }
 

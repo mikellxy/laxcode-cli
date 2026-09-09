@@ -1,176 +1,139 @@
 package compactor
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/mikellxy/laxcode/internal/domain/session"
 	"github.com/mikellxy/laxcode/internal/domain/sharedkernel"
 )
 
-// compressMsgs 生成一段典型的 ReAct 历史：user 提问 → 工具输出 → assistant 回答。
-func compressMsgs() []sharedkernel.Message {
-	return []sharedkernel.Message{
-		{Role: sharedkernel.RoleUser, Content: "用户提问：请帮我统计一下"},
-		{Role: sharedkernel.RoleUser, ToolCallID: "call-1", Content: strings.Repeat("工具大输出", 500)},
-		{Role: sharedkernel.RoleAssistant, Content: "assistant 回答", ReasoningContent: strings.Repeat("思考过程", 200)},
-		{Role: sharedkernel.RoleUser, ToolCallID: "call-2", Content: strings.Repeat("工具输出2", 300)},
-		{Role: sharedkernel.RoleAssistant, Content: "final", ReasoningContent: "最新推理"},
+func assistantToolTurn(ids ...string) sharedkernel.Message {
+	calls := make([]sharedkernel.ToolCall, 0, len(ids))
+	for _, id := range ids {
+		calls = append(calls, sharedkernel.ToolCall{
+			ID: id, Name: "tool_" + id, Arguments: json.RawMessage(`{"value":"x"}`),
+		})
 	}
+	return sharedkernel.Message{Role: sharedkernel.RoleAssistant, ToolCalls: calls}
 }
 
-func TestCompressBelowThresholdNoop(t *testing.T) {
-	msgs := compressMsgs()
-	win := sharedkernel.TokenStatistics{TokenInput: 100, TokenOutput: 50}
-	out, res, err := SimpleCompactor.Compress(msgs, 200_000, win)
+func TestCompressZeroSavingsIsNoopAndDoesNotAliasSlice(t *testing.T) {
+	msgs := []sharedkernel.Message{{Role: sharedkernel.RoleUser, Content: "question"}}
+	out, saved, err := SimpleCompactor.Compress(msgs, 0)
 	if err != nil {
 		t.Fatalf("Compress: %v", err)
 	}
-	if res.Total() != 0 {
-		t.Errorf("未达阈值不应压缩，实际节省 %d", res.Total())
+	if saved != 0 || out[0].Content != msgs[0].Content {
+		t.Fatalf("零目标不应压缩：saved=%d out=%+v", saved, out)
 	}
-	// 原地返回同一切片
-	if len(out) != len(msgs) {
-		t.Errorf("消息数量应不变，实际 %d", len(out))
+	out[0].Content = "changed"
+	if msgs[0].Content != "question" {
+		t.Fatal("返回切片不应与原始历史别名")
 	}
-	for i := range msgs {
-		if out[i].Content != msgs[i].Content {
-			t.Errorf("未达阈值不应改动内容：第 %d 条", i)
+}
+
+func TestCompressUsesRoleToolAndKeepsLatestParallelSpan(t *testing.T) {
+	oldOutput := strings.Repeat("旧结果", 500)
+	latestA := strings.Repeat("A", 800)
+	latestB := strings.Repeat("B", 800)
+	msgs := []sharedkernel.Message{
+		{Role: sharedkernel.RoleUser, Content: "q"},
+		assistantToolTurn("old"),
+		{Role: sharedkernel.RoleTool, ToolCallID: "old", Content: oldOutput},
+		{Role: sharedkernel.RoleAssistant, Content: "old done"},
+		assistantToolTurn("new-a", "new-b"),
+		{Role: sharedkernel.RoleTool, ToolCallID: "new-a", Content: latestA},
+		{Role: sharedkernel.RoleTool, ToolCallID: "new-b", Content: latestB},
+	}
+
+	out, saved, err := SimpleCompactor.Compress(msgs, 1)
+	if err != nil {
+		t.Fatalf("Compress: %v", err)
+	}
+	if saved <= 0 || !strings.Contains(out[2].Content, "早期工具输出已清理") {
+		t.Fatalf("真实 RoleTool 的旧 span 应被清理：saved=%d content=%q", saved, out[2].Content)
+	}
+	if out[5].Content != latestA || out[6].Content != latestB {
+		t.Fatal("同一最新并行 tool-call span 的所有结果应一起完整保留")
+	}
+	if len(out[4].ToolCalls) != 2 || out[5].ToolCallID != "new-a" || out[6].ToolCallID != "new-b" {
+		t.Fatalf("function call/result 配对被破坏：%+v", out[4:])
+	}
+}
+
+func TestCompressLatestParallelSpanTruncatesEveryLargeResultUTF8Safely(t *testing.T) {
+	largeA := strings.Repeat("你🙂", 900)
+	largeB := strings.Repeat("界🚀", 900)
+	msgs := []sharedkernel.Message{
+		{Role: sharedkernel.RoleUser, Content: "q"},
+		assistantToolTurn("a", "b"),
+		{Role: sharedkernel.RoleTool, ToolCallID: "a", Content: largeA},
+		{Role: sharedkernel.RoleTool, ToolCallID: "b", Content: largeB},
+	}
+
+	out, saved, err := SimpleCompactor.Compress(msgs, 1_000_000)
+	if err != nil {
+		t.Fatalf("Compress: %v", err)
+	}
+	if saved <= 0 {
+		t.Fatal("large latest tool results should be truncated")
+	}
+	for _, idx := range []int{2, 3} {
+		if !utf8.ValidString(out[idx].Content) {
+			t.Fatalf("result %d is not valid UTF-8", idx)
+		}
+		if !strings.Contains(out[idx].Content, "...") {
+			t.Fatalf("result %d was not truncated", idx)
 		}
 	}
+	if len(out[1].ToolCalls) != 2 || out[2].ToolCallID != "a" || out[3].ToolCallID != "b" {
+		t.Fatal("truncation must preserve the complete tool-call span")
+	}
 }
 
-// 阈值判据读的是窗口占用总量（Total），故输出侧占用同样能触发压缩。
-func TestCompressThresholdCountsBothSides(t *testing.T) {
+func TestCompressClearsOldReasoningWithinSingleUserTask(t *testing.T) {
 	msgs := []sharedkernel.Message{
-		{Role: sharedkernel.RoleUser, Content: "q"},
-		{Role: sharedkernel.RoleUser, ToolCallID: "c1", Content: strings.Repeat("工具输出", 500)},
+		{Role: sharedkernel.RoleUser, Content: "one long task"},
+		{Role: sharedkernel.RoleAssistant, ReasoningContent: strings.Repeat("old reasoning", 200)},
+		{Role: sharedkernel.RoleAssistant, ReasoningContent: "latest reasoning"},
 	}
-	// 输入侧 0、输出侧 200：合计达到 maxToken=100 的 80% 以上 → 应压缩
-	_, res, err := SimpleCompactor.Compress(msgs, 100, sharedkernel.TokenStatistics{TokenOutput: 200})
+	out, saved, err := SimpleCompactor.Compress(msgs, 1)
 	if err != nil {
 		t.Fatalf("Compress: %v", err)
 	}
-	if res.Total() <= 0 {
-		t.Errorf("输出侧占用也应触发压缩，实际 %+v", res)
+	if saved <= 0 || out[1].ReasoningContent != "" {
+		t.Fatal("old reasoning must be cleared within a single long user task")
+	}
+	if out[2].ReasoningContent != "latest reasoning" {
+		t.Fatal("the latest assistant reasoning must be retained")
 	}
 }
 
-func TestCompressAboveThresholdCleansOldToolOutput(t *testing.T) {
-	// 历史形如：q1 → 工具输出1 → 早期回答 → q2(最后人类输入) → 工具输出2 → final
+func TestCompressKeepsSystemAndUserMessages(t *testing.T) {
+	system := strings.Repeat("system", 1000)
+	user := strings.Repeat("user", 1000)
 	msgs := []sharedkernel.Message{
-		{Role: sharedkernel.RoleUser, Content: "q1"},
-		{Role: sharedkernel.RoleUser, ToolCallID: "call-1", Content: strings.Repeat("工具输出1", 500)},
-		{Role: sharedkernel.RoleAssistant, Content: "assistant 早期回答", ReasoningContent: strings.Repeat("早期思考", 200)},
-		{Role: sharedkernel.RoleUser, Content: "q2"},
-		{Role: sharedkernel.RoleUser, ToolCallID: "call-2", Content: strings.Repeat("工具输出2", 300)},
-		{Role: sharedkernel.RoleAssistant, Content: "final", ReasoningContent: "最新推理"},
+		{Role: sharedkernel.RoleSystem, Content: system},
+		{Role: sharedkernel.RoleUser, Content: user},
 	}
-	win := sharedkernel.TokenStatistics{TokenInput: 200_000, TokenOutput: 0}
-	out, res, err := SimpleCompactor.Compress(msgs, 200_000, win)
+	out, saved, err := SimpleCompactor.Compress(msgs, 1_000_000)
 	if err != nil {
 		t.Fatalf("Compress: %v", err)
 	}
-	if res.Total() <= 0 {
-		t.Fatal("超过阈值应产生压缩收益")
-	}
-	// 早于最后一条（in-memory）的工具输出被替换为清理说明
-	for _, idx := range []int{1, 4} {
-		if !strings.Contains(out[idx].Content, "已被系统清理") {
-			t.Errorf("第 %d 条（非 in-memory 工具输出）应被清理说明替换，实际：%q", idx+1, out[idx].Content[:60])
-		}
-	}
-	// 最后一条消息完整保留
-	if out[len(out)-1].Content != "final" {
-		t.Errorf("最后一条消息应完整保留，实际：%q", out[len(out)-1].Content)
-	}
-	// 早于最后一次人类输入的旧 reasoning 被丢弃
-	if out[2].ReasoningContent != "" {
-		t.Errorf("陈旧 reasoning 应被清空，实际：%q", out[2].ReasoningContent)
-	}
-	if out[len(out)-1].ReasoningContent != "最新推理" {
-		t.Errorf("最后一次人类输入之后的 reasoning 应保留，实际：%q", out[len(out)-1].ReasoningContent)
-	}
-	// 输入输出两侧都应记录压缩收益
-	if res.TokenInput <= 0 || res.TokenOutput <= 0 {
-		t.Errorf("输入输出两侧都应记录压缩收益：%+v", res)
+	if saved != 0 || out[0].Content != system || out[1].Content != user {
+		t.Fatal("system and user messages must not be truncated")
 	}
 }
 
-func TestCompressInMemoryToolOutputTruncatesOnlyLong(t *testing.T) {
-	// 只有 2 条消息：最后一条（in-memory）为超长工具输出 → 应截断保留头尾
-	long := strings.Repeat("x", 3000)
-	msgs := []sharedkernel.Message{
-		{Role: sharedkernel.RoleUser, Content: "q"},
-		{Role: sharedkernel.RoleUser, ToolCallID: "c1", Content: long},
-	}
-	out, res, err := SimpleCompactor.Compress(msgs, 1, sharedkernel.TokenStatistics{TokenInput: 100, TokenOutput: 0})
-	if err != nil {
-		t.Fatalf("Compress: %v", err)
-	}
-	if res.Total() <= 0 {
-		t.Fatal("长工具输出应触发截断")
-	}
-	if !strings.Contains(out[1].Content, "输出过长") {
-		t.Errorf("应截断并标注，实际开头：%q", out[1].Content[:100])
-	}
-	if !strings.HasSuffix(out[1].Content, strings.Repeat("x", 500)) {
-		t.Error("截断应保留末尾 500 字节")
+func TestCompressRejectsNegativeSavings(t *testing.T) {
+	if _, _, err := SimpleCompactor.Compress(nil, -1); err == nil {
+		t.Fatal("negative savings target must fail")
 	}
 }
 
-func TestCompressShortInMemoryToolOutputKept(t *testing.T) {
-	msgs := []sharedkernel.Message{
-		{Role: sharedkernel.RoleUser, Content: "q"},
-		{Role: sharedkernel.RoleUser, ToolCallID: "c1", Content: "short tool output"},
-	}
-	out, res, err := SimpleCompactor.Compress(msgs, 1, sharedkernel.TokenStatistics{TokenInput: 100, TokenOutput: 0})
-	if err != nil {
-		t.Fatalf("Compress: %v", err)
-	}
-	if res.Total() != 0 {
-		t.Errorf("in-memory 短工具输出不应压缩，实际 %+v", res)
-	}
-	if out[1].Content != "short tool output" {
-		t.Errorf("内容不应被改动，实际 %q", out[1].Content)
-	}
-}
-
-func TestCompressLongAssistantOutputTruncated(t *testing.T) {
-	long := strings.Repeat("a", 2000)
-	msgs := []sharedkernel.Message{
-		{Role: sharedkernel.RoleUser, Content: "q"},
-		{Role: sharedkernel.RoleAssistant, Content: long},
-		{Role: sharedkernel.RoleUser, Content: "next"},
-	}
-	_, res, err := SimpleCompactor.Compress(msgs, 1, sharedkernel.TokenStatistics{TokenInput: 100, TokenOutput: 0})
-	if err != nil {
-		t.Fatalf("Compress: %v", err)
-	}
-	if res.TokenOutput <= 0 {
-		t.Errorf("非 in-memory 超长 assistant 输出应计入 output 侧压缩，实际 %+v", res)
-	}
-}
-
-// 压缩不得改动系统消息：它是每轮启动重写的人格提示词，不参与裁剪。
-func TestCompressKeepsSystemMessage(t *testing.T) {
-	sys := "系统提示词" + strings.Repeat("长", 2000)
-	msgs := []sharedkernel.Message{
-		{Role: sharedkernel.RoleSystem, Content: sys},
-		{Role: sharedkernel.RoleUser, Content: "q"},
-		{Role: sharedkernel.RoleUser, ToolCallID: "c1", Content: strings.Repeat("工具输出", 500)},
-	}
-	out, _, err := SimpleCompactor.Compress(msgs, 1, sharedkernel.TokenStatistics{TokenInput: 100})
-	if err != nil {
-		t.Fatalf("Compress: %v", err)
-	}
-	if out[0].Role != sharedkernel.RoleSystem || out[0].Content != sys {
-		t.Errorf("系统消息应原样保留，实际 %q", out[0].Content[:40])
-	}
-}
-
-// 契约测试：SimpleCompactor 必须满足消费方（session 聚合）定义的 Compactor
-// 端口。两包互不 import，靠这条编译期断言守住签名不漂移。
 func TestSatisfiesSessionCompactorPort(t *testing.T) {
 	var _ session.Compactor = SimpleCompactor
 }

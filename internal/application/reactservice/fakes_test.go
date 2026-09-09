@@ -118,9 +118,12 @@ func (m *memRepo) storedMeta(sessionID string) (sharedkernel.SessionMeta, bool) 
 // lastMsgs 记录最近一次 Generate 实际收到的消息序列，供断言“发给模型前
 // 已经压缩 / 系统提示词居首”。
 type scriptedLLM struct {
-	responses []scriptedResp
-	calls     int
-	lastMsgs  []sharedkernel.Message
+	responses  []scriptedResp
+	calls      int
+	lastMsgs   []sharedkernel.Message
+	countCalls int
+	countFn    func([]sharedkernel.Message, []sharedkernel.ToolDefinition) (int, error)
+	budget     llmprovider.ContextBudget
 }
 
 type scriptedResp struct {
@@ -158,6 +161,34 @@ func (s *scriptedLLM) GenerateStream(ctx context.Context, msgs []sharedkernel.Me
 		emit(sharedkernel.StreamChunk{Kind: sharedkernel.ChunkToolCall, ToolCall: &tc})
 	}
 	return msg, nil
+}
+
+func (s *scriptedLLM) CountInputTokens(_ context.Context, msgs []sharedkernel.Message, defs []sharedkernel.ToolDefinition) (int, error) {
+	s.countCalls++
+	if s.countFn != nil {
+		return s.countFn(msgs, defs)
+	}
+	count := 0
+	for _, msg := range msgs {
+		count += sharedkernel.EstimateTokenInt(msg.Content)
+		count += sharedkernel.EstimateTokenInt(msg.ReasoningContent)
+		for _, call := range msg.ToolCalls {
+			count += sharedkernel.EstimateTokenInt(call.Name)
+			count += sharedkernel.EstimateTokenInt(string(call.Arguments))
+		}
+	}
+	for _, def := range defs {
+		data, _ := json.Marshal(def)
+		count += sharedkernel.EstimateTokenInt(string(data))
+	}
+	return count, nil
+}
+
+func (s *scriptedLLM) ContextBudget() llmprovider.ContextBudget {
+	if s.budget.ContextWindow == 0 {
+		return llmprovider.ContextBudget{ContextWindow: 200_000, ReservedOutputTokens: 20_000}
+	}
+	return s.budget
 }
 
 func assistantMsg(content string) *sharedkernel.Message {

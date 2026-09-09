@@ -2,6 +2,7 @@ package reactservice
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -27,14 +28,17 @@ type ReActService struct {
 	tracer telemetry.Tracer
 }
 
+var (
+	ErrInvalidContextBudget  = errors.New("reactservice: invalid model context budget")
+	ErrContextTargetNotReach = errors.New("reactservice: context compaction target cannot be reached")
+)
+
 const (
 	ReActEventTypeChunk    = "chunk"
 	ReActEventTypeToolCall = "tool_call"
+	contextTriggerPercent  = 80
+	contextTargetPercent   = 60
 )
-
-// maxWindowToken 是触发上下文压缩的窗口 token 预算，暂写死 200k，
-// 未来再做动态配置。
-const maxWindowToken = 200_000
 
 type ReactEvent struct {
 	Type       string
@@ -134,15 +138,16 @@ func (r *ReActService) think(ctx context.Context) (*sharedkernel.Message, error)
 				telemetry.WithErr(err))
 		}
 
-		// 上下文压缩：每轮 generate 前压缩历史（对齐老 engine.Run），触发
-		// 阈值 maxWindowToken；压缩在聚合内改写 Messages 并同步扣减窗口占用。
-		if err := r.Session.Compact(compactor.SimpleCompactor, maxWindowToken); err != nil {
+		// 每轮固定一份工具定义：精确计数与随后的生成请求必须
+		// 序列化同一份 tools，不能让 registry map 的遍历顺序在两次读取间漂移。
+		toolDefs := r.ToolRegistry.GetAvailableTools()
+		if err := r.compactContext(turnCtx, toolDefs); err != nil {
 			reActErr = err
 			closeTurn(err)
 			return nil, err
 		}
 
-		msg, err := r.LLMClient.GenerateStream(turnCtx, r.Session.Messages, r.ToolRegistry.GetAvailableTools(), func(chunkEvent sharedkernel.StreamChunk) {
+		msg, err := r.LLMClient.GenerateStream(turnCtx, r.Session.Messages, toolDefs, func(chunkEvent sharedkernel.StreamChunk) {
 			r.ReActEventConsumerF(&ReactEvent{Type: ReActEventTypeChunk, ChunkEvent: &chunkEvent})
 		})
 		if err != nil {
@@ -185,6 +190,53 @@ func (r *ReActService) think(ctx context.Context) (*sharedkernel.Message, error)
 		}
 		closeTurn(nil)
 	}
+}
+
+// compactContext 以“下一个完整 provider 请求”为计数口径。占用达到
+// 可用输入的 80% 时开始压缩，目标回落到 60%；高低水位避免
+// 长会话在每一轮都重复裁剪。每次策略修改后都请 provider 重新计数，
+// 未确认达到目标前绝不发送生成请求。
+func (r *ReActService) compactContext(ctx context.Context, toolDefs []sharedkernel.ToolDefinition) error {
+	budget := r.LLMClient.ContextBudget()
+	maxInput := budget.MaxInputTokens()
+	if budget.ContextWindow <= 0 || budget.ReservedOutputTokens <= 0 || maxInput <= 0 {
+		return fmt.Errorf("%w: context_window=%d reserved_output_tokens=%d",
+			ErrInvalidContextBudget, budget.ContextWindow, budget.ReservedOutputTokens)
+	}
+
+	current, err := r.LLMClient.CountInputTokens(ctx, r.Session.Messages, toolDefs)
+	if err != nil {
+		return fmt.Errorf("count context before compaction: %w", err)
+	}
+	trigger := maxInput * contextTriggerPercent / 100
+	target := maxInput * contextTargetPercent / 100
+	if current < trigger {
+		r.Session.ReconcileWindowInput(current)
+		return nil
+	}
+
+	for current > target {
+		saved, compactErr := r.Session.Compact(compactor.SimpleCompactor, current-target)
+		if compactErr != nil {
+			return compactErr
+		}
+		if saved <= 0 {
+			return fmt.Errorf("%w: current=%d target=%d", ErrContextTargetNotReach, current, target)
+		}
+
+		next, countErr := r.LLMClient.CountInputTokens(ctx, r.Session.Messages, toolDefs)
+		if countErr != nil {
+			return fmt.Errorf("count context after compaction: %w", countErr)
+		}
+		if next >= current {
+			return fmt.Errorf("%w: provider count made no progress (%d -> %d)",
+				ErrContextTargetNotReach, current, next)
+		}
+		current = next
+	}
+
+	r.Session.ReconcileWindowInput(current)
+	return nil
 }
 
 // handleTurnMsg 把一条消息落盘、同步进聚合，并在 token 账目变化时写回 meta。

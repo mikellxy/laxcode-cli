@@ -35,7 +35,9 @@ touch ~/.laxcode/settings.json
 {
   "OPENAI_API_KEY": "sk-xxxxxxxxxxxxxxxx",
   "OPENAI_BASE_URL": "https://api.openai.com/v1", # 任意 OpenAI 兼容端点
-  "OPENAI_MODEL": "gpt-4o-mini"
+  "OPENAI_MODEL": "gpt-4o-mini",
+  "OPENAI_CONTEXT_WINDOW": 128000,
+  "OPENAI_MAX_OUTPUT_TOKENS": 16384
 }
 ```
 * **使用环境变量**
@@ -43,6 +45,8 @@ touch ~/.laxcode/settings.json
 export OPENAI_API_KEY=sk-xxxxxxxxxxxxxxxx
 export OPENAI_BASE_URL=https://api.openai.com/v1     # 任意 OpenAI 兼容端点
 export OPENAI_MODEL=gpt-4o-mini
+export OPENAI_CONTEXT_WINDOW=128000
+export OPENAI_MAX_OUTPUT_TOKENS=16384
 ```
 
 ### 1.3 终端交互模式
@@ -170,9 +174,12 @@ LaxCode 在 ReAct 循环中完整实现 openai function call 协议。启动时�
 - 子 Agent 可以单独设置一套独立人格、系统提示词、权限范围，和主 Agent 职责解耦
 
 ## 4. 上下文压缩
+
+The context budget is configured per model deployment. Before each generation call, the provider counts the exact request, including messages and tool definitions. Compression starts at 80% of available input capacity and is recounted until it reaches 60%. Tool calls and results are handled as complete spans, and truncation is UTF-8 safe. If compaction cannot reach the target, the request is not sent.
+
 压缩器在每次调用 LLM 前检查窗口占用，达到阈值（默认窗口的 80%）时分层清理：  
 - 近期工具输出做内容截断保留关键头尾；
-- 更早的工具输出替换为简要摘要；
+- 更早的工具输出替换为带 call ID 的清理标记；
 - 过期的模型推理思考链（reasoning‑content）直接清除；
 - 压缩仅作用于发送给大模型的内存视图，原始会话历史完整保存在磁盘。
 

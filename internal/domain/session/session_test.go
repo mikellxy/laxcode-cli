@@ -8,26 +8,23 @@ import (
 	"github.com/mikellxy/laxcode/internal/domain/sharedkernel"
 )
 
-// fakeCompactor 是 Compactor 端口的测试替身：记录收到的窗口占用与阈值，
+// fakeCompactor 是 Compactor 端口的测试替身：记录收到的节省目标，
 // 按预设返回压缩结果，用于验证聚合把哪些状态交给策略、又如何回收结果。
 type fakeCompactor struct {
-	gotMaxToken int
-	gotWin      sharedkernel.TokenStatistics
-	gotMsgCnt   int
-	retMsgs     []sharedkernel.Message
-	retSaved    sharedkernel.TokenStatistics
-	retErr      error
-	calls       int
+	gotMinSavings int
+	gotMsgCnt     int
+	retMsgs       []sharedkernel.Message
+	retSaved      int
+	retErr        error
+	calls         int
 }
 
-func (f *fakeCompactor) Compress(msgs []sharedkernel.Message, maxToken int,
-	winConsumed sharedkernel.TokenStatistics) ([]sharedkernel.Message, sharedkernel.TokenStatistics, error) {
+func (f *fakeCompactor) Compress(msgs []sharedkernel.Message, minTokenSavings int) ([]sharedkernel.Message, int, error) {
 	f.calls++
 	f.gotMsgCnt = len(msgs)
-	f.gotMaxToken = maxToken
-	f.gotWin = winConsumed
+	f.gotMinSavings = minTokenSavings
 	if f.retErr != nil {
-		return nil, sharedkernel.TokenStatistics{}, f.retErr
+		return nil, 0, f.retErr
 	}
 	if f.retMsgs != nil {
 		return f.retMsgs, f.retSaved, nil
@@ -265,29 +262,26 @@ func TestLoadAndReadMeta(t *testing.T) {
 	}
 }
 
-// 压缩触发判据用窗口占用（而非只增不减的累计用量），节省量从窗口扣除。
-func TestCompactUsesWindowTokenAndDeductsSaved(t *testing.T) {
+func TestCompactPassesSavingsTargetWithoutGuessingWindowUsage(t *testing.T) {
 	s := NewSession("s1")
 	s.UpsertSysMessage("system prompt")
 	s.LoadMeta(sharedkernel.SessionMeta{
 		TokenUsed:   sharedkernel.TokenStatistics{TokenInput: 900_000, TokenOutput: 100},
 		WindowToken: sharedkernel.TokenStatistics{TokenInput: 180_000, TokenOutput: 2_000},
 	})
-	fake := &fakeCompactor{retSaved: sharedkernel.TokenStatistics{TokenInput: 3_000, TokenOutput: 500}}
+	fake := &fakeCompactor{retSaved: 3_000}
 
-	if err := s.Compact(fake, 200_000); err != nil {
+	saved, err := s.Compact(fake, 50_000)
+	if err != nil {
 		t.Fatalf("Compact: %v", err)
 	}
-	if fake.calls != 1 {
-		t.Fatalf("策略应被调用一次，实际 %d", fake.calls)
+	if fake.calls != 1 || fake.gotMinSavings != 50_000 || saved != 3_000 {
+		t.Fatalf("unexpected compact call: calls=%d target=%d saved=%d",
+			fake.calls, fake.gotMinSavings, saved)
 	}
-	if fake.gotMaxToken != 200_000 {
-		t.Errorf("阈值应原样传给策略，实际 %d", fake.gotMaxToken)
-	}
-	if fake.gotWin != (sharedkernel.TokenStatistics{TokenInput: 180_000, TokenOutput: 2_000}) {
-		t.Errorf("触发判据应为窗口占用而非累计用量，实际传给策略的是 %+v", fake.gotWin)
-	}
-	want := sharedkernel.TokenStatistics{TokenInput: 177_000, TokenOutput: 1_500}
+	// 本地 saved 只用于策略进度，不得用它修改 provider 的精确账目。
+	// application 层重新计数后会调 ReconcileWindowInput 校正。
+	want := sharedkernel.TokenStatistics{TokenInput: 180_000, TokenOutput: 2_000}
 	if s.WindowToken != want {
 		t.Errorf("窗口占用应扣减节省量 %+v，实际 %+v", want, s.WindowToken)
 	}
@@ -306,7 +300,7 @@ func TestCompactAdoptsCompressedMessages(t *testing.T) {
 	}
 	fake := &fakeCompactor{retMsgs: compressed}
 
-	if err := s.Compact(fake, 1); err != nil {
+	if _, err := s.Compact(fake, 1); err != nil {
 		t.Fatalf("Compact: %v", err)
 	}
 	if len(s.Messages) != 2 || s.Messages[1].Content != "已被系统清理" {
@@ -317,16 +311,27 @@ func TestCompactAdoptsCompressedMessages(t *testing.T) {
 	}
 }
 
+func TestReconcileWindowInputUsesExactNextRequestCount(t *testing.T) {
+	s := NewSession("s1")
+	s.LoadMeta(sharedkernel.SessionMeta{WindowToken: sharedkernel.TokenStatistics{
+		TokenInput: 100, TokenOutput: 20,
+	}})
+	s.ReconcileWindowInput(77)
+	if s.WindowToken != (sharedkernel.TokenStatistics{TokenInput: 77}) {
+		t.Fatalf("unexpected reconciled window usage: %+v", s.WindowToken)
+	}
+}
+
 func TestCompactNilStrategyAndError(t *testing.T) {
 	s := NewSession("s1")
-	if err := s.Compact(nil, 100); !errors.Is(err, ErrNilCompactor) {
+	if _, err := s.Compact(nil, 100); !errors.Is(err, ErrNilCompactor) {
 		t.Errorf("nil 策略应返回 ErrNilCompactor，实际 %v", err)
 	}
 
 	boom := errors.New("compress failed")
 	s2 := NewSession("s2")
 	s2.LoadMessages([]sharedkernel.Message{{Role: sharedkernel.RoleUser, Content: "q"}})
-	if err := s2.Compact(&fakeCompactor{retErr: boom}, 100); !errors.Is(err, boom) {
+	if _, err := s2.Compact(&fakeCompactor{retErr: boom}, 100); !errors.Is(err, boom) {
 		t.Errorf("策略错误应透传，实际 %v", err)
 	}
 	// 失败时不得改动聚合状态

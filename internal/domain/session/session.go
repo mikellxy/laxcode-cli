@@ -144,24 +144,29 @@ func (s *Session) AppendMessage(msg *sharedkernel.Message) error {
 // domain/compactor 的实现按 Go 惯例结构化匹配，无需相互 import——
 // Compress 的签名全部由 sharedkernel 类型构成，天然可隐式满足。
 type Compactor interface {
-	Compress(msgs []sharedkernel.Message, maxToken int, winConsumed sharedkernel.TokenStatistics) ([]sharedkernel.Message, sharedkernel.TokenStatistics, error)
+	Compress(msgs []sharedkernel.Message, minTokenSavings int) ([]sharedkernel.Message, int, error)
 }
 
-// Compact 按窗口预算压缩历史：策略在聚合内部改写消息序列，节省量同步从
-// WindowToken 扣除。触发判据用 WindowToken（当前窗口占用）而非 TokenUsed
-// （会话累计，只增不减）——后者会让长会话每轮都误触发压缩。
+// Compact 要求策略尝试节省指定 token，并在聚合内采纳新的
+// 消息序列。触发判断和最终精确重计数由 application 层完成。
 //
 // 压缩结果只在内存生效：history.jsonl 始终保留完整原文，续聊后按原文重新
 // 压缩，故落盘的 meta 也不记压缩后的窗口值。
-func (s *Session) Compact(strategy Compactor, maxToken int) error {
+func (s *Session) Compact(strategy Compactor, minTokenSavings int) (int, error) {
 	if strategy == nil {
-		return ErrNilCompactor
+		return 0, ErrNilCompactor
 	}
-	msgs, saved, err := strategy.Compress(s.Messages, maxToken, s.WindowToken)
+	msgs, saved, err := strategy.Compress(s.Messages, minTokenSavings)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	s.LoadMessages(msgs)
-	s.WindowToken.Minus(saved)
-	return nil
+	return saved, nil
+}
+
+// ReconcileWindowInput 用 provider 对“下一个完整请求”的精确计数
+// 校正内存窗口账目。该值不单独落盘，下一条 assistant 消息
+// 会用 API 实测 usage 再次覆盖它。
+func (s *Session) ReconcileWindowInput(inputTokens int) {
+	s.WindowToken = sharedkernel.TokenStatistics{TokenInput: inputTokens}
 }

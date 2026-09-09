@@ -1,7 +1,10 @@
 package llmprovider
 
 import (
+	"context"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 
 	"github.com/mikellxy/laxcode/internal/domain/sharedkernel"
@@ -16,6 +19,62 @@ func TestNewOpenApiProvider(t *testing.T) {
 	if p.model != "gpt-x" {
 		t.Errorf("model 未装配，实际 %q", p.model)
 	}
+}
+
+func TestProviderContextBudgetAndMaxOutputTokens(t *testing.T) {
+	p := NewOpenApiProvider("sk-test", "https://example.com/v1", "g", 128_000, 8_192)
+	if got := p.ContextBudget(); got.ContextWindow != 128_000 || got.ReservedOutputTokens != 8_192 {
+		t.Fatalf("unexpected context budget: %+v", got)
+	}
+	m := paramsJSON(t, p, nil, nil)
+	if m["max_output_tokens"] != float64(8_192) {
+		t.Fatalf("max_output_tokens must match the reserved budget: %v", m)
+	}
+}
+
+func TestCountInputTokensUsesCompleteResponseRequestShape(t *testing.T) {
+	var received map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.URL.Path != "/responses/input_tokens" {
+			t.Errorf("unexpected path: %s", req.URL.Path)
+		}
+		if err := json.NewDecoder(req.Body).Decode(&received); err != nil {
+			t.Errorf("decode request: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"object":"response.input_tokens","input_tokens":321}`))
+	}))
+	defer server.Close()
+
+	p := NewOpenApiProvider("sk-test", server.URL, "model-x", 1000, 100)
+	msgs := []sharedkernel.Message{
+		{Role: sharedkernel.RoleUser, Content: "question"},
+		assistantToolTurnForProviderTest(),
+		{Role: sharedkernel.RoleTool, ToolCallID: "call-1", Content: "result"},
+	}
+	defs := []sharedkernel.ToolDefinition{{Name: "lookup", Description: "lookup data"}}
+	got, err := p.CountInputTokens(context.Background(), msgs, defs)
+	if err != nil {
+		t.Fatalf("CountInputTokens: %v", err)
+	}
+	if got != 321 {
+		t.Fatalf("count = %d, want 321", got)
+	}
+	if received["model"] != "model-x" {
+		t.Fatalf("model was not counted: %v", received)
+	}
+	if input, ok := received["input"].([]any); !ok || len(input) != 3 {
+		t.Fatalf("messages/function-call/tool-result were not all counted: %v", received["input"])
+	}
+	if tools, ok := received["tools"].([]any); !ok || len(tools) != 1 {
+		t.Fatalf("tool definitions were not counted: %v", received["tools"])
+	}
+}
+
+func assistantToolTurnForProviderTest() sharedkernel.Message {
+	return sharedkernel.Message{Role: sharedkernel.RoleAssistant, ToolCalls: []sharedkernel.ToolCall{{
+		ID: "call-1", Name: "lookup", Arguments: json.RawMessage(`{"q":"x"}`),
+	}}}
 }
 
 // paramsJSON 把 buildResponseParams 的结果序列化为通用结构便于断言

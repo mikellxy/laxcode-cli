@@ -3,6 +3,7 @@ package llmprovider
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 
 	domainllm "github.com/mikellxy/laxcode/internal/domain/llmprovider"
 	"github.com/mikellxy/laxcode/internal/domain/sharedkernel"
@@ -14,15 +15,52 @@ import (
 type OpenApiProvider struct {
 	client openai.Client
 	model  string
+	budget domainllm.ContextBudget
 }
 
 // 编译期契约：基础设施 provider 必须满足领域层 LLMClient 接口。
 var _ domainllm.LLMClient = (*OpenApiProvider)(nil)
 
-func NewOpenApiProvider(apiKey, baseURL, model string) *OpenApiProvider {
+func NewOpenApiProvider(apiKey, baseURL, model string, budgetValues ...int) *OpenApiProvider {
+	// 可变参只用于保持库内旧调用方的源码兼容；组合根始终传入
+	// 由配置解析得到的窗口和输出预留。
+	contextWindow, reservedOutput := 128_000, 16_384
+	if len(budgetValues) >= 2 {
+		contextWindow, reservedOutput = budgetValues[0], budgetValues[1]
+	}
 	return &OpenApiProvider{
 		client: openai.NewClient(option.WithAPIKey(apiKey), option.WithBaseURL(baseURL)),
 		model:  model,
+		budget: domainllm.ContextBudget{
+			ContextWindow:        contextWindow,
+			ReservedOutputTokens: reservedOutput,
+		},
+	}
+}
+
+func (p *OpenApiProvider) ContextBudget() domainllm.ContextBudget {
+	return p.budget
+}
+
+// CountInputTokens 调用 Responses 的 input-token counting 端点。这里先复用
+// buildResponseParams，再把其输入项与工具原样放入计数请求，保证计数
+// 与真正 Generate 的结构口径一致。
+func (p *OpenApiProvider) CountInputTokens(ctx context.Context, msgs []sharedkernel.Message, toolsDefs []sharedkernel.ToolDefinition) (int, error) {
+	resp, err := p.client.Responses.InputTokens.Count(ctx, p.buildInputTokenCountParams(msgs, toolsDefs))
+	if err != nil {
+		return 0, fmt.Errorf("count response input tokens: %w", err)
+	}
+	return int(resp.InputTokens), nil
+}
+
+func (p *OpenApiProvider) buildInputTokenCountParams(msgs []sharedkernel.Message, toolsDefs []sharedkernel.ToolDefinition) responses.InputTokenCountParams {
+	params := p.buildResponseParams(msgs, toolsDefs)
+	return responses.InputTokenCountParams{
+		Model: openai.String(p.model),
+		Input: responses.InputTokenCountParamsInputUnion{
+			OfResponseInputItemArray: params.Input.OfInputItemList,
+		},
+		Tools: params.Tools,
 	}
 }
 
@@ -110,6 +148,9 @@ func (p *OpenApiProvider) buildResponseParams(msgs []sharedkernel.Message, tools
 	reqParams := responses.ResponseNewParams{
 		Model: p.model,
 		Input: inputParams,
+	}
+	if p.budget.ReservedOutputTokens > 0 {
+		reqParams.MaxOutputTokens = openai.Int(int64(p.budget.ReservedOutputTokens))
 	}
 
 	if len(toolsDefs) > 0 {

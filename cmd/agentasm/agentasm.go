@@ -103,7 +103,8 @@ func Assemble(ctx context.Context, in Input) (*Assembled, error) {
 
 	// provider + service
 	c := config.EnvAndFileConf
-	llmClient := llmprovider.NewOpenApiProvider(c.OpenaiApiKey, c.OpenaiBaseUrl, c.OpenaiModel)
+	llmClient := llmprovider.NewOpenApiProvider(c.OpenaiApiKey, c.OpenaiBaseUrl, c.OpenaiModel,
+		c.OpenaiContextWindow, c.OpenaiMaxOutputTokens)
 	svc := reactservice.NewReActService(sess, sessRepo, llmClient, toolReg,
 		in.Consumer, tracer)
 	// 子 Agent 复用 svc 的 LLMClient/tracer/Repo 派生隔离子服务，注册进同一
