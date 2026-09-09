@@ -45,9 +45,17 @@ func (p *OpenApiProvider) ContextBudget() domainllm.ContextBudget {
 // CountInputTokens 调用 Responses 的 input-token counting 端点。这里先复用
 // buildResponseParams，再把其输入项与工具原样放入计数请求，保证计数
 // 与真正 Generate 的结构口径一致。
+//
+// 远端计数端点并非所有兼容实现都提供（例如 DeepSeek 未实现
+// /responses/input_tokens，返回 404）。任一远端失败都退回本地 tiktoken
+// 估算，避免因缺少计数端点而中断整个 ReAct 循环；仅当本地估算也失败时
+// 才向调用方暴露原始远端错误。
 func (p *OpenApiProvider) CountInputTokens(ctx context.Context, msgs []sharedkernel.Message, toolsDefs []sharedkernel.ToolDefinition) (int, error) {
 	resp, err := p.client.Responses.InputTokens.Count(ctx, p.buildInputTokenCountParams(msgs, toolsDefs))
 	if err != nil {
+		if local, localErr := p.countInputTokensLocal(msgs, toolsDefs); localErr == nil {
+			return local, nil
+		}
 		return 0, fmt.Errorf("count response input tokens: %w", err)
 	}
 	return int(resp.InputTokens), nil

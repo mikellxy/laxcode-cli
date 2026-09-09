@@ -77,6 +77,57 @@ func assistantToolTurnForProviderTest() sharedkernel.Message {
 	}}}
 }
 
+// TestCountInputTokensFallsBackToLocalTiktoken 模拟 DeepSeek 等兼容端点：
+// /responses/input_tokens 未实现而返回 404，CountInputTokens 应退回本地
+// tiktoken 估算而非把错误上抛中断 ReAct 循环。
+func TestCountInputTokensFallsBackToLocalTiktoken(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		http.NotFound(w, req)
+	}))
+	defer server.Close()
+
+	p := NewOpenApiProvider("sk-test", server.URL, "deepseek-chat", 128_000, 16_384)
+	msgs := []sharedkernel.Message{
+		{Role: sharedkernel.RoleSystem, Content: "you are laxcode"},
+		{Role: sharedkernel.RoleUser, Content: "count these tokens please"},
+	}
+	defs := []sharedkernel.ToolDefinition{{Name: "lookup", Description: "lookup data"}}
+	got, err := p.CountInputTokens(context.Background(), msgs, defs)
+	if err != nil {
+		t.Fatalf("远端 404 时应本地兜底，却返回错误：%v", err)
+	}
+	if got <= 0 {
+		t.Fatalf("本地估算 token 数应为正，实际 %d", got)
+	}
+}
+
+// TestCountInputTokensLocalGrowsWithContent 验证本地估算口径合理：更长的
+// 输入应得到严格更大的 token 数，且对同一输入可重复（确定性）。
+func TestCountInputTokensLocalGrowsWithContent(t *testing.T) {
+	p := NewOpenApiProvider("sk-test", "https://example.com/v1", "m", 128_000, 16_384)
+	short := []sharedkernel.Message{{Role: sharedkernel.RoleUser, Content: "hi"}}
+	long := []sharedkernel.Message{{Role: sharedkernel.RoleUser, Content: "a much much longer prompt with many words to inflate the token estimate"}}
+
+	shortCount, err := p.countInputTokensLocal(short, nil)
+	if err != nil {
+		t.Fatalf("本地估算短文本：%v", err)
+	}
+	longCount, err := p.countInputTokensLocal(long, nil)
+	if err != nil {
+		t.Fatalf("本地估算长文本：%v", err)
+	}
+	if longCount <= shortCount {
+		t.Fatalf("更长输入应得到更大 token 数：short=%d long=%d", shortCount, longCount)
+	}
+	again, err := p.countInputTokensLocal(long, nil)
+	if err != nil {
+		t.Fatalf("本地估算重复调用：%v", err)
+	}
+	if again != longCount {
+		t.Fatalf("本地估算应确定性：first=%d second=%d", longCount, again)
+	}
+}
+
 // paramsJSON 把 buildResponseParams 的结果序列化为通用结构便于断言
 // （不依赖 openai SDK 内部类型，仅依赖其公开 JSON 语义）。
 func paramsJSON(t *testing.T, p *OpenApiProvider, msgs []sharedkernel.Message, defs []sharedkernel.ToolDefinition) map[string]any {
