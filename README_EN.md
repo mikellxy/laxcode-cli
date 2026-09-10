@@ -130,6 +130,10 @@ ${workdir}/.laxcode/.session/
         └── <plan_mode_task_name>/
 ```
 
+### 2.2 Runtime Log
+
+At startup, the standard-library `log/slog` logger creates `./log/laxcode.log` and appends INFO-and-above JSON Lines records. `context_compaction_triggered` is emitted when the context reaches the compaction threshold, `context_compaction_completed` after the compacted snapshot is committed, and `context_compaction_failed` on failure. Records contain only token, message, tool-call-group, artifact, protected-range, and duration statistics—never message bodies or tool output.
+
 ## 3. Tools
 LaxCode fully implements the OpenAI function call protocol inside the ReAct loop. Built-in tools are injected at startup, and tool definitions are sent with every LLM call.
 All tools parse paths safely internally, preventing path traversal.  

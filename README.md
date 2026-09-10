@@ -132,6 +132,10 @@ ${workdir}/.laxcode/.session/
         └── <plan_mode_task_name>/
 ```
 
+### 2.2 运行日志
+
+进程启动时使用标准库 `log/slog` 创建 `./log/laxcode.log`，以 JSON Lines 追加写入 INFO 及以上日志。上下文达到压缩阈值时记录 `context_compaction_triggered`，成功提交后记录 `context_compaction_completed`；失败记录 `context_compaction_failed`。日志只包含 token、消息数量、调用组、artifact、保护区和耗时等统计，不记录消息正文或工具输出。
+
 ## 3. 工具
 LaxCode 在 ReAct 循环中完整实现 openai function call 协议。启动时默认注入内置工具，并在每轮调用 llm 时发送工具定义
 所有工具内部对路径进行安全解析，杜绝路径穿越  

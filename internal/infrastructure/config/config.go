@@ -21,8 +21,8 @@ type envAndFileConf struct {
 const (
 	// 兼容端点的 /models 响应不会标准化暴露 context window，
 	// 因此给出保守默认值，并允许按实际部署显式配置。
-	DefaultContextWindow   = 128_000
-	DefaultMaxOutputTokens = 16_384
+	DefaultContextWindow   = 32768
+	DefaultMaxOutputTokens = 4096
 )
 
 var EnvAndFileConf envAndFileConf

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/mikellxy/laxcode/internal/domain/compactor"
@@ -292,7 +293,7 @@ func (r *ReActService) think(ctx context.Context) (*sharedkernel.Message, error)
 // 可用输入的 80% 时开始压缩，目标回落到 60%；高低水位避免
 // 长会话在每一轮都重复裁剪。每次策略修改后都请 provider 重新计数，
 // 未确认达到目标前绝不发送生成请求。
-func (r *ReActService) compactContext(ctx context.Context, toolDefs []sharedkernel.ToolDefinition) error {
+func (r *ReActService) compactContext(ctx context.Context, toolDefs []sharedkernel.ToolDefinition) (retErr error) {
 	budget := r.LLMClient.ContextBudget()
 	maxInput := budget.MaxInputTokens()
 	if budget.ContextWindow <= 0 || budget.ReservedOutputTokens <= 0 || maxInput <= 0 {
@@ -312,8 +313,66 @@ func (r *ReActService) compactContext(ctx context.Context, toolDefs []sharedkern
 	}
 
 	// 所有修改都在候选工作集上进行；计数失败或未达标时不污染当前上下文。
+	startedAt := time.Now()
+	beforeInput := current
+	beforeStats := collectContextLogStats(r.Session.Messages)
+	protectedStart := compactor.ProtectedStart(r.Session.Messages)
+	protectedStartSeq := uint64(0)
+	if protectedStart < len(r.Session.Messages) {
+		protectedStartSeq = r.Session.Messages[protectedStart].Seq
+	}
+	protectedToolCallGroups := countToolCallGroups(r.Session.Messages[protectedStart:])
+	phase := "archive_artifacts"
+	passes := 0
+	estimatedSaved := 0
+	artifactRefsAdded := 0
+	afterInput := current
+
 	candidate := r.Session.Clone()
-	for _, idx := range compactor.ArtifactCandidates(candidate.Messages) {
+	artifactCandidates := compactor.ArtifactCandidates(candidate.Messages)
+	slog.InfoContext(ctx, "context_compaction_triggered",
+		"session_id", r.Session.ID,
+		"context_window_tokens", budget.ContextWindow,
+		"reserved_output_tokens", budget.ReservedOutputTokens,
+		"max_input_tokens", maxInput,
+		"trigger_tokens", trigger,
+		"target_tokens", target,
+		"before_input_tokens", beforeInput,
+		"before_utilization_ratio", ratio(beforeInput, maxInput),
+		"last_seq", r.Session.LastSeq,
+		"tool_definition_count", len(toolDefs),
+		"message_count", beforeStats.messageCount,
+		"assistant_message_count", beforeStats.assistantMessageCount,
+		"tool_call_group_count", beforeStats.toolCallGroupCount,
+		"tool_call_count", beforeStats.toolCallCount,
+		"tool_result_count", beforeStats.toolResultCount,
+		"content_bytes", beforeStats.contentBytes,
+		"reasoning_bytes", beforeStats.reasoningBytes,
+		"existing_artifact_ref_count", beforeStats.artifactRefCount,
+		"artifact_candidate_count", len(artifactCandidates),
+		"protected_start_index", protectedStart,
+		"protected_start_seq", protectedStartSeq,
+		"protected_message_count", len(r.Session.Messages)-protectedStart,
+		"protected_tool_call_group_count", protectedToolCallGroups,
+	)
+	defer func() {
+		if retErr == nil {
+			return
+		}
+		slog.ErrorContext(ctx, "context_compaction_failed",
+			"session_id", r.Session.ID,
+			"phase", phase,
+			"before_input_tokens", beforeInput,
+			"last_counted_input_tokens", afterInput,
+			"target_tokens", target,
+			"compression_passes", passes,
+			"artifact_refs_added", artifactRefsAdded,
+			"duration_ms", time.Since(startedAt).Milliseconds(),
+			"error", retErr,
+		)
+	}()
+
+	for _, idx := range artifactCandidates {
 		if r.Artifacts == nil {
 			return errors.New("artifact store required for tool output compaction")
 		}
@@ -322,9 +381,12 @@ func (r *ReActService) compactContext(ctx context.Context, toolDefs []sharedkern
 			return fmt.Errorf("archive tool output: %w", err)
 		}
 		candidate.Messages[idx].Artifact = &ref
+		artifactRefsAdded++
 	}
+	phase = "compress"
 	for current > target {
 		saved, compactErr := candidate.Compact(compactor.SimpleCompactor, current-target)
+		passes++
 		if compactErr != nil {
 			return compactErr
 		}
@@ -340,11 +402,90 @@ func (r *ReActService) compactContext(ctx context.Context, toolDefs []sharedkern
 			return fmt.Errorf("%w: provider count made no progress (%d -> %d)",
 				ErrContextTargetNotReach, current, next)
 		}
+		estimatedSaved += saved
 		current = next
+		afterInput = next
 	}
 
 	candidate.ReconcileWindowInput(current)
-	return r.commitContext(ctx, candidate, nil)
+	phase = "checkpoint"
+	if err := r.commitContext(ctx, candidate, nil); err != nil {
+		return err
+	}
+	phase = "completed"
+	afterStats := collectContextLogStats(candidate.Messages)
+	slog.InfoContext(ctx, "context_compaction_completed",
+		"session_id", r.Session.ID,
+		"before_input_tokens", beforeInput,
+		"after_input_tokens", current,
+		"exact_saved_tokens", beforeInput-current,
+		"estimated_saved_tokens", estimatedSaved,
+		"input_reduction_ratio", ratio(beforeInput-current, beforeInput),
+		"after_utilization_ratio", ratio(current, maxInput),
+		"target_tokens", target,
+		"target_met", current <= target,
+		"compression_passes", passes,
+		"artifact_refs_added", artifactRefsAdded,
+		"message_count_before", beforeStats.messageCount,
+		"message_count_after", afterStats.messageCount,
+		"content_bytes_before", beforeStats.contentBytes,
+		"content_bytes_after", afterStats.contentBytes,
+		"reasoning_bytes_before", beforeStats.reasoningBytes,
+		"reasoning_bytes_after", afterStats.reasoningBytes,
+		"artifact_ref_count_after", afterStats.artifactRefCount,
+		"duration_ms", time.Since(startedAt).Milliseconds(),
+	)
+	return nil
+}
+
+type contextLogStats struct {
+	messageCount          int
+	assistantMessageCount int
+	toolCallGroupCount    int
+	toolCallCount         int
+	toolResultCount       int
+	contentBytes          int
+	reasoningBytes        int
+	artifactRefCount      int
+}
+
+func collectContextLogStats(messages []sharedkernel.Message) contextLogStats {
+	stats := contextLogStats{messageCount: len(messages)}
+	for _, message := range messages {
+		stats.contentBytes += len(message.Content)
+		stats.reasoningBytes += len(message.ReasoningContent)
+		if message.Artifact != nil {
+			stats.artifactRefCount++
+		}
+		switch message.Role {
+		case sharedkernel.RoleAssistant:
+			stats.assistantMessageCount++
+			if len(message.ToolCalls) > 0 {
+				stats.toolCallGroupCount++
+				stats.toolCallCount += len(message.ToolCalls)
+			}
+		case sharedkernel.RoleTool:
+			stats.toolResultCount++
+		}
+	}
+	return stats
+}
+
+func ratio(numerator, denominator int) float64 {
+	if denominator <= 0 {
+		return 0
+	}
+	return float64(numerator) / float64(denominator)
+}
+
+func countToolCallGroups(messages []sharedkernel.Message) int {
+	count := 0
+	for _, message := range messages {
+		if message.Role == sharedkernel.RoleAssistant && len(message.ToolCalls) > 0 {
+			count++
+		}
+	}
+	return count
 }
 
 // handleTurnMsg 先在候选中赋予稳定标识，再提交原始流水与工作集。

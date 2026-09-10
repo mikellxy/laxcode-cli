@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"os"
 
 	"github.com/mikellxy/laxcode/cmd/run_cli"
@@ -10,6 +11,13 @@ import (
 )
 
 func main() {
+	logFile, err := configureSlog(appLogPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "initialize log %s: %v\n", appLogPath, err)
+		os.Exit(1)
+	}
+	defer logFile.Close()
+
 	if err := config.ParseEnvAndFile(); err != nil {
 		panic(err)
 	}
@@ -24,7 +32,9 @@ func main() {
 		// one-shot：跑单个任务、结果 JSON 直写 stdout，Run 返回进程 exit code
 		// （0 成功 / 1 运行失败 / 2 用法错误）。经 os.Exit 映射；Run 内部的
 		// defer（工具回收 / trace flush）在返回前已执行，不受 os.Exit 跳过影响。
-		os.Exit(run_oneshot.Run())
+		exitCode := run_oneshot.Run()
+		_ = logFile.Close() // os.Exit 不执行 defer，显式关闭。
+		os.Exit(exitCode)
 	case config.CliConf.SSE:
 		// sse server：阻塞式监听，接受 POST /chat 并把 ReAct 事件以 SSE 流式回传；
 		// SIGINT/SIGTERM 触发优雅关闭后 Run 返回。

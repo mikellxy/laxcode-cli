@@ -1,8 +1,10 @@
 package reactservice
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log/slog"
 	"reflect"
 	"strings"
 	"testing"
@@ -636,6 +638,11 @@ func TestRunPropagatesMetaPersistError(t *testing.T) {
 
 // provider 对完整下一请求的计数达到高水位时，应压缩并重计数。
 func TestRunCompactsHistoryBeforeGenerate(t *testing.T) {
+	previousLogger := slog.Default()
+	var logs bytes.Buffer
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelInfo})))
+	t.Cleanup(func() { slog.SetDefault(previousLogger) })
+
 	repo := newMemRepo()
 	sess := newTestSession("s-compact", repo)
 	appendOrFatal(t, sess, &sharedkernel.Message{Role: sharedkernel.RoleUser, Content: "q"})
@@ -686,6 +693,22 @@ func TestRunCompactsHistoryBeforeGenerate(t *testing.T) {
 	}
 	if sess.Messages[0].Role != sharedkernel.RoleSystem {
 		t.Errorf("压缩不得弄丢系统提示词，实际首条：%+v", sess.Messages[0])
+	}
+	logOutput := logs.String()
+	for _, want := range []string{
+		`"msg":"context_compaction_triggered"`,
+		`"before_input_tokens":80`,
+		`"trigger_tokens":72`,
+		`"target_tokens":54`,
+		`"artifact_candidate_count":1`,
+		`"msg":"context_compaction_completed"`,
+		`"after_input_tokens":50`,
+		`"exact_saved_tokens":30`,
+		`"target_met":true`,
+	} {
+		if !strings.Contains(logOutput, want) {
+			t.Errorf("压缩日志缺少 %s：%s", want, logOutput)
+		}
 	}
 }
 
