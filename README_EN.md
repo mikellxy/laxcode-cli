@@ -92,6 +92,19 @@ pip3 install langgraph langchain-openai python-dotenv
 python3 ./examples/workflow-agent-hybrid/example.py -workdir=/tmp/laxcode-example -session=xxxxx -task="how to use meta Class in python? Just give me a text answer first"
 ```
 
+### 1.6 sse
+```shell
+./bin/laxcode -sse -workdir /tmp/laxcode-example -addr 127.0.0.1:8080
+go run ./examples/sse-client -task "list the current directory and count the go files"
+go run ./examples/sse-client -task "what did we talk about" -session=20260910-142622.514
+```
+
+| Argument   | Default | Description               |
+|------------|---------|---------------------------|
+| `-sse`     | false   | Start the sse server      |
+| `-addr`    | empty   | sse server listen address |
+| `-workdir` | cwd     | Working directory         |
+
 ## 2. Session Management
 Resuming a conversation from a previous run is supported by specifying a session id
 ```shell

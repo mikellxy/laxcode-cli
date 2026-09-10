@@ -94,6 +94,19 @@ pip3 install langgraph langchain-openai python-dotenv
 python3 ./examples/workflow-agent-hybrid/example.py -workdir=/tmp/laxcode-example -session=xxxxx -task="how to use meta Class in python? Just give me a text answer first"
 ```
 
+### 1.6 sse
+```shell
+./bin/laxcode -sse -workdir /tmp/laxcode-example -addr 127.0.0.1:8080
+go run ./examples/sse-client -task "列出当前目录并统计 go 文件数量"
+go run ./examples/sse-client -task "我们都聊了什么" -session=20260910-142622.514
+```
+
+| 参数       | 默认  | 说明                |
+|------------|-------|---------------------|
+| `-sse`     | false | 启动 sse server     |
+| `-addr`    | 空    | sse server 监听地址 |
+| `-workdir` | cwd   | 工作目录            |
+
 ## 2. session 管理
 支持通过指定 session id 进行断点续聊
 ```shell
