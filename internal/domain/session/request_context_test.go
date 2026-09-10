@@ -2,6 +2,7 @@ package session
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"reflect"
 	"strings"
@@ -96,6 +97,44 @@ func TestInvalidSnapshotDoesNotReplaceWorkingContext(t *testing.T) {
 	}
 	if !reflect.DeepEqual(before, s.Snapshot()) {
 		t.Fatal("failed restore changed session")
+	}
+}
+
+func TestActiveChatLifecycleAndLegacyInference(t *testing.T) {
+	s := NewSession("active")
+	user := sharedkernel.Message{Role: sharedkernel.RoleUser, Content: "q"}
+	candidate, err := s.WithStartedChat(&user)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if candidate.ActiveChatID != "chat-1" {
+		t.Fatalf("启动对话后 ActiveChatID=%q", candidate.ActiveChatID)
+	}
+	if _, err := candidate.WithStartedChat(&sharedkernel.Message{Role: sharedkernel.RoleUser}); !errors.Is(err, ErrChatAlreadyActive) {
+		t.Fatalf("未完成对话期间应拒绝新 user，实际 %v", err)
+	}
+	final := sharedkernel.Message{Role: sharedkernel.RoleAssistant, Content: "done"}
+	if err := candidate.AppendMessage(&final); err != nil {
+		t.Fatal(err)
+	}
+	if candidate.ActiveChatID != "" {
+		t.Fatalf("最终 assistant 后应清除 ActiveChatID，实际 %q", candidate.ActiveChatID)
+	}
+
+	legacy := NewSession("legacy-active")
+	legacySnapshot := RequestContext{
+		Version: RequestContextVersion,
+		LastSeq: 2,
+		Messages: []sharedkernel.Message{
+			{Role: sharedkernel.RoleUser, Seq: 1, Content: "old"},
+			{Role: sharedkernel.RoleAssistant, Seq: 2, ToolCalls: []sharedkernel.ToolCall{{ID: "call"}}},
+		},
+	}
+	if err := legacy.Restore(legacySnapshot); err != nil {
+		t.Fatal(err)
+	}
+	if legacy.ActiveChatID != "chat-1" {
+		t.Fatalf("旧快照未推断出活跃对话：%q", legacy.ActiveChatID)
 	}
 }
 

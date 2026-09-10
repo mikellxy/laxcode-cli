@@ -429,6 +429,127 @@ func TestChatAppendsUserMessageToRepoAndSession(t *testing.T) {
 	}
 }
 
+func TestChatRecoversPendingCommitBeforeNewInput(t *testing.T) {
+	ctx := context.Background()
+	repo := newMemRepo()
+	llm := &scriptedLLM{responses: []scriptedResp{
+		{msg: assistantMsg("recovered answer")},
+		{msg: assistantMsg("new answer")},
+	}}
+	rec := &eventRecorder{}
+	svc := newTestService(t, "s-recover-pending", "system prompt", repo, llm, tools.NewDefaultRegistry(nil))
+	svc.ReActEventConsumerF = rec.record
+
+	user := svc.Session.BuildUserMessage("old question")
+	candidate, err := svc.Session.WithStartedChat(&user)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.commitContext(ctx, candidate, &user); err != nil {
+		t.Fatal(err)
+	}
+	callMsg := assistantMsgWithTool(sharedkernel.ToolCall{ID: "call", Name: "side_effect"})
+	if err := svc.handleTurnMsg(ctx, callMsg); err != nil {
+		t.Fatal(err)
+	}
+
+	// 工具结果已进入 pending，但 Save 返回失败；内存仍停在 tool-call assistant。
+	repo.failWithPending = true
+	pendingResult := &sharedkernel.Message{
+		Role: sharedkernel.RoleTool, ToolCallID: "call", Content: "uncertain result",
+	}
+	if err := svc.handleTurnMsg(ctx, pendingResult); !errors.Is(err, ErrPersistRequestContext) {
+		t.Fatalf("应返回可识别的持久化错误，实际 %v", err)
+	}
+	if svc.Session.LastSeq != 2 {
+		t.Fatalf("失败提交不应切换内存上下文，LastSeq=%d", svc.Session.LastSeq)
+	}
+	repo.failWithPending = false
+
+	final, err := svc.Chat(ctx, "new question")
+	if err != nil {
+		t.Fatalf("恢复后 Chat: %v", err)
+	}
+	if final.Content != "new answer" || llm.calls != 2 {
+		t.Fatalf("应先收束旧轮次再处理新输入：final=%+v calls=%d", final, llm.calls)
+	}
+	msgs := svc.Session.Messages
+	if len(msgs) != 7 || msgs[3].Role != sharedkernel.RoleTool || msgs[3].Content != "uncertain result" {
+		t.Fatalf("pending tool result 应被前滚且不重复补写：%+v", msgs)
+	}
+	if msgs[4].Role != sharedkernel.RoleAssistant || msgs[4].Content != "recovered answer" ||
+		msgs[5].Role != sharedkernel.RoleUser || msgs[5].Content != "new question" {
+		t.Fatalf("恢复与新输入顺序不符：%+v", msgs)
+	}
+	if svc.Session.ActiveChatID != "" {
+		t.Fatalf("两轮均完成后不应残留 ActiveChatID：%q", svc.Session.ActiveChatID)
+	}
+	if len(rec.events) == 0 || rec.events[0].Type != ReActEventTypeRecovery {
+		t.Fatalf("应先发恢复事件，实际 %+v", rec.events)
+	}
+}
+
+func TestChatSynthesizesOnlyMissingToolResults(t *testing.T) {
+	ctx := context.Background()
+	repo := newMemRepo()
+	llm := &scriptedLLM{responses: []scriptedResp{
+		{msg: assistantMsg("old done")},
+		{msg: assistantMsg("new done")},
+	}}
+	svc := newTestService(t, "s-recover-missing", "system prompt", repo, llm, tools.NewDefaultRegistry(nil))
+
+	user := svc.Session.BuildUserMessage("old question")
+	candidate, err := svc.Session.WithStartedChat(&user)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.commitContext(ctx, candidate, &user); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.handleTurnMsg(ctx, assistantMsgWithTool(
+		sharedkernel.ToolCall{ID: "a", Name: "side_effect"},
+		sharedkernel.ToolCall{ID: "b", Name: "side_effect"},
+	)); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.handleTurnMsg(ctx, &sharedkernel.Message{
+		Role: sharedkernel.RoleTool, ToolCallID: "a", Content: "known",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := svc.Chat(ctx, "new question"); err != nil {
+		t.Fatal(err)
+	}
+	msgs := svc.Session.Messages
+	if len(msgs) != 8 {
+		t.Fatalf("消息数=%d：%+v", len(msgs), msgs)
+	}
+	synthetic := msgs[4]
+	if synthetic.Role != sharedkernel.RoleTool || synthetic.ToolCallID != "b" || synthetic.Content != recoveryToolResultPrompt {
+		t.Fatalf("只应为缺失的 b 构造恢复结果，实际 %+v", synthetic)
+	}
+	if synthetic.TurnID != msgs[2].TurnID || synthetic.ToolCallGroupID != msgs[2].ToolCallGroupID {
+		t.Fatalf("synthetic tool result 未继承调用组标识：%+v / %+v", msgs[2], synthetic)
+	}
+}
+
+func TestMissingToolResultsOnlyReturnsUncommittedCalls(t *testing.T) {
+	messages := []sharedkernel.Message{
+		{Role: sharedkernel.RoleUser, Seq: 1},
+		{Role: sharedkernel.RoleAssistant, Seq: 2, ToolCallGroupID: "current", ToolCalls: []sharedkernel.ToolCall{
+			{ID: "a"}, {ID: "b"}, {ID: "c"},
+		}},
+		{Role: sharedkernel.RoleTool, Seq: 3, ToolCallGroupID: "current", ToolCallID: "b"},
+		{Role: sharedkernel.RoleTool, Seq: 4, ToolCallGroupID: "current", ToolCallID: "a"},
+		{Role: sharedkernel.RoleTool, Seq: 5, ToolCallGroupID: "old", ToolCallID: "c"},
+	}
+	missing := missingToolResults(messages)
+	if len(missing) != 1 || missing[0].ID != "c" {
+		t.Fatalf("只应补缺失的 c，实际 %+v", missing)
+	}
+}
+
 // 先磁盘后内存：写盘失败时聚合状态不得变化，否则续聊读回的历史会与内存分叉。
 func TestChatRepoFailureDoesNotMutateSession(t *testing.T) {
 	repo := newMemRepo()

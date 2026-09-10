@@ -25,7 +25,9 @@ type memRepo struct {
 	metas           map[string]sharedkernel.SessionMeta
 	contexts        map[string]session.RequestContext
 	artifacts       map[string]map[string]string
+	pendingContexts map[string]memPendingContext
 	failSaveContext bool
+	failWithPending bool
 	failArtifact    bool
 
 	failAppend      bool
@@ -35,20 +37,36 @@ type memRepo struct {
 	failGetMeta     bool
 }
 
+type memPendingContext struct {
+	snapshot session.RequestContext
+	original *sharedkernel.Message
+}
+
 // errRepo 是仓储故障的哨兵错误，供断言透传路径。
 var errRepo = errors.New("repo failure")
 
 func newMemRepo() *memRepo {
 	return &memRepo{
-		msgs:      make(map[string][]sharedkernel.Message),
-		sysMsgs:   make(map[string]sharedkernel.Message),
-		metas:     make(map[string]sharedkernel.SessionMeta),
-		contexts:  make(map[string]session.RequestContext),
-		artifacts: make(map[string]map[string]string),
+		msgs:            make(map[string][]sharedkernel.Message),
+		sysMsgs:         make(map[string]sharedkernel.Message),
+		metas:           make(map[string]sharedkernel.SessionMeta),
+		contexts:        make(map[string]session.RequestContext),
+		artifacts:       make(map[string]map[string]string),
+		pendingContexts: make(map[string]memPendingContext),
 	}
 }
 
 func (m *memRepo) GetRequestContext(ctx context.Context, id string) (session.RequestContext, error) {
+	if pending, ok := m.pendingContexts[id]; ok {
+		if pending.original != nil {
+			m.msgs[id] = append(m.msgs[id], pending.original.Clone())
+		}
+		m.contexts[id] = pending.snapshot.Clone()
+		m.metas[id] = sharedkernel.SessionMeta{
+			TokenUsed: pending.snapshot.TokenUsed, WindowToken: pending.snapshot.WindowToken,
+		}
+		delete(m.pendingContexts, id)
+	}
 	if snapshot, ok := m.contexts[id]; ok {
 		return snapshot.Clone(), nil
 	}
@@ -67,6 +85,15 @@ func (m *memRepo) GetRequestContext(ctx context.Context, id string) (session.Req
 }
 
 func (m *memRepo) SaveRequestContext(ctx context.Context, id string, snapshot session.RequestContext, original *sharedkernel.Message) error {
+	if m.failWithPending {
+		var originalCopy *sharedkernel.Message
+		if original != nil {
+			copy := original.Clone()
+			originalCopy = &copy
+		}
+		m.pendingContexts[id] = memPendingContext{snapshot: snapshot.Clone(), original: originalCopy}
+		return errRepo
+	}
 	if m.failSaveContext || (original != nil && (m.failAppend || m.failUpdateMeta)) || (original == nil && m.failUpsertSys) {
 		return errRepo
 	}

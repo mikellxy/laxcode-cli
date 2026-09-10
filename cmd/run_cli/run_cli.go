@@ -69,8 +69,18 @@ func newEventConsumer(sendIn func(string)) func(*reactservice.ReactEvent) {
 			}
 		case reactservice.ReActEventTypeToolCall:
 			sendIn(fmt.Sprintf("%s[LaxCode] tool execute... %s%s\n", ColorYellow, e.Content, ColorReset))
+		case reactservice.ReActEventTypeRecovery:
+			sendIn(fmt.Sprintf("%s[LaxCode] %s%s\n", ColorYellow, e.Content, ColorReset))
 		}
 	}
+}
+
+func formatRuntimeError(err error) string {
+	message := fmt.Sprintf("%s\n%s[LaxCode] error: %v", ColorReset, ColorRed, err)
+	if errors.Is(err, reactservice.ErrPersistRequestContext) {
+		message += "\n[LaxCode] 会话状态保存未完成；可以继续输入，系统会在下次对话开始前先恢复上一轮。"
+	}
+	return message + ColorReset + "\n"
 }
 
 func Run() {
@@ -135,7 +145,7 @@ func Run() {
 			case input := <-outChan:
 				if _, err := assembled.Service.Chat(ctx, input); err != nil {
 					// 运行期错误经 inChan 回流到 TUI 呈现，本轮仍以终止符收尾
-					sendIn(fmt.Sprintf("%s\n%s[LaxCode] error: %v%s\n", ColorReset, ColorRed, err, ColorReset))
+					sendIn(formatRuntimeError(err))
 				}
 				sendIn(cliprinter.StreamEnd)
 			}

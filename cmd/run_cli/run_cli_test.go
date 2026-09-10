@@ -1,7 +1,9 @@
 package run_cli
 
 import (
+	"errors"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/mikellxy/laxcode/internal/application/reactservice"
@@ -47,5 +49,26 @@ func TestEventConsumerShowsToolOnlyAtExecution(t *testing.T) {
 	want := []string{ColorYellow + "[LaxCode] tool execute... bash: ls" + ColorReset + "\n"}
 	if !reflect.DeepEqual(output, want) {
 		t.Fatalf("工具执行提示不符：got %q, want %q", output, want)
+	}
+}
+
+func TestEventConsumerShowsRecovery(t *testing.T) {
+	var output []string
+	rcf := newEventConsumer(func(s string) { output = append(output, s) })
+	rcf(&reactservice.ReactEvent{Type: reactservice.ReActEventTypeRecovery, Content: "正在恢复"})
+	want := []string{ColorYellow + "[LaxCode] 正在恢复" + ColorReset + "\n"}
+	if !reflect.DeepEqual(output, want) {
+		t.Fatalf("恢复提示不符：got %q, want %q", output, want)
+	}
+}
+
+func TestFormatRuntimeErrorAddsPersistRetryHint(t *testing.T) {
+	got := formatRuntimeError(errors.Join(reactservice.ErrPersistRequestContext, errors.New("disk full")))
+	if !strings.Contains(got, "下次对话开始前先恢复上一轮") {
+		t.Fatalf("持久化错误应提示下次输入自动恢复：%q", got)
+	}
+	plain := formatRuntimeError(errors.New("provider error"))
+	if strings.Contains(plain, "下次对话开始前先恢复上一轮") {
+		t.Fatalf("普通错误不应显示持久化恢复提示：%q", plain)
 	}
 }

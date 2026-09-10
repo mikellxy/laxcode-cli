@@ -25,6 +25,10 @@ var (
 	ErrSystemViaAppend = errors.New("session: system message must go through UpsertSysMessage")
 	// ErrNilCompactor 表示未注入压缩策略。
 	ErrNilCompactor = errors.New("session: nil compactor strategy")
+	// ErrChatAlreadyActive 表示上一条用户请求尚未完成，不能直接开始下一条。
+	ErrChatAlreadyActive = errors.New("session: previous chat is still active")
+	// ErrStartChatRole 表示启动对话时传入的不是 user 消息。
+	ErrStartChatRole = errors.New("session: chat must start with a user message")
 )
 
 type Session struct {
@@ -55,6 +59,7 @@ func (s *Session) LoadMessages(msgs []sharedkernel.Message) {
 	loaded := sharedkernel.CloneMessages(msgs)
 	s.Messages = nil
 	s.LastSeq = 0
+	s.ActiveChatID = ""
 	for i := range loaded {
 		if loaded[i].Role == sharedkernel.RoleSystem {
 			s.Messages = append(s.Messages, loaded[i])
@@ -67,6 +72,7 @@ func (s *Session) LoadMessages(msgs []sharedkernel.Message) {
 		}
 		s.Messages = append(s.Messages, loaded[i])
 	}
+	s.RequestContext.inferActiveChatID()
 	s.refreshSysToken()
 }
 
@@ -151,6 +157,9 @@ func (s *Session) AppendMessage(msg *sharedkernel.Message) error {
 	if msg.Role == sharedkernel.RoleAssistant {
 		s.WindowToken.OverWrite(msg.TokenUsed)
 		s.TokenUsed.Add(msg.TokenUsed)
+		if len(msg.ToolCalls) == 0 {
+			s.ActiveChatID = ""
+		}
 	}
 
 	s.Messages = append(s.Messages, msg.Clone())

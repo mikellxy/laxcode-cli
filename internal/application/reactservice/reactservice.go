@@ -30,15 +30,19 @@ type ReActService struct {
 }
 
 var (
-	ErrInvalidContextBudget  = errors.New("reactservice: invalid model context budget")
-	ErrContextTargetNotReach = errors.New("reactservice: context compaction target cannot be reached")
+	ErrInvalidContextBudget   = errors.New("reactservice: invalid model context budget")
+	ErrContextTargetNotReach  = errors.New("reactservice: context compaction target cannot be reached")
+	ErrPersistRequestContext  = errors.New("reactservice: persist request context")
+	ErrInvalidRecoveryContext = errors.New("reactservice: active chat has no recoverable user message")
 )
 
 const (
-	ReActEventTypeChunk    = "chunk"
-	ReActEventTypeToolCall = "tool_call"
-	contextTriggerPercent  = 80
-	contextTargetPercent   = 60
+	ReActEventTypeChunk      = "chunk"
+	ReActEventTypeToolCall   = "tool_call"
+	ReActEventTypeRecovery   = "recovery"
+	contextTriggerPercent    = 80
+	contextTargetPercent     = 60
+	recoveryToolResultPrompt = "上一次工具调用未获得可确认的结果；它可能尚未执行，也可能已经执行但结果未被保存。请先检查当前状态，再决定是否重试。"
 )
 
 type ReactEvent struct {
@@ -76,7 +80,7 @@ func NewReActService(sess *session.Session,
 func (r *ReActService) InitSession(ctx context.Context) error {
 	snapshot, err := r.SessRepo.GetRequestContext(ctx, r.Session.ID)
 	if err != nil {
-		return err
+		return fmt.Errorf("%w: recover pending context: %w", ErrPersistRequestContext, err)
 	}
 	return r.Session.Restore(snapshot)
 }
@@ -88,13 +92,107 @@ func (r *ReActService) InitSysPrompt(ctx context.Context, p string) error {
 	return r.commitContext(ctx, candidate, nil)
 }
 
-// Chat 追加一条用户消息并跑一轮 ReAct 循环，直到模型给出无工具调用的回答。
+// Chat 先从仓储前滚 pending 并恢复上一个未完成的 ReAct，再追加本次用户消息。
+// 这样新输入不会越过一个缺少 tool result 或最终 assistant 的旧轮次。
 func (r *ReActService) Chat(ctx context.Context, p string) (*sharedkernel.Message, error) {
+	if err := r.recoverBeforeChat(ctx); err != nil {
+		return nil, fmt.Errorf("recover previous chat: %w", err)
+	}
 	userMsg := r.Session.BuildUserMessage(p)
-	if err := r.handleTurnMsg(ctx, &userMsg); err != nil {
+	candidate, err := r.Session.WithStartedChat(&userMsg)
+	if err != nil {
+		return nil, err
+	}
+	if err := r.commitContext(ctx, candidate, &userMsg); err != nil {
 		return nil, err
 	}
 	return r.think(ctx)
+}
+
+// recoverBeforeChat 是同进程恢复入口。GetRequestContext 会先完成仓储中的
+// pending 提交；恢复出的 ActiveChatID 非空时，补齐未落盘的 tool result，
+// 再让模型把上一轮收束为最终 assistant，成功后才允许开始新对话。
+func (r *ReActService) recoverBeforeChat(ctx context.Context) error {
+	snapshot, err := r.SessRepo.GetRequestContext(ctx, r.Session.ID)
+	if err != nil {
+		return err
+	}
+	if err := r.Session.Restore(snapshot); err != nil {
+		return err
+	}
+	if r.Session.ActiveChatID == "" {
+		return nil
+	}
+
+	if !hasUserMessage(r.Session.Messages) {
+		return ErrInvalidRecoveryContext
+	}
+	r.ReActEventConsumerF(&ReactEvent{
+		Type:    ReActEventTypeRecovery,
+		Content: "检测到上一次对话未完成，正在恢复后继续处理本次输入。",
+	})
+
+	// 显式 ActiveChatID 可能来自异常的旧版本快照；若尾部已经是最终回答，
+	// 只需持久化清除标记，不能额外再调用一次模型。
+	tail := r.Session.Messages[len(r.Session.Messages)-1]
+	if tail.Role == sharedkernel.RoleAssistant && len(tail.ToolCalls) == 0 {
+		candidate := r.Session.Clone()
+		candidate.ActiveChatID = ""
+		return r.commitContext(ctx, candidate, nil)
+	}
+
+	for _, call := range missingToolResults(r.Session.Messages) {
+		toolMsg := &sharedkernel.Message{
+			Role:       sharedkernel.RoleTool,
+			ToolCallID: call.ID,
+			Content:    recoveryToolResultPrompt,
+		}
+		if err := r.handleTurnMsg(ctx, toolMsg); err != nil {
+			return err
+		}
+	}
+	_, err = r.think(ctx)
+	return err
+}
+
+func hasUserMessage(messages []sharedkernel.Message) bool {
+	for i := len(messages) - 1; i >= 0; i-- {
+		if messages[i].Role == sharedkernel.RoleUser {
+			return true
+		}
+	}
+	return false
+}
+
+// missingToolResults 只检查最近一个 tool-call assistant。ReAct 在进入下一次
+// 模型调用前会持久化该组全部 tool result，因此恢复时最多只有这个调用组未闭合。
+func missingToolResults(messages []sharedkernel.Message) []sharedkernel.ToolCall {
+	callIndex := -1
+	for i := len(messages) - 1; i >= 0; i-- {
+		if messages[i].Role == sharedkernel.RoleAssistant && len(messages[i].ToolCalls) > 0 {
+			callIndex = i
+			break
+		}
+	}
+	if callIndex < 0 {
+		return nil
+	}
+
+	completed := make(map[string]struct{})
+	groupID := messages[callIndex].ToolCallGroupID
+	for i := callIndex + 1; i < len(messages); i++ {
+		if messages[i].Role == sharedkernel.RoleTool &&
+			(groupID == "" || messages[i].ToolCallGroupID == groupID) {
+			completed[messages[i].ToolCallID] = struct{}{}
+		}
+	}
+	var missing []sharedkernel.ToolCall
+	for _, call := range messages[callIndex].ToolCalls {
+		if _, ok := completed[call.ID]; !ok {
+			missing = append(missing, call)
+		}
+	}
+	return missing
 }
 
 func (r *ReActService) think(ctx context.Context) (*sharedkernel.Message, error) {
@@ -262,7 +360,7 @@ func (r *ReActService) handleTurnMsg(ctx context.Context, msg *sharedkernel.Mess
 func (r *ReActService) commitContext(ctx context.Context, candidate *session.Session, original *sharedkernel.Message) error {
 	// 同步提交只读借用候选工作集，无需再次深复制；仓储返回后才切换内存。
 	if err := r.SessRepo.SaveRequestContext(ctx, r.Session.ID, candidate.RequestContext, original); err != nil {
-		return fmt.Errorf("persist request context: %w", err)
+		return fmt.Errorf("%w: %w", ErrPersistRequestContext, err)
 	}
 	*r.Session = *candidate
 	return nil
