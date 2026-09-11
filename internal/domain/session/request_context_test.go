@@ -2,7 +2,6 @@ package session
 
 import (
 	"encoding/json"
-	"errors"
 	"fmt"
 	"reflect"
 	"strings"
@@ -11,8 +10,9 @@ import (
 	"github.com/mikellxy/laxcode/internal/domain/sharedkernel"
 )
 
-func TestIdentifiersSurviveSnapshotAndResume(t *testing.T) {
+func TestSequencesAndOriginsSurviveSnapshotAndResume(t *testing.T) {
 	s := NewSession("ids")
+	s.UpsertSysMessage("system")
 	messages := []sharedkernel.Message{
 		{Role: sharedkernel.RoleUser, Content: "q"},
 		{Role: sharedkernel.RoleAssistant, ToolCalls: []sharedkernel.ToolCall{{ID: "a", Arguments: json.RawMessage(`{}`)}, {ID: "b"}}},
@@ -25,22 +25,11 @@ func TestIdentifiersSurviveSnapshotAndResume(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	for i, m := range messages {
-		if m.Seq != uint64(i+1) {
-			t.Fatalf("seq=%d at %d", m.Seq, i)
+	for i, msg := range s.Messages {
+		want := uint64(i + 1)
+		if msg.Seq != want || msg.OriginalSeq != want {
+			t.Fatalf("message %d identity=(%d,%d), want (%d,%d)", i, msg.Seq, msg.OriginalSeq, want, want)
 		}
-	}
-	call := messages[1]
-	if call.TurnID == "" || call.ToolCallGroupID == "" {
-		t.Fatal("call has no IDs")
-	}
-	for _, i := range []int{2, 3} {
-		if messages[i].TurnID != call.TurnID || messages[i].ToolCallGroupID != call.ToolCallGroupID {
-			t.Fatal("parallel result lost identity")
-		}
-	}
-	if messages[4].TurnID == call.TurnID || messages[4].ToolCallGroupID != "" || messages[0].TurnID != "" {
-		t.Fatal("ordinary assistant and user identity semantics")
 	}
 	snapshot := s.Snapshot()
 	resumed := NewSession("ids")
@@ -48,17 +37,17 @@ func TestIdentifiersSurviveSnapshotAndResume(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !reflect.DeepEqual(s.Messages, resumed.Messages) {
-		t.Fatal("restore changed IDs")
+		t.Fatal("restore changed messages")
 	}
 	newMsg := sharedkernel.Message{Role: sharedkernel.RoleAssistant, Content: "continue"}
 	if err := resumed.AppendMessage(&newMsg); err != nil {
 		t.Fatal(err)
 	}
-	if newMsg.Seq != 6 || newMsg.TurnID == call.TurnID {
-		t.Fatal("ID reused after restart")
+	if newMsg.Seq != 7 || newMsg.OriginalSeq != 7 {
+		t.Fatalf("identity reused after restart: %+v", newMsg)
 	}
-	resumed.Messages[1].ToolCalls[0].Arguments[0] = 'x'
-	if string(s.Messages[1].ToolCalls[0].Arguments) != "{}" {
+	resumed.Messages[2].ToolCalls[0].Arguments[0] = 'x'
+	if string(s.Messages[2].ToolCalls[0].Arguments) != "{}" {
 		t.Fatal("snapshot aliased tool arguments")
 	}
 }
@@ -67,56 +56,43 @@ func TestInvalidSnapshotDoesNotReplaceWorkingContext(t *testing.T) {
 	s := NewSession("bad")
 	s.UpsertSysMessage("keep")
 	before := s.Snapshot()
-	bad := before.Clone()
-	bad.Version = 99
-	if err := s.Restore(bad); err == nil {
-		t.Fatal("accepted unsupported snapshot")
-	}
-	if !reflect.DeepEqual(before, s.Snapshot()) {
-		t.Fatal("failed restore changed session")
+	for _, mutate := range []func(*RequestContext){
+		func(r *RequestContext) { r.MemoryGeneration = 0 },
+		func(r *RequestContext) { r.LastSeq++ },
+		func(r *RequestContext) { r.Messages[0].OriginalSeq = 99 },
+		func(r *RequestContext) { r.Messages[0].Role = sharedkernel.RoleUser },
+	} {
+		bad := before.Clone()
+		mutate(&bad)
+		if err := s.Restore(bad); err == nil {
+			t.Fatal("accepted invalid snapshot")
+		}
+		if !reflect.DeepEqual(before, s.Snapshot()) {
+			t.Fatal("failed restore changed session")
+		}
 	}
 }
 
-func TestActiveChatLifecycleAndLegacyInference(t *testing.T) {
-	s := NewSession("active")
-	user := sharedkernel.Message{Role: sharedkernel.RoleUser, Content: "q"}
-	candidate, err := s.WithStartedChat(&user)
-	if err != nil {
+func TestAdvanceMemoryGeneration(t *testing.T) {
+	s := NewSession("generation")
+	if s.MemoryGeneration != 1 {
+		t.Fatalf("initial generation=%d", s.MemoryGeneration)
+	}
+	if err := s.AdvanceMemoryGeneration(); err != nil {
 		t.Fatal(err)
 	}
-	if candidate.ActiveChatID != "chat-1" {
-		t.Fatalf("启动对话后 ActiveChatID=%q", candidate.ActiveChatID)
+	if s.MemoryGeneration != 2 {
+		t.Fatalf("advanced generation=%d", s.MemoryGeneration)
 	}
-	if _, err := candidate.WithStartedChat(&sharedkernel.Message{Role: sharedkernel.RoleUser}); !errors.Is(err, ErrChatAlreadyActive) {
-		t.Fatalf("未完成对话期间应拒绝新 user，实际 %v", err)
-	}
-	final := sharedkernel.Message{Role: sharedkernel.RoleAssistant, Content: "done"}
-	if err := candidate.AppendMessage(&final); err != nil {
-		t.Fatal(err)
-	}
-	if candidate.ActiveChatID != "" {
-		t.Fatalf("最终 assistant 后应清除 ActiveChatID，实际 %q", candidate.ActiveChatID)
-	}
-
-	legacy := NewSession("legacy-active")
-	legacySnapshot := RequestContext{
-		Version: RequestContextVersion,
-		LastSeq: 2,
-		Messages: []sharedkernel.Message{
-			{Role: sharedkernel.RoleUser, Seq: 1, Content: "old"},
-			{Role: sharedkernel.RoleAssistant, Seq: 2, ToolCalls: []sharedkernel.ToolCall{{ID: "call"}}},
-		},
-	}
-	if err := legacy.Restore(legacySnapshot); err != nil {
-		t.Fatal(err)
-	}
-	if legacy.ActiveChatID != "chat-1" {
-		t.Fatalf("旧快照未推断出活跃对话：%q", legacy.ActiveChatID)
+	s.MemoryGeneration = ^uint64(0)
+	if err := s.AdvanceMemoryGeneration(); err == nil {
+		t.Fatal("generation overflow was accepted")
 	}
 }
 
 func TestAppendCandidateIsolatesSliceAndIncomingMessage(t *testing.T) {
 	s := NewSession("append")
+	s.UpsertSysMessage("system")
 	old := sharedkernel.Message{
 		Role:      sharedkernel.RoleAssistant,
 		ToolCalls: []sharedkernel.ToolCall{{ID: "old", Arguments: json.RawMessage(`{}`)}},
@@ -125,11 +101,10 @@ func TestAppendCandidateIsolatesSliceAndIncomingMessage(t *testing.T) {
 	if err := s.AppendMessage(&old); err != nil {
 		t.Fatal(err)
 	}
-	// 原切片即使还有容量，构造候选也不能写入它的 backing array。
 	backing := make([]sharedkernel.Message, 4)
 	copy(backing, s.Messages)
-	backing[1].Content = "unused capacity sentinel"
-	s.Messages = backing[:1]
+	backing[2].Content = "unused capacity sentinel"
+	s.Messages = backing[:2]
 	before := s.Snapshot()
 	incoming := sharedkernel.Message{
 		Role:      sharedkernel.RoleAssistant,
@@ -141,37 +116,32 @@ func TestAppendCandidateIsolatesSliceAndIncomingMessage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !reflect.DeepEqual(before, s.Snapshot()) || backing[1].Content != "unused capacity sentinel" {
-		t.Fatal("append candidate changed the original session or its backing array")
+	if !reflect.DeepEqual(before, s.Snapshot()) || backing[2].Content != "unused capacity sentinel" {
+		t.Fatal("append candidate changed the original session or backing array")
 	}
 	if candidate.LastSeq != s.LastSeq+1 || candidate.TokenUsed.TokenInput != 100 {
 		t.Fatal("candidate state was not advanced")
 	}
-	candidate.Messages[0].Content = "candidate only"
-	if s.Messages[0].Content != "" {
-		t.Fatal("message slice is shared")
-	}
 	incoming.ToolCalls[0].Arguments[0] = 'x'
 	incoming.Artifact.ID = "mutated by caller"
-	if string(candidate.Messages[1].ToolCalls[0].Arguments) != `{"n":1}` || candidate.Messages[1].Artifact.ID != "new-artifact" {
-		t.Fatal("new message retained mutable caller-owned fields")
+	if string(candidate.Messages[2].ToolCalls[0].Arguments) != `{"n":1}` || candidate.Messages[2].Artifact.ID != "new-artifact" {
+		t.Fatal("new message retained caller-owned mutable fields")
 	}
-	// 历史修改路径仍通过完整 Clone 隔离已有的嵌套字段。
 	editable := candidate.Clone()
-	editable.Messages[0].ToolCalls[0].Arguments[0] = 'x'
-	editable.Messages[0].Artifact.ID = "changed"
-	if string(s.Messages[0].ToolCalls[0].Arguments) != "{}" || candidate.Messages[0].Artifact.ID != "old-artifact" {
-		t.Fatal("editable clone changed shared read-only history")
+	editable.Messages[1].ToolCalls[0].Arguments[0] = 'x'
+	editable.Messages[1].Artifact.ID = "changed"
+	if string(s.Messages[1].ToolCalls[0].Arguments) != "{}" || candidate.Messages[1].Artifact.ID != "old-artifact" {
+		t.Fatal("editable clone changed shared history")
 	}
 }
 
 var appendContextSink RequestContext
 
-// 比较旧的“两次全量复制”与追加候选的内存准备开销，不包含 JSON 和磁盘 I/O。
 func BenchmarkAppendContextPreparation(b *testing.B) {
 	for _, count := range []int{100, 1000} {
 		b.Run(fmt.Sprintf("messages=%d", count), func(b *testing.B) {
 			s := NewSession("bench")
+			s.UpsertSysMessage("system")
 			args := json.RawMessage(`{"value":"` + strings.Repeat("x", 1024) + `"}`)
 			for i := 0; i < count; i++ {
 				m := sharedkernel.Message{Role: sharedkernel.RoleAssistant, ToolCalls: []sharedkernel.ToolCall{{ID: fmt.Sprint(i), Arguments: args}}}

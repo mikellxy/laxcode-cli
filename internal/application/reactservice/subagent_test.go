@@ -142,12 +142,12 @@ func TestSubAgentExecuteHappyPath(t *testing.T) {
 	for id, sys := range repo.sysMsgs {
 		if strings.HasPrefix(id, "sub:") {
 			sysCnt++
-			roles[sys.Role]++
+			_ = sys
 		}
 	}
 	repo.mu.Unlock()
-	if total != 2 {
-		t.Errorf("子会话对话流水应为 user/assistant 两条，实际 %d", total)
+	if total != 3 {
+		t.Errorf("子会话 original 应为 system/user/assistant 三条，实际 %d", total)
 	}
 	if sysCnt != 1 {
 		t.Errorf("子会话应单独存一份系统提示词，实际 %d", sysCnt)

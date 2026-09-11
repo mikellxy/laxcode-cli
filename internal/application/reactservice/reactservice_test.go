@@ -87,7 +87,6 @@ func TestRunEmitsReasoningEvent(t *testing.T) {
 func TestRunToolCallLoop(t *testing.T) {
 	repo := newMemRepo()
 	sess := newTestSession("s-tool", repo)
-	sess.ActiveChatID = "chat-1"
 	llm := &scriptedLLM{responses: []scriptedResp{
 		{msg: assistantMsgWithTool(sharedkernel.ToolCall{
 			ID:        "tc-1",
@@ -199,7 +198,7 @@ func TestRunForwardsChunksBeforeStreamReturns(t *testing.T) {
 				for i, chunk := range chunks {
 					emit(chunk)
 					assertChunks(t, rec.events, chunks[:i+1])
-					if len(sess.Messages) != 1 || len(repo.storedMsgs(sess.ID)) != 0 {
+					if len(sess.Messages) != 1 || len(repo.storedMsgs(sess.ID)) != 1 {
 						t.Fatal("生成完成前不得持久化或追加部分消息")
 					}
 				}
@@ -215,10 +214,10 @@ func TestRunForwardsChunksBeforeStreamReturns(t *testing.T) {
 			}
 			assertChunks(t, rec.events, chunks)
 			if streamErr != nil {
-				if msg != nil || len(sess.Messages) != 1 || len(repo.storedMsgs(sess.ID)) != 0 {
+				if msg != nil || len(sess.Messages) != 1 || len(repo.storedMsgs(sess.ID)) != 1 {
 					t.Fatal("流式失败不得保存不完整回复")
 				}
-			} else if msg.Content != "hello" || len(sess.Messages) != 2 || len(repo.storedMsgs(sess.ID)) != 1 {
+			} else if msg.Content != "hello" || len(sess.Messages) != 2 || len(repo.storedMsgs(sess.ID)) != 2 {
 				t.Fatal("流式完成后应返回并保存一条完整回复")
 			}
 		})
@@ -246,7 +245,6 @@ func TestRunPropagatesGenerateError(t *testing.T) {
 func TestRunUnknownToolDoesNotHang(t *testing.T) {
 	repo := newMemRepo()
 	sess := newTestSession("s-ghost", repo)
-	sess.ActiveChatID = "chat-1"
 	llm := &scriptedLLM{responses: []scriptedResp{
 		{msg: assistantMsgWithTool(sharedkernel.ToolCall{ID: "g1", Name: "ghost_tool", Arguments: []byte(`{}`)})},
 		{msg: assistantMsg("recovered")},
@@ -301,20 +299,20 @@ func TestInitSessionRestoresHistoryAndMeta(t *testing.T) {
 	sid := "s-resume"
 	// 预置一份“上一次运行”留下的会话状态
 	stored := session.NewSession(sid)
-	stored.UpsertSysMessage("旧提示词")
-	revision, err := repo.CommitSnapshot(ctx, sid, stored.Snapshot())
+	sys := stored.UpsertSysMessage("旧提示词")
+	revision, err := repo.CommitCreateMessage(ctx, sid, stored.Snapshot(), sys, sys)
 	if err != nil {
 		t.Fatalf("预置系统提示词：%v", err)
 	}
 	stored.Revision = revision
 	userMsg := sharedkernel.Message{Role: sharedkernel.RoleUser, Content: "上一轮提问"}
-	candidate, err := stored.WithStartedChat(&userMsg)
+	candidate, err := stored.WithAppendedMessage(&userMsg)
 	if err != nil {
 		t.Fatal(err)
 	}
 	candidate.TokenUsed = sharedkernel.TokenStatistics{TokenInput: 300, TokenOutput: 40}
 	candidate.WindowToken = sharedkernel.TokenStatistics{TokenInput: 120, TokenOutput: 8}
-	revision, err = repo.CommitAppendedMessage(ctx, sid, candidate.Snapshot(), userMsg)
+	revision, err = repo.CommitCreateMessage(ctx, sid, candidate.Snapshot(), userMsg, userMsg)
 	if err != nil {
 		t.Fatalf("预置工作集：%v", err)
 	}
@@ -377,18 +375,19 @@ func TestInitSysPromptWritesRepoAndKeepsSysAtHead(t *testing.T) {
 	if sys.TokenUsed != (sharedkernel.TokenStatistics{}) {
 		t.Errorf("系统消息不应携带伪造的实测用量：%+v", sys.TokenUsed)
 	}
-	// 系统提示词不进只追加的对话流水
-	if stored := repo.storedMsgs("s-sys"); len(stored) != 0 {
-		t.Errorf("系统提示词不应写进 history，实际 %+v", stored)
+	// system 首次进入 original，后续更新只改变当前 memory。
+	if stored := repo.storedMsgs("s-sys"); len(stored) != 1 || stored[0].Content != "旧提示词" {
+		t.Errorf("system original 应保持首次内容，实际 %+v", stored)
 	}
-	if repo.snapshotCalls != 2 || repo.appendCalls != 0 {
-		t.Fatalf("系统提示词应只走快照提交：snapshot=%d append=%d", repo.snapshotCalls, repo.appendCalls)
+	if repo.createCalls != 1 || repo.updateCalls != 1 || repo.generationCalls != 0 {
+		t.Fatalf("system 应先创建后更新：create=%d update=%d generation=%d",
+			repo.createCalls, repo.updateCalls, repo.generationCalls)
 	}
 }
 
 func TestInitSysPromptPropagatesRepoError(t *testing.T) {
 	repo := newMemRepo()
-	repo.failSnapshot = true
+	repo.failAppend = true
 	svc := NewReActService(session.NewSession("s1"), repo, &scriptedLLM{}, tools.NewDefaultRegistry(nil), nil, nil)
 	if err := svc.InitSysPrompt(context.Background(), "p"); !errors.Is(err, errRepo) {
 		t.Errorf("UpsertSysMessage 失败应透传，实际 %v", err)
@@ -421,17 +420,17 @@ func TestChatAppendsUserMessageToRepoAndSession(t *testing.T) {
 		t.Errorf("发给模型的消息序列不符：%+v", llm.lastMsgs)
 	}
 
-	// 仓储：对话流水里有 user 与 assistant，系统提示词单独一份
+	// 仓储 original 包含首次 system、user 与 assistant。
 	stored := repo.storedMsgs("s-chat")
-	if len(stored) != 2 {
-		t.Fatalf("history 应含 user+assistant 共 2 条，实际 %d：%+v", len(stored), stored)
+	if len(stored) != 3 {
+		t.Fatalf("history 应含 system+user+assistant 共 3 条，实际 %d：%+v", len(stored), stored)
 	}
-	if stored[0].Role != sharedkernel.RoleUser || stored[1].Role != sharedkernel.RoleAssistant {
+	if stored[0].Role != sharedkernel.RoleSystem || stored[1].Role != sharedkernel.RoleUser || stored[2].Role != sharedkernel.RoleAssistant {
 		t.Errorf("history 落盘顺序不符：%+v", stored)
 	}
-	if repo.snapshotCalls != 1 || repo.appendCalls != 2 {
-		t.Fatalf("Chat 应由一次初始化快照提交和两次 append 组成：snapshot=%d append=%d",
-			repo.snapshotCalls, repo.appendCalls)
+	if repo.createCalls != 3 || repo.updateCalls != 0 || repo.generationCalls != 0 {
+		t.Fatalf("Chat 应创建 system、user、assistant：create=%d update=%d generation=%d",
+			repo.createCalls, repo.updateCalls, repo.generationCalls)
 	}
 	if sys, ok := repo.storedSys("s-chat"); !ok || sys.Content != "system prompt" {
 		t.Errorf("系统提示词应独立落盘，实际 %+v / %v", sys, ok)
@@ -447,11 +446,11 @@ func TestChatContinuesCommittedInterruptedInput(t *testing.T) {
 	svc.ReActEventConsumerF = rec.record
 
 	user := svc.Session.BuildUserMessage("old question")
-	candidate, err := svc.Session.WithStartedChat(&user)
+	candidate, err := svc.Session.WithAppendedMessage(&user)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := svc.commitAppendedMessage(ctx, candidate, user); err != nil {
+	if err := svc.commitCreatedMessage(ctx, candidate, user, user); err != nil {
 		t.Fatal(err)
 	}
 	callMsg := assistantMsgWithTool(sharedkernel.ToolCall{ID: "call", Name: "side_effect"})
@@ -491,9 +490,6 @@ func TestChatContinuesCommittedInterruptedInput(t *testing.T) {
 		llm.lastMsgs[4].Role != sharedkernel.RoleUser || llm.lastMsgs[4].Content != "new question" {
 		t.Fatalf("模型应同时看到前滚结果和新输入：%+v", llm.lastMsgs)
 	}
-	if svc.Session.ActiveChatID != "" {
-		t.Fatalf("两轮均完成后不应残留 ActiveChatID：%q", svc.Session.ActiveChatID)
-	}
 	if len(rec.events) == 0 || rec.events[0].Type != ReActEventTypeRecovery {
 		t.Fatalf("应先发恢复事件，实际 %+v", rec.events)
 	}
@@ -506,11 +502,11 @@ func TestChatSynthesizesOnlyMissingToolResults(t *testing.T) {
 	svc := newTestService(t, "s-recover-missing", "system prompt", repo, llm, tools.NewDefaultRegistry(nil))
 
 	user := svc.Session.BuildUserMessage("old question")
-	candidate, err := svc.Session.WithStartedChat(&user)
+	candidate, err := svc.Session.WithAppendedMessage(&user)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := svc.commitAppendedMessage(ctx, candidate, user); err != nil {
+	if err := svc.commitCreatedMessage(ctx, candidate, user, user); err != nil {
 		t.Fatal(err)
 	}
 	if err := svc.handleTurnMsg(ctx, assistantMsgWithTool(
@@ -527,9 +523,6 @@ func TestChatSynthesizesOnlyMissingToolResults(t *testing.T) {
 
 	// 模拟 Ctrl+C 后重新启动：新服务只从持久化快照恢复旧执行链。
 	svc = newTestService(t, "s-recover-missing", "system prompt", repo, llm, tools.NewDefaultRegistry(nil))
-	if svc.Session.ActiveChatID == "" {
-		t.Fatal("重启后应保留未完成执行链的 ActiveChatID")
-	}
 	if _, err := svc.Chat(ctx, "new question"); err != nil {
 		t.Fatal(err)
 	}
@@ -541,8 +534,8 @@ func TestChatSynthesizesOnlyMissingToolResults(t *testing.T) {
 	if synthetic.Role != sharedkernel.RoleTool || synthetic.ToolCallID != "b" || synthetic.Content != recoveryToolResultPrompt {
 		t.Fatalf("只应为缺失的 b 构造恢复结果，实际 %+v", synthetic)
 	}
-	if synthetic.TurnID != msgs[2].TurnID || synthetic.ToolCallGroupID != msgs[2].ToolCallGroupID {
-		t.Fatalf("synthetic tool result 未继承调用组标识：%+v / %+v", msgs[2], synthetic)
+	if synthetic.OriginalSeq != synthetic.Seq {
+		t.Fatalf("synthetic tool result 未获得稳定原始序号：%+v", synthetic)
 	}
 	if msgs[5].Role != sharedkernel.RoleUser || msgs[5].Content != "new question" ||
 		msgs[6].Role != sharedkernel.RoleAssistant || msgs[6].Content != "combined done" {
@@ -562,11 +555,11 @@ func TestChatPersistsNewInputBeforeContinuingRecoveredChat(t *testing.T) {
 		&scriptedLLM{}, tools.NewDefaultRegistry(nil))
 
 	oldUser := svc.Session.BuildUserMessage("old question")
-	candidate, err := svc.Session.WithStartedChat(&oldUser)
+	candidate, err := svc.Session.WithAppendedMessage(&oldUser)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := svc.commitAppendedMessage(ctx, candidate, oldUser); err != nil {
+	if err := svc.commitCreatedMessage(ctx, candidate, oldUser, oldUser); err != nil {
 		t.Fatal(err)
 	}
 	if err := svc.handleTurnMsg(ctx, assistantMsgWithTool(
@@ -586,9 +579,6 @@ func TestChatPersistsNewInputBeforeContinuingRecoveredChat(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if snapshot.ActiveChatID != "chat-1" {
-		t.Fatalf("再次中断后应保留原执行链，实际 %q", snapshot.ActiveChatID)
-	}
 	if len(snapshot.Messages) != 5 ||
 		snapshot.Messages[3].Role != sharedkernel.RoleTool ||
 		snapshot.Messages[3].ToolCallID != "call" ||
@@ -601,12 +591,11 @@ func TestChatPersistsNewInputBeforeContinuingRecoveredChat(t *testing.T) {
 func TestMissingToolResultsOnlyReturnsUncommittedCalls(t *testing.T) {
 	messages := []sharedkernel.Message{
 		{Role: sharedkernel.RoleUser, Seq: 1},
-		{Role: sharedkernel.RoleAssistant, Seq: 2, ToolCallGroupID: "current", ToolCalls: []sharedkernel.ToolCall{
+		{Role: sharedkernel.RoleAssistant, Seq: 2, ToolCalls: []sharedkernel.ToolCall{
 			{ID: "a"}, {ID: "b"}, {ID: "c"},
 		}},
-		{Role: sharedkernel.RoleTool, Seq: 3, ToolCallGroupID: "current", ToolCallID: "b"},
-		{Role: sharedkernel.RoleTool, Seq: 4, ToolCallGroupID: "current", ToolCallID: "a"},
-		{Role: sharedkernel.RoleTool, Seq: 5, ToolCallGroupID: "old", ToolCallID: "c"},
+		{Role: sharedkernel.RoleTool, Seq: 3, ToolCallID: "b"},
+		{Role: sharedkernel.RoleTool, Seq: 4, ToolCallID: "a"},
 	}
 	missing := missingToolResults(messages)
 	if len(missing) != 1 || missing[0].ID != "c" {
@@ -656,7 +645,6 @@ func TestRequestContextIncludesUserMessagesAndUsage(t *testing.T) {
 	ctx := context.Background()
 	repo := newMemRepo()
 	sess := newTestSession("s-persist", repo)
-	sess.ActiveChatID = "chat-1"
 	svc := NewReActService(sess, repo, &scriptedLLM{}, tools.NewDefaultRegistry(nil), nil, nil)
 
 	if err := svc.handleTurnMsg(ctx, &sharedkernel.Message{Role: sharedkernel.RoleUser, Content: "q"}); err != nil {
@@ -707,11 +695,11 @@ func TestRunCompactsHistoryBeforeGenerate(t *testing.T) {
 	sess := newTestSession("s-compact", repo)
 	svc := NewReActService(sess, repo, &scriptedLLM{}, tools.NewDefaultRegistry(nil), func(*ReactEvent) {}, nil, repo)
 	user := sess.BuildUserMessage("q")
-	candidate, err := sess.WithStartedChat(&user)
+	candidate, err := sess.WithAppendedMessage(&user)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := svc.commitAppendedMessage(context.Background(), candidate, user); err != nil {
+	if err := svc.commitCreatedMessage(context.Background(), candidate, user, user); err != nil {
 		t.Fatal(err)
 	}
 	for _, msg := range []*sharedkernel.Message{
@@ -768,6 +756,10 @@ func TestRunCompactsHistoryBeforeGenerate(t *testing.T) {
 	if sess.Messages[0].Role != sharedkernel.RoleSystem {
 		t.Errorf("压缩不得弄丢系统提示词，实际首条：%+v", sess.Messages[0])
 	}
+	if sess.MemoryGeneration != 2 || repo.generationCalls != 1 {
+		t.Fatalf("一次完整压缩只应推进一个 memory generation：generation=%d commits=%d",
+			sess.MemoryGeneration, repo.generationCalls)
+	}
 	logOutput := logs.String()
 	for _, want := range []string{
 		`"msg":"context_compaction_triggered"`,
@@ -791,11 +783,11 @@ func TestRunDoesNotGenerateWhenCompactionCannotReachExactTarget(t *testing.T) {
 	sess := newTestSession("s-compact-unreachable", repo)
 	svc := NewReActService(sess, repo, &scriptedLLM{}, tools.NewDefaultRegistry(nil), func(*ReactEvent) {}, nil, repo)
 	user := sess.BuildUserMessage("q")
-	candidate, err := sess.WithStartedChat(&user)
+	candidate, err := sess.WithAppendedMessage(&user)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := svc.commitAppendedMessage(context.Background(), candidate, user); err != nil {
+	if err := svc.commitCreatedMessage(context.Background(), candidate, user, user); err != nil {
 		t.Fatal(err)
 	}
 	for _, msg := range []*sharedkernel.Message{

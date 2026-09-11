@@ -25,10 +25,6 @@ var (
 	ErrSystemViaAppend = errors.New("session: system message must go through UpsertSysMessage")
 	// ErrNilCompactor 表示未注入压缩策略。
 	ErrNilCompactor = errors.New("session: nil compactor strategy")
-	// ErrChatAlreadyActive 表示上一条用户请求尚未完成，不能直接开始下一条。
-	ErrChatAlreadyActive = errors.New("session: previous chat is still active")
-	// ErrStartChatRole 表示启动对话时传入的不是 user 消息。
-	ErrStartChatRole = errors.New("session: chat must start with a user message")
 )
 
 type Session struct {
@@ -49,7 +45,7 @@ func NewSession(sessionID string) *Session {
 	}
 	return &Session{
 		ID:             sessionID,
-		RequestContext: RequestContext{Version: RequestContextVersion},
+		RequestContext: RequestContext{MemoryGeneration: 1},
 	}
 }
 
@@ -67,20 +63,21 @@ func (s *Session) refreshSysToken() {
 // 只保存副本，返回值与内部状态互不别名，调用方改动返回值不会影响会话。
 // 窗口占用同步校正：扣掉旧提示词的估算占用，加上新提示词的。
 func (s *Session) UpsertSysMessage(content string) sharedkernel.Message {
-	sysMsg := sharedkernel.Message{
-		Role:    sharedkernel.RoleSystem,
-		Content: content,
-	}
-
+	var sysMsg sharedkernel.Message
 	if len(s.Messages) == 0 {
+		seq, err := s.nextSeq()
+		if err != nil {
+			panic(err)
+		}
+		sysMsg = sharedkernel.Message{Seq: seq, OriginalSeq: seq, Role: sharedkernel.RoleSystem, Content: content}
 		s.Messages = []sharedkernel.Message{sysMsg}
+		s.LastSeq = seq
 	} else if s.Messages[0].Role == sharedkernel.RoleSystem {
+		sysMsg = s.Messages[0].Clone()
+		sysMsg.Content = content
 		s.Messages[0] = sysMsg
 	} else {
-		msgs := make([]sharedkernel.Message, 0, len(s.Messages)+1)
-		msgs = append(msgs, sysMsg)
-		msgs = append(msgs, s.Messages...)
-		s.Messages = msgs
+		panic("session: invalid context without leading system message")
 	}
 
 	newToken := sharedkernel.EstimateTokenInt(content)
@@ -120,9 +117,6 @@ func (s *Session) AppendMessage(msg *sharedkernel.Message) error {
 	if msg.Role == sharedkernel.RoleAssistant {
 		s.WindowToken.OverWrite(msg.TokenUsed)
 		s.TokenUsed.Add(msg.TokenUsed)
-		if len(msg.ToolCalls) == 0 {
-			s.ActiveChatID = ""
-		}
 	}
 
 	s.Messages = append(s.Messages, msg.Clone())

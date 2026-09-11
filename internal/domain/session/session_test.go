@@ -63,6 +63,9 @@ func TestUpsertSysMessageOnEmptySession(t *testing.T) {
 	if s.Messages[0].Role != sharedkernel.RoleSystem || s.Messages[0].Content != "p1" {
 		t.Errorf("首条应为 system/p1，实际 %+v", s.Messages[0])
 	}
+	if s.Messages[0].Seq != 1 || s.Messages[0].OriginalSeq != 1 || s.LastSeq != 1 {
+		t.Fatalf("system 应由 domain 分配首个原始序号，实际 %+v last=%d", s.Messages[0], s.LastSeq)
+	}
 	if s.sysToken != sharedkernel.EstimateTokenInt("p1") {
 		t.Errorf("系统提示词估算占用未记账：got %d want %d", s.sysToken, sharedkernel.EstimateTokenInt("p1"))
 	}
@@ -80,25 +83,11 @@ func TestUpsertSysMessageReplacesInPlace(t *testing.T) {
 	if s.Messages[0].Content != "p2" {
 		t.Errorf("系统提示词应更新为 p2，实际 %q", s.Messages[0].Content)
 	}
+	if s.Messages[0].Seq != 1 || s.Messages[0].OriginalSeq != 1 || s.LastSeq != 1 {
+		t.Fatal("替换 system 不应分配新序号")
+	}
 	if s.sysToken != sharedkernel.EstimateTokenInt("p2") {
 		t.Errorf("估算占用应跟随新提示词，got %d", s.sysToken)
-	}
-}
-
-// 历史首条不是系统消息时，系统提示词插入到头部（仍满足"恒居首位"）。
-func TestUpsertSysMessageInsertsBeforeNonSystemHead(t *testing.T) {
-	s := NewSession("s1")
-	if err := s.AppendMessage(&sharedkernel.Message{Role: sharedkernel.RoleUser, Content: "q"}); err != nil {
-		t.Fatalf("append user: %v", err)
-	}
-
-	s.UpsertSysMessage("p1")
-
-	if len(s.Messages) != 2 {
-		t.Fatalf("应插入到头部，实际 %d 条", len(s.Messages))
-	}
-	if s.Messages[0].Role != sharedkernel.RoleSystem || s.Messages[1].Content != "q" {
-		t.Errorf("顺序应为 system → user，实际 %+v", s.Messages)
 	}
 }
 

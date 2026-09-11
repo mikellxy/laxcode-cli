@@ -27,12 +27,15 @@ type memRepo struct {
 	artifacts       map[string]map[string]string
 	failLoadContext bool
 	failSaveContext bool
-	failSnapshot  bool
+	failSnapshot    bool
 	failAppend      bool
 	failArtifact    bool
-	snapshotCalls int
+	createCalls     int
+	updateCalls     int
+	generationCalls int
+	snapshotCalls   int // update + generation，保留给部分故障测试观察
 	appendCalls     int
-	lastSnapshot  session.RequestContext
+	lastSnapshot    session.RequestContext
 	lastAppend      session.RequestContext
 	lastAppendedMsg sharedkernel.Message
 }
@@ -58,69 +61,85 @@ func (m *memRepo) GetRequestContext(_ context.Context, id string) (session.Reque
 	if snapshot, ok := m.contexts[id]; ok {
 		return snapshot.Clone(), nil
 	}
-	return session.RequestContext{Version: session.RequestContextVersion}, nil
+	return session.RequestContext{MemoryGeneration: 1}, nil
 }
 
-func (m *memRepo) CommitSnapshot(_ context.Context, id string, snapshot session.RequestContext) (uint64, error) {
+func (m *memRepo) CommitCreateMessage(_ context.Context, id string, snapshot session.RequestContext, original, memory sharedkernel.Message) (uint64, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.createCalls++
+	m.appendCalls++
+	m.lastAppend = snapshot.Clone()
+	m.lastAppendedMsg = original.Clone()
+	previous, exists := m.contexts[id]
+	if m.failSaveContext || m.failAppend {
+		return 0, errRepo
+	}
+	if err := snapshot.Validate(); err != nil {
+		return 0, err
+	}
+	if !reflect.DeepEqual(original, memory) || len(snapshot.Messages) == 0 || !reflect.DeepEqual(snapshot.Messages[len(snapshot.Messages)-1], memory) {
+		return 0, errRepo
+	}
+	if exists {
+		if snapshot.Revision != previous.Revision || snapshot.LastSeq != previous.LastSeq+1 || snapshot.MemoryGeneration != previous.MemoryGeneration {
+			return 0, errRepo
+		}
+	} else if snapshot.Revision != 0 || snapshot.LastSeq != 1 || snapshot.MemoryGeneration != 1 || len(snapshot.Messages) != 1 {
+		return 0, errRepo
+	}
+	if original.Seq != snapshot.LastSeq || original.OriginalSeq != original.Seq {
+		return 0, errRepo
+	}
+	m.msgs[id] = append(m.msgs[id], original.Clone())
+	return m.saveSnapshot(id, snapshot), nil
+}
+
+func (m *memRepo) CommitUpdateMessage(_ context.Context, id string, snapshot session.RequestContext, memory sharedkernel.Message) (uint64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.updateCalls++
 	m.snapshotCalls++
 	m.lastSnapshot = snapshot.Clone()
 	previous, exists := m.contexts[id]
 	if m.failSaveContext || m.failSnapshot {
 		return 0, errRepo
 	}
+	if !exists || snapshot.Revision != previous.Revision || snapshot.LastSeq != previous.LastSeq || snapshot.MemoryGeneration != previous.MemoryGeneration {
+		return 0, errRepo
+	}
 	if err := snapshot.Validate(); err != nil {
 		return 0, err
 	}
-	if exists && (snapshot.Revision != previous.Revision || snapshot.LastSeq != previous.LastSeq) {
-		return 0, errRepo
+	found := false
+	for _, msg := range snapshot.Messages {
+		if msg.Seq == memory.Seq && reflect.DeepEqual(msg, memory) {
+			found = true
+			break
+		}
 	}
-	if !exists {
-		if snapshot.Revision != 0 || snapshot.LastSeq != 0 {
-			return 0, errRepo
-		}
-		for i := range snapshot.Messages {
-			if snapshot.Messages[i].Role != sharedkernel.RoleSystem {
-				return 0, errRepo
-			}
-		}
+	if !found {
+		return 0, errRepo
 	}
 	return m.saveSnapshot(id, snapshot), nil
 }
 
-func (m *memRepo) CommitAppendedMessage(
-	_ context.Context,
-	id string,
-	snapshot session.RequestContext,
-	newMsg sharedkernel.Message,
-) (uint64, error) {
+func (m *memRepo) CommitNextMemoryGeneration(_ context.Context, id string, snapshot session.RequestContext) (uint64, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.appendCalls++
-	m.lastAppend = snapshot.Clone()
-	m.lastAppendedMsg = newMsg.Clone()
+	m.generationCalls++
+	m.snapshotCalls++
+	m.lastSnapshot = snapshot.Clone()
 	previous, exists := m.contexts[id]
-	if m.failSaveContext || m.failAppend {
+	if m.failSaveContext || m.failSnapshot {
 		return 0, errRepo
 	}
-	if !exists || snapshot.Revision != previous.Revision || snapshot.LastSeq != previous.LastSeq+1 {
+	if !exists || snapshot.Revision != previous.Revision || snapshot.LastSeq != previous.LastSeq || snapshot.MemoryGeneration != previous.MemoryGeneration+1 {
 		return 0, errRepo
 	}
 	if err := snapshot.Validate(); err != nil {
 		return 0, err
 	}
-	if len(snapshot.Messages) == 0 || !reflect.DeepEqual(snapshot.Messages[len(snapshot.Messages)-1], newMsg) {
-		return 0, errRepo
-	}
-	isFinalAssistant := newMsg.Role == sharedkernel.RoleAssistant && len(newMsg.ToolCalls) == 0
-	if isFinalAssistant && snapshot.ActiveChatID != "" {
-		return 0, errRepo
-	}
-	if !isFinalAssistant && snapshot.ActiveChatID == "" {
-		return 0, errRepo
-	}
-	m.msgs[id] = append(m.msgs[id], newMsg.Clone())
 	return m.saveSnapshot(id, snapshot), nil
 }
 
@@ -316,8 +335,8 @@ func (fatalTool) AfterExecInfo(json.RawMessage) string { return "" }
 // 聚合先落定状态并交出快照，再由调用方（平时是 ReActService.InitSysPrompt）落盘。
 func newTestSession(id string, repo session.SessionRepository) *session.Session {
 	sess := session.NewSession(id)
-	sess.UpsertSysMessage("system prompt")
-	if revision, err := repo.CommitSnapshot(context.Background(), id, sess.Snapshot()); err != nil {
+	sys := sess.UpsertSysMessage("system prompt")
+	if revision, err := repo.CommitCreateMessage(context.Background(), id, sess.Snapshot(), sys, sys); err != nil {
 		panic(err)
 	} else {
 		sess.Revision = revision

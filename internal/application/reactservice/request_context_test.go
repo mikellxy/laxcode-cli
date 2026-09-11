@@ -40,7 +40,6 @@ func TestCompactionSnapshotAndArtifactSurviveRestart(t *testing.T) {
 	if err := svc.InitSysPrompt(ctx, "sys"); err != nil {
 		t.Fatal(err)
 	}
-	s.ActiveChatID = "chat-test"
 	large := strings.Repeat("raw 中文🙂 output\n", 1000)
 	for _, id := range []string{"old", "a", "b", "c"} {
 		if err := svc.handleTurnMsg(ctx, assistantMsgWithTool(sharedkernel.ToolCall{ID: id, Name: "tool", Arguments: json.RawMessage(`{}`)})); err != nil {
@@ -80,7 +79,7 @@ func TestCompactionSnapshotAndArtifactSurviveRestart(t *testing.T) {
 		}
 		raw = append(raw, msg)
 	}
-	if raw[1].Content != large || raw[1].Artifact != nil {
+	if raw[2].Content != large || raw[2].Artifact != nil {
 		t.Fatal("raw archive was modified")
 	}
 	args, _ := json.Marshal(map[string]any{"artifact_id": before.Messages[2].Artifact.ID, "offset": 0, "limit": 100})
@@ -102,7 +101,6 @@ func TestFailedCompactionNeverReplacesCurrentContext(t *testing.T) {
 		t.Run(failure, func(t *testing.T) {
 			repo := newMemRepo()
 			s := newTestSession("failure", repo)
-			s.ActiveChatID = "chat-test"
 			svc := NewReActService(s, repo, &scriptedLLM{}, tools.NewDefaultRegistry(nil), nil, nil, repo)
 			for _, id := range []string{"old", "a", "b", "c"} {
 				if err := svc.handleTurnMsg(context.Background(), assistantMsgWithTool(sharedkernel.ToolCall{ID: id, Name: "tool"})); err != nil {
@@ -145,7 +143,6 @@ func TestFailedCompactionNeverReplacesCurrentContext(t *testing.T) {
 func TestAppendCommitFailurePreservesContextAndRetryIdentity(t *testing.T) {
 	repo := newMemRepo()
 	s := newTestSession("append-fail", repo)
-	s.ActiveChatID = "chat-1"
 	svc := NewReActService(s, repo, &scriptedLLM{}, tools.NewDefaultRegistry(nil), nil, nil)
 	ctx := context.Background()
 	if err := svc.handleTurnMsg(ctx, assistantMsgWithTool(sharedkernel.ToolCall{ID: "old", Arguments: json.RawMessage(`{}`)})); err != nil {
@@ -163,12 +160,12 @@ func TestAppendCommitFailurePreservesContextAndRetryIdentity(t *testing.T) {
 	if !reflect.DeepEqual(before, s.Snapshot()) || !reflect.DeepEqual(before, repo.contexts[s.ID]) {
 		t.Fatal("failed append changed committed state")
 	}
-	seq, turn, group := msg.Seq, msg.TurnID, msg.ToolCallGroupID
+	seq, originalSeq := msg.Seq, msg.OriginalSeq
 	repo.failAppend = false
 	if err := svc.handleTurnMsg(ctx, &msg); err != nil {
 		t.Fatal(err)
 	}
-	if msg.Seq != seq || msg.TurnID != turn || msg.ToolCallGroupID != group {
+	if msg.Seq != seq || msg.OriginalSeq != originalSeq {
 		t.Fatal("retry changed identity")
 	}
 	msg.Artifact.ID = "caller edit"
@@ -176,7 +173,7 @@ func TestAppendCommitFailurePreservesContextAndRetryIdentity(t *testing.T) {
 		t.Fatal("caller mutation reached active context")
 	}
 	s.Messages[len(s.Messages)-1].Artifact.ID = "session edit"
-	if repo.contexts[s.ID].Messages[len(s.Messages)-1].Artifact.ID != "incoming" || repo.storedMsgs(s.ID)[1].Artifact.ID != "incoming" {
+	if repo.contexts[s.ID].Messages[len(s.Messages)-1].Artifact.ID != "incoming" || repo.storedMsgs(s.ID)[len(repo.storedMsgs(s.ID))-1].Artifact.ID != "incoming" {
 		t.Fatal("repository retained borrowed mutable references")
 	}
 }

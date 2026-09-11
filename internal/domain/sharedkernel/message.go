@@ -8,15 +8,14 @@ const (
 )
 
 type Message struct {
-	// Seq 在 session 内单调递增；system 消息不属于追加流水，使用 0。
+	// Seq 在 session 内单调递增，system 首次创建时也会占用一个序号。
 	Seq uint64 `json:"seq,omitempty"`
-	// TurnID 标识一次模型响应，其工具结果继承相同 ID；user/system 为空。
-	TurnID string `json:"turn_id,omitempty"`
-	// 一条 assistant 发起的全部调用及其结果共享同一个调用组 ID。
-	ToolCallGroupID string       `json:"tool_call_group_id,omitempty"`
-	Artifact        *ArtifactRef `json:"artifact,omitempty"`
-	Role            string       `json:"role"`
-	Content         string       `json:"content"`
+	// OriginalSeq 指向该工作集消息对应的不可变原始消息。当前压缩策略不合并
+	// 多条消息，因此始终与 Seq 相同；将来支持摘要合并时再扩展为多来源模型。
+	OriginalSeq uint64       `json:"original_seq,omitempty"`
+	Artifact    *ArtifactRef `json:"artifact,omitempty"`
+	Role        string       `json:"role"`
+	Content     string       `json:"content"`
 	// ReasoningID and ReasoningContent carry the model's chain-of-thought
 	// (assistant messages only), replayed to Responses API on later turns.
 	ReasoningID      string     `json:"reasoning_id,omitempty"`

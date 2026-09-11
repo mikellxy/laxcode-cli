@@ -15,12 +15,13 @@ import (
 type SessionRepository interface {
 	// GetRequestContext 读取数据库中的最新工作集；会话不存在时返回空工作集。
 	GetRequestContext(ctx context.Context, sessionID string) (RequestContext, error)
-	// CommitSnapshot 提交不产生新 original 消息的工作集快照。新 Session 只能
-	// 通过该方法以 Revision=0、LastSeq=0 初始化；成功后 revision 仍会递增。
-	// 参数在同步调用期间只读借用。实现不得修改或在返回后保留任何切片、
-	// 指针引用；内存存储或异步处理须自行复制。调用方在返回前也不得修改参数。
-	CommitSnapshot(ctx context.Context, sessionID string, snapshot RequestContext) (uint64, error)
-	// CommitAppendedMessage 原子保存一条明确的新增 original 消息及其对应的最新
-	// 工作集。snapshot 必须只比当前状态前进一步，且尾消息必须与 newMsg 等价。
-	CommitAppendedMessage(ctx context.Context, sessionID string, snapshot RequestContext, newMsg sharedkernel.Message) (uint64, error)
+	// CommitCreateMessage 原子创建一条不可变 original、当前 generation 的
+	// memory 副本及新的 context head。首次 system 也使用本方法创建 Session。
+	CommitCreateMessage(ctx context.Context, sessionID string, snapshot RequestContext, original, memory sharedkernel.Message) (uint64, error)
+	// CommitUpdateMessage 只更新当前 generation 中的一条 memory 消息；用于
+	// 后续启动时替换 system，original 与 generation 均保持不变。
+	CommitUpdateMessage(ctx context.Context, sessionID string, snapshot RequestContext, memory sharedkernel.Message) (uint64, error)
+	// CommitNextMemoryGeneration 批量创建压缩后的下一代 memory 消息并原子
+	// 切换 context head，旧 generation 保留且不再修改。
+	CommitNextMemoryGeneration(ctx context.Context, sessionID string, snapshot RequestContext) (uint64, error)
 }

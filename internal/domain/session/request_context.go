@@ -6,20 +6,17 @@ import (
 	"github.com/mikellxy/laxcode/internal/domain/sharedkernel"
 )
 
-const RequestContextVersion = 1
-
 // RequestContext 是会话最新工作集；完整历史仅在仓储追加保存。
 // LastSeq 不因压缩改变，避免重启后复用历史消息的标识。
 type RequestContext struct {
 	// Revision 是仓储乐观锁版本，不参与 JSON 冷备；首次保存为 0，每次数据库
 	// 提交成功后加一。
-	Revision     uint64                       `json:"-"`
-	Version      int                          `json:"version"`
-	LastSeq      uint64                       `json:"last_seq"`
-	ActiveChatID string                       `json:"active_chat_id,omitempty"`
-	Messages     []sharedkernel.Message       `json:"messages"`
-	TokenUsed    sharedkernel.TokenStatistics `json:"token_used"`
-	WindowToken  sharedkernel.TokenStatistics `json:"window_token"`
+	Revision         uint64                       `json:"-"`
+	MemoryGeneration uint64                       `json:"memory_generation"`
+	LastSeq          uint64                       `json:"last_seq"`
+	Messages         []sharedkernel.Message       `json:"messages"`
+	TokenUsed        sharedkernel.TokenStatistics `json:"token_used"`
+	WindowToken      sharedkernel.TokenStatistics `json:"window_token"`
 }
 
 func (r RequestContext) Clone() RequestContext {
@@ -28,42 +25,35 @@ func (r RequestContext) Clone() RequestContext {
 }
 
 func (r RequestContext) Validate() error {
-	if r.Version != RequestContextVersion {
-		return fmt.Errorf("session: unsupported request context version %d", r.Version)
+	if r.MemoryGeneration == 0 {
+		return fmt.Errorf("session: memory generation must start at 1")
+	}
+	if len(r.Messages) == 0 {
+		if r.LastSeq != 0 {
+			return fmt.Errorf("session: empty context has last sequence %d", r.LastSeq)
+		}
+		return nil
 	}
 	var prev uint64
 	for i, m := range r.Messages {
-		if m.Role == sharedkernel.RoleSystem {
-			if i != 0 || m.Seq != 0 {
-				return fmt.Errorf("session: invalid system message position/seq")
-			}
-			continue
+		if i == 0 && m.Role != sharedkernel.RoleSystem {
+			return fmt.Errorf("session: first message must be system")
 		}
-		if m.Seq <= prev || m.Seq > r.LastSeq {
+		if i > 0 && m.Role == sharedkernel.RoleSystem {
+			return fmt.Errorf("session: system message must be first")
+		}
+		if m.Seq == 0 || m.Seq <= prev || m.Seq > r.LastSeq {
 			return fmt.Errorf("session: invalid message sequence %d", m.Seq)
+		}
+		if m.OriginalSeq != m.Seq {
+			return fmt.Errorf("session: message %d has invalid original sequence %d", m.Seq, m.OriginalSeq)
 		}
 		prev = m.Seq
 	}
+	if prev != r.LastSeq {
+		return fmt.Errorf("session: last message sequence %d does not match context %d", prev, r.LastSeq)
+	}
 	return nil
-}
-
-// inferActiveChatID 兼容尚未写入 ActiveChatID 的 v1 快照。只有尾消息明确
-// 表示 ReAct 尚未收束时才推断为活跃；普通 assistant 尾消息视为已完成。
-func (r *RequestContext) inferActiveChatID() {
-	if r.ActiveChatID != "" || len(r.Messages) == 0 {
-		return
-	}
-	tail := r.Messages[len(r.Messages)-1]
-	if tail.Role == sharedkernel.RoleSystem ||
-		(tail.Role == sharedkernel.RoleAssistant && len(tail.ToolCalls) == 0) {
-		return
-	}
-	for i := len(r.Messages) - 1; i >= 0; i-- {
-		if r.Messages[i].Role == sharedkernel.RoleUser {
-			r.ActiveChatID = fmt.Sprintf("chat-%d", r.Messages[i].Seq)
-			return
-		}
-	}
 }
 
 func (s *Session) Snapshot() RequestContext { return s.RequestContext.Clone() }
@@ -72,7 +62,6 @@ func (s *Session) Restore(snapshot RequestContext) error {
 	if err := snapshot.Validate(); err != nil {
 		return err
 	}
-	snapshot.inferActiveChatID()
 	s.RequestContext = snapshot.Clone()
 	s.refreshSysToken()
 	return nil
@@ -98,55 +87,41 @@ func (s *Session) WithAppendedMessage(msg *sharedkernel.Message) (*Session, erro
 	return &candidate, nil
 }
 
-// WithStartedChat 原子构造“追加用户消息 + 标记活跃对话”的候选状态。
-// ActiveChatID 由用户消息稳定 Seq 派生，与候选快照一起持久化。
-func (s *Session) WithStartedChat(msg *sharedkernel.Message) (*Session, error) {
-	if s.ActiveChatID != "" {
-		return nil, ErrChatAlreadyActive
-	}
-	if msg == nil {
-		return nil, ErrNilMessage
-	}
-	if msg.Role != sharedkernel.RoleUser {
-		return nil, ErrStartChatRole
-	}
-	candidate, err := s.WithAppendedMessage(msg)
-	if err != nil {
-		return nil, err
-	}
-	candidate.ActiveChatID = fmt.Sprintf("chat-%d", msg.Seq)
-	return candidate, nil
-}
-
-// identify 在写原文之前赋值，工具结果从其调用消息继承标识。
-// ID 由稳定 Seq 派生，无需另一个需要落盘的计数器。
+// identify 在写原文之前由聚合分配序号。Application 只表达新增消息，不接触
+// 发号细节；当前一对一压缩模型下 OriginalSeq 与 Seq 相同。
 func (s *Session) identify(msg *sharedkernel.Message) error {
 	if msg.Seq == 0 {
-		msg.Seq = s.LastSeq + 1
+		seq, err := s.nextSeq()
+		if err != nil {
+			return err
+		}
+		msg.Seq = seq
 	}
 	if msg.Seq <= s.LastSeq {
 		return fmt.Errorf("session: sequence %d is not after %d", msg.Seq, s.LastSeq)
 	}
-	switch msg.Role {
-	case sharedkernel.RoleAssistant:
-		msg.TurnID = fmt.Sprintf("turn-%d", msg.Seq)
-		msg.ToolCallGroupID = ""
-		if len(msg.ToolCalls) > 0 {
-			msg.ToolCallGroupID = fmt.Sprintf("tool-group-%d", msg.Seq)
-		}
-	case sharedkernel.RoleTool:
-		msg.TurnID, msg.ToolCallGroupID = "", ""
-		for i := len(s.Messages) - 1; i >= 0; i-- {
-			for _, call := range s.Messages[i].ToolCalls {
-				if call.ID == msg.ToolCallID {
-					msg.TurnID = s.Messages[i].TurnID
-					msg.ToolCallGroupID = s.Messages[i].ToolCallGroupID
-					return nil
-				}
-			}
-		}
-	case sharedkernel.RoleUser:
-		msg.TurnID, msg.ToolCallGroupID = "", ""
+	if msg.OriginalSeq == 0 {
+		msg.OriginalSeq = msg.Seq
 	}
+	if msg.OriginalSeq != msg.Seq {
+		return fmt.Errorf("session: original sequence %d does not match sequence %d", msg.OriginalSeq, msg.Seq)
+	}
+	return nil
+}
+
+func (s *Session) nextSeq() (uint64, error) {
+	if s.LastSeq == ^uint64(0) {
+		return 0, fmt.Errorf("session: message sequence exhausted")
+	}
+	return s.LastSeq + 1, nil
+}
+
+// AdvanceMemoryGeneration 在一整轮压缩确认成功后调用一次。多轮压缩策略
+// 共用同一个候选 generation，避免一次压缩产生多个版本。
+func (s *Session) AdvanceMemoryGeneration() error {
+	if s.MemoryGeneration == ^uint64(0) {
+		return fmt.Errorf("session: memory generation exhausted")
+	}
+	s.MemoryGeneration++
 	return nil
 }

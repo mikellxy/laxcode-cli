@@ -31,10 +31,9 @@ type ReActService struct {
 }
 
 var (
-	ErrInvalidContextBudget   = errors.New("reactservice: invalid model context budget")
-	ErrContextTargetNotReach  = errors.New("reactservice: context compaction target cannot be reached")
-	ErrPersistRequestContext  = errors.New("reactservice: persist request context")
-	ErrInvalidRecoveryContext = errors.New("reactservice: active chat has no recoverable user message")
+	ErrInvalidContextBudget  = errors.New("reactservice: invalid model context budget")
+	ErrContextTargetNotReach = errors.New("reactservice: context compaction target cannot be reached")
+	ErrPersistRequestContext = errors.New("reactservice: persist request context")
 )
 
 const (
@@ -91,62 +90,45 @@ func (r *ReActService) InitSession(ctx context.Context) error {
 // InitSysPrompt 将本次系统提示词和账目一起提交到工作集快照。
 func (r *ReActService) InitSysPrompt(ctx context.Context, p string) error {
 	candidate := r.Session.Clone()
-	candidate.UpsertSysMessage(p)
-	return r.commitSnapshot(ctx, candidate)
+	isFirst := len(candidate.Messages) == 0
+	sysMsg := candidate.UpsertSysMessage(p)
+	if isFirst {
+		return r.commitCreatedMessage(ctx, candidate, sysMsg, sysMsg)
+	}
+	return r.commitUpdatedMessage(ctx, candidate, sysMsg)
 }
 
 // Chat 先为数据库中恢复出的未完成 ReAct 补齐缺失的 tool result；随后立即
 // 追加本次用户消息，让模型在同一次后续推理中综合旧工具结果与用户的新要求。
-// 恢复期间 ActiveChatID 保持不变，直到模型生成最终 assistant 才清除。
 func (r *ReActService) Chat(ctx context.Context, p string) (*sharedkernel.Message, error) {
 	if err := r.recoverBeforeChat(ctx); err != nil {
 		return nil, fmt.Errorf("recover previous chat: %w", err)
 	}
 	userMsg := r.Session.BuildUserMessage(p)
-	var (
-		candidate *session.Session
-		err       error
-	)
-	if r.Session.ActiveChatID == "" {
-		candidate, err = r.Session.WithStartedChat(&userMsg)
-	} else {
-		// 旧 Chat 尚未收束：新输入作为该执行链的补充/变更要求，
-		// 不创建新的 ActiveChatID。
-		candidate, err = r.Session.WithAppendedMessage(&userMsg)
-	}
+	candidate, err := r.Session.WithAppendedMessage(&userMsg)
 	if err != nil {
 		return nil, err
 	}
-	if err := r.commitAppendedMessage(ctx, candidate, userMsg); err != nil {
+	if err := r.commitCreatedMessage(ctx, candidate, userMsg, userMsg); err != nil {
 		return nil, err
 	}
 	return r.think(ctx)
 }
 
-// recoverBeforeChat 检查启动时从数据库恢复出的工作集。ActiveChatID 非空时只
-// 补齐未持久化的 tool result；Chat 会紧接着追加用户新输入，再把完整序列
-// 一次性交给模型继续推理。
+// recoverBeforeChat 直接从消息尾部推导上次执行是否收束；若未收束，只补齐
+// 最近一次工具调用中未持久化的 tool result，无需额外的活跃对话状态字段。
 func (r *ReActService) recoverBeforeChat(ctx context.Context) error {
-	if r.Session.ActiveChatID == "" {
+	if !hasUserMessage(r.Session.Messages) {
 		return nil
 	}
-
-	if !hasUserMessage(r.Session.Messages) {
-		return ErrInvalidRecoveryContext
+	tail := r.Session.Messages[len(r.Session.Messages)-1]
+	if tail.Role == sharedkernel.RoleAssistant && len(tail.ToolCalls) == 0 {
+		return nil
 	}
 	r.ReActEventConsumerF(&ReactEvent{
 		Type:    ReActEventTypeRecovery,
 		Content: "检测到上一次对话未完成，正在恢复后继续处理本次输入。",
 	})
-
-	// 显式 ActiveChatID 可能来自异常的旧版本快照；若尾部已经是最终回答，
-	// 只需持久化清除标记，不能额外再调用一次模型。
-	tail := r.Session.Messages[len(r.Session.Messages)-1]
-	if tail.Role == sharedkernel.RoleAssistant && len(tail.ToolCalls) == 0 {
-		candidate := r.Session.Clone()
-		candidate.ActiveChatID = ""
-		return r.commitSnapshot(ctx, candidate)
-	}
 
 	for _, call := range missingToolResults(r.Session.Messages) {
 		toolMsg := &sharedkernel.Message{
@@ -185,10 +167,8 @@ func missingToolResults(messages []sharedkernel.Message) []sharedkernel.ToolCall
 	}
 
 	completed := make(map[string]struct{})
-	groupID := messages[callIndex].ToolCallGroupID
 	for i := callIndex + 1; i < len(messages); i++ {
-		if messages[i].Role == sharedkernel.RoleTool &&
-			(groupID == "" || messages[i].ToolCallGroupID == groupID) {
+		if messages[i].Role == sharedkernel.RoleTool {
 			completed[messages[i].ToolCallID] = struct{}{}
 		}
 	}
@@ -413,8 +393,12 @@ func (r *ReActService) compactContext(ctx context.Context, toolDefs []sharedkern
 	}
 
 	candidate.ReconcileWindowInput(current)
+	phase = "advance_generation"
+	if err := candidate.AdvanceMemoryGeneration(); err != nil {
+		return err
+	}
 	phase = "snapshot"
-	if err := r.commitSnapshot(ctx, candidate); err != nil {
+	if err := r.commitNextMemoryGeneration(ctx, candidate); err != nil {
 		return err
 	}
 	phase = "completed"
@@ -500,12 +484,11 @@ func (r *ReActService) handleTurnMsg(ctx context.Context, msg *sharedkernel.Mess
 	if err != nil {
 		return err
 	}
-	return r.commitAppendedMessage(ctx, candidate, *msg)
+	return r.commitCreatedMessage(ctx, candidate, *msg, *msg)
 }
 
-func (r *ReActService) commitSnapshot(ctx context.Context, candidate *session.Session) error {
-	// 同步提交只读借用候选工作集，无需再次深复制；仓储返回后才切换内存。
-	revision, err := r.SessRepo.CommitSnapshot(ctx, r.Session.ID, candidate.RequestContext)
+func (r *ReActService) commitCreatedMessage(ctx context.Context, candidate *session.Session, original, memory sharedkernel.Message) error {
+	revision, err := r.SessRepo.CommitCreateMessage(ctx, r.Session.ID, candidate.RequestContext, original, memory)
 	if err != nil {
 		return fmt.Errorf("%w: %w", ErrPersistRequestContext, err)
 	}
@@ -514,17 +497,18 @@ func (r *ReActService) commitSnapshot(ctx context.Context, candidate *session.Se
 	return nil
 }
 
-func (r *ReActService) commitAppendedMessage(
-	ctx context.Context,
-	candidate *session.Session,
-	newMsg sharedkernel.Message,
-) error {
-	// newMsg 显式说明本次新增的 original；仓储会校验它与候选尾消息等价，
-	// 并校验 ActiveChatID 双向约束：最终 assistant 必须已清空、其余消息须
-	// 处于活跃对话。违反时提交被整体拒绝，候选须由调用方保证满足契约。
-	revision, err := r.SessRepo.CommitAppendedMessage(
-		ctx, r.Session.ID, candidate.RequestContext, newMsg,
-	)
+func (r *ReActService) commitUpdatedMessage(ctx context.Context, candidate *session.Session, memory sharedkernel.Message) error {
+	revision, err := r.SessRepo.CommitUpdateMessage(ctx, r.Session.ID, candidate.RequestContext, memory)
+	if err != nil {
+		return fmt.Errorf("%w: %w", ErrPersistRequestContext, err)
+	}
+	candidate.Revision = revision
+	*r.Session = *candidate
+	return nil
+}
+
+func (r *ReActService) commitNextMemoryGeneration(ctx context.Context, candidate *session.Session) error {
+	revision, err := r.SessRepo.CommitNextMemoryGeneration(ctx, r.Session.ID, candidate.RequestContext)
 	if err != nil {
 		return fmt.Errorf("%w: %w", ErrPersistRequestContext, err)
 	}
