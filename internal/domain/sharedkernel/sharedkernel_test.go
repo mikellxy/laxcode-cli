@@ -76,18 +76,22 @@ func TestEstimateTokenAsciiAndHan(t *testing.T) {
 	}
 }
 
-func TestEstimateTokenIntCeil(t *testing.T) {
-	if got := EstimateTokenInt(""); got != 1 {
-		t.Errorf("EstimateTokenInt(\"\") = %d, 期望 1（实现恒 +1 向上取整）", got)
+// EstimateTokenInt 改用 tiktoken(cl100k_base) 计数，口径与 llmprovider 本地兜底
+// 一致：不再走 EstimateToken 的 4char/1.5rune 启发式，也不再恒 +1 向上取整。
+func TestEstimateTokenIntUsesTiktoken(t *testing.T) {
+	encoding, err := getEstimateEncoding()
+	if err != nil {
+		t.Fatalf("加载 tiktoken 编码失败: %v", err)
 	}
-	if got := EstimateTokenInt("abcd"); got != 2 {
-		t.Errorf("EstimateTokenInt(abcd) = %d, 期望 2", got)
+	// 空串计 0：启发式曾恒 +1 返回 1，据此确认已切到 tiktoken 口径。
+	if got := EstimateTokenInt(""); got != 0 {
+		t.Errorf("EstimateTokenInt(\"\") = %d, 期望 0", got)
 	}
-	if got := EstimateTokenInt(strings.Repeat("a", 400)); got != 101 {
-		t.Errorf("EstimateTokenInt(400 ascii) = %d, 期望 101", got)
-	}
-	if got := EstimateTokenInt("三个字"); got != 3 {
-		t.Errorf("EstimateTokenInt(三个字) = %d, 期望 3（2+1 取整）", got)
+	// 其余用例直接对齐 tiktoken 编码输出，保证函数委托给 cl100k_base 计数。
+	for _, s := range []string{"abcd", strings.Repeat("a", 400), "三个字", "hello world"} {
+		if got, want := EstimateTokenInt(s), len(encoding.Encode(s, nil, nil)); got != want {
+			t.Errorf("EstimateTokenInt(%q) = %d, 期望 tiktoken 计数 %d", s, got, want)
+		}
 	}
 }
 

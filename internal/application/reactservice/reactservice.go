@@ -19,11 +19,14 @@ type ReActService struct {
 	Session *session.Session
 	// SessRepo 是会话持久化端口：加载与落盘由本服务（application 层）编排，
 	// 聚合只做内存内的状态演化，不持有仓储。
-	SessRepo            session.SessionRepository
-	LLMClient           llmprovider.LLMClient
-	ToolRegistry        tools.Registry
-	Artifacts           tools.ArtifactStore
-	ReActEventConsumerF func(reactEvent *ReactEvent)
+	SessRepo  session.SessionRepository
+	LLMClient llmprovider.LLMClient
+	// ContextSummaryLLMClient 只在确定性本地压缩无法达到目标时调用。
+	// 它不参与正常 ReAct 生成，且摘要请求不携带业务工具定义。
+	ContextSummaryLLMClient llmprovider.LLMClient
+	ToolRegistry            tools.Registry
+	Artifacts               tools.ArtifactStore
+	ReActEventConsumerF     func(reactEvent *ReactEvent)
 	// tracer 是 ReAct/llm-turn span 的追踪注入点，经构造注入；nil 缺省
 	// noop，不产生任何观测输出。类型经 telemetry 别名持有，本包不直接
 	// 依赖 OTel（span 的开启与收尾均走 telemetry 辅助函数）。
@@ -54,6 +57,7 @@ type ReactEvent struct {
 func NewReActService(sess *session.Session,
 	sessRepo session.SessionRepository,
 	llmClient llmprovider.LLMClient,
+	contextSummaryLLMClient llmprovider.LLMClient,
 	toolRegistry tools.Registry,
 	reActEventConsumerF func(reactEvent *ReactEvent),
 	tracer telemetry.Tracer,
@@ -62,12 +66,13 @@ func NewReActService(sess *session.Session,
 		reActEventConsumerF = func(*ReactEvent) {}
 	}
 	r := &ReActService{
-		Session:             sess,
-		SessRepo:            sessRepo,
-		LLMClient:           llmClient,
-		ToolRegistry:        toolRegistry,
-		ReActEventConsumerF: reActEventConsumerF,
-		tracer:              telemetry.OrNoop(tracer),
+		Session:                 sess,
+		SessRepo:                sessRepo,
+		LLMClient:               llmClient,
+		ContextSummaryLLMClient: contextSummaryLLMClient,
+		ToolRegistry:            toolRegistry,
+		ReActEventConsumerF:     reActEventConsumerF,
+		tracer:                  telemetry.OrNoop(tracer),
 	}
 	// ArtifactStore 与数据库会话仓储相互独立；子服务绑定自己的 session ID。
 	if len(artifactStores) > 0 && artifactStores[0] != nil {
@@ -311,6 +316,9 @@ func (r *ReActService) compactContext(ctx context.Context, toolDefs []sharedkern
 	passes := 0
 	estimatedSaved := 0
 	artifactRefsAdded := 0
+	summaryCalls := 0
+	summaryInputTokens := 0
+	summaryOutputTokens := 0
 	afterInput := current
 
 	candidate := r.Session.Clone()
@@ -352,6 +360,9 @@ func (r *ReActService) compactContext(ctx context.Context, toolDefs []sharedkern
 			"target_tokens", target,
 			"compression_passes", passes,
 			"artifact_refs_added", artifactRefsAdded,
+			"summary_calls", summaryCalls,
+			"summary_input_tokens", summaryInputTokens,
+			"summary_output_tokens", summaryOutputTokens,
 			"duration_ms", time.Since(startedAt).Milliseconds(),
 			"error", retErr,
 		)
@@ -368,6 +379,12 @@ func (r *ReActService) compactContext(ctx context.Context, toolDefs []sharedkern
 		candidate.Messages[idx].Artifact = &ref
 		artifactRefsAdded++
 	}
+	// LLM 摘要应看到尚未被本地裁剪的信息，同时携带刚写入的 artifact 引用。
+	// 后续 SimpleCompactor 只修改 candidate；summarySource 保留独立副本。
+	var summarySource []sharedkernel.Message
+	if protectedStart > 1 {
+		summarySource = sharedkernel.CloneMessages(candidate.Messages[1:protectedStart])
+	}
 	phase = "compress"
 	for current > target {
 		saved, compactErr := candidate.Compact(compactor.SimpleCompactor, current-target)
@@ -376,7 +393,7 @@ func (r *ReActService) compactContext(ctx context.Context, toolDefs []sharedkern
 			return compactErr
 		}
 		if saved <= 0 {
-			return fmt.Errorf("%w: current=%d target=%d", ErrContextTargetNotReach, current, target)
+			break
 		}
 
 		next, countErr := r.LLMClient.CountInputTokens(ctx, candidate.Messages, toolDefs)
@@ -384,10 +401,82 @@ func (r *ReActService) compactContext(ctx context.Context, toolDefs []sharedkern
 			return fmt.Errorf("count context after compaction: %w", countErr)
 		}
 		if next >= current {
-			return fmt.Errorf("%w: provider count made no progress (%d -> %d)",
-				ErrContextTargetNotReach, current, next)
+			break
 		}
 		estimatedSaved += saved
+		current = next
+		afterInput = next
+	}
+
+	if current > target {
+		phase = "summarize"
+		if r.ContextSummaryLLMClient == nil || len(summarySource) == 0 {
+			return fmt.Errorf("%w: current=%d target=%d summarizable_messages=%d summary_client_configured=%t",
+				ErrContextTargetNotReach, current, target, len(summarySource), r.ContextSummaryLLMClient != nil)
+		}
+
+		firstSeq := summarySource[0].Seq
+		lastSeq := summarySource[len(summarySource)-1].Seq
+		summaryPrefix := fmt.Sprintf("以下是原始消息 seq %d-%d 的结构化历史摘要，不是新的用户请求：\n", firstSeq, lastSeq)
+		baseMessages, mergeErr := compactor.MergeSummary(candidate.Messages, protectedStart, summaryPrefix)
+		if mergeErr != nil {
+			return mergeErr
+		}
+		baseInput, countErr := r.LLMClient.CountInputTokens(ctx, baseMessages, toolDefs)
+		if countErr != nil {
+			return fmt.Errorf("count context summary base: %w", countErr)
+		}
+		maxSummaryTokens := target - baseInput
+		if maxSummaryTokens <= 0 {
+			return fmt.Errorf("%w: protected context input=%d target=%d", ErrContextTargetNotReach, baseInput, target)
+		}
+
+		normalized, usage, summaryErr := r.generateContextSummary(ctx, summarySource, "", maxSummaryTokens)
+		summaryCalls++
+		summaryInputTokens += usage.TokenInput
+		summaryOutputTokens += usage.TokenOutput
+		if summaryErr != nil {
+			return summaryErr
+		}
+		merged, mergeErr := compactor.MergeSummary(candidate.Messages, protectedStart, summaryPrefix+normalized)
+		if mergeErr != nil {
+			return mergeErr
+		}
+		next, countErr := r.LLMClient.CountInputTokens(ctx, merged, toolDefs)
+		if countErr != nil {
+			return fmt.Errorf("count context after llm summary: %w", countErr)
+		}
+
+		// 模型可能没有严格遵守 token 上限。只允许一次基于已有摘要的再压缩，
+		// 避免故障模型造成无界调用和费用。
+		if next > target {
+			stricterTarget := maxSummaryTokens - (next - target)
+			if stricterTarget <= 0 {
+				return fmt.Errorf("%w: summarized input=%d target=%d", ErrContextTargetNotReach, next, target)
+			}
+			normalized, usage, summaryErr = r.generateContextSummary(ctx, nil, normalized, stricterTarget)
+			summaryCalls++
+			summaryInputTokens += usage.TokenInput
+			summaryOutputTokens += usage.TokenOutput
+			if summaryErr != nil {
+				return summaryErr
+			}
+			merged, mergeErr = compactor.MergeSummary(candidate.Messages, protectedStart, summaryPrefix+normalized)
+			if mergeErr != nil {
+				return mergeErr
+			}
+			next, countErr = r.LLMClient.CountInputTokens(ctx, merged, toolDefs)
+			if countErr != nil {
+				return fmt.Errorf("count context after llm summary retry: %w", countErr)
+			}
+		}
+		if next > target {
+			return fmt.Errorf("%w: summarized input=%d target=%d", ErrContextTargetNotReach, next, target)
+		}
+		candidate.Messages = merged
+		candidate.TokenUsed.Add(sharedkernel.TokenStatistics{
+			TokenInput: summaryInputTokens, TokenOutput: summaryOutputTokens,
+		})
 		current = next
 		afterInput = next
 	}
@@ -415,6 +504,9 @@ func (r *ReActService) compactContext(ctx context.Context, toolDefs []sharedkern
 		"target_met", current <= target,
 		"compression_passes", passes,
 		"artifact_refs_added", artifactRefsAdded,
+		"summary_calls", summaryCalls,
+		"summary_input_tokens", summaryInputTokens,
+		"summary_output_tokens", summaryOutputTokens,
 		"message_count_before", beforeStats.messageCount,
 		"message_count_after", afterStats.messageCount,
 		"content_bytes_before", beforeStats.contentBytes,

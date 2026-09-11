@@ -2,6 +2,7 @@ package session
 
 import (
 	"errors"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -63,7 +64,7 @@ func TestUpsertSysMessageOnEmptySession(t *testing.T) {
 	if s.Messages[0].Role != sharedkernel.RoleSystem || s.Messages[0].Content != "p1" {
 		t.Errorf("首条应为 system/p1，实际 %+v", s.Messages[0])
 	}
-	if s.Messages[0].Seq != 1 || s.Messages[0].OriginalSeq != 1 || s.LastSeq != 1 {
+	if s.Messages[0].Seq != 1 || !reflect.DeepEqual(s.Messages[0].OriginalSeq, []uint64{1}) || s.LastSeq != 1 {
 		t.Fatalf("system 应由 domain 分配首个原始序号，实际 %+v last=%d", s.Messages[0], s.LastSeq)
 	}
 	if s.sysToken != sharedkernel.EstimateTokenInt("p1") {
@@ -83,7 +84,7 @@ func TestUpsertSysMessageReplacesInPlace(t *testing.T) {
 	if s.Messages[0].Content != "p2" {
 		t.Errorf("系统提示词应更新为 p2，实际 %q", s.Messages[0].Content)
 	}
-	if s.Messages[0].Seq != 1 || s.Messages[0].OriginalSeq != 1 || s.LastSeq != 1 {
+	if s.Messages[0].Seq != 1 || !reflect.DeepEqual(s.Messages[0].OriginalSeq, []uint64{1}) || s.LastSeq != 1 {
 		t.Fatal("替换 system 不应分配新序号")
 	}
 	if s.sysToken != sharedkernel.EstimateTokenInt("p2") {
@@ -112,12 +113,12 @@ func TestUpsertSysMessageReturnsDetachedCopy(t *testing.T) {
 // 窗口占用校正：换系统提示词时扣掉旧估算、加上新估算。
 func TestUpsertSysMessageAdjustsWindowToken(t *testing.T) {
 	s := NewSession("s1")
-	s.UpsertSysMessage("aaaa") // 估算 4/4+1 = 2
+	s.UpsertSysMessage("aaaa") // tiktoken 计数
 	if s.WindowToken.TokenInput != sharedkernel.EstimateTokenInt("aaaa") {
 		t.Fatalf("首次设置应把估算占用计入窗口，实际 %+v", s.WindowToken)
 	}
 
-	s.UpsertSysMessage(strings.Repeat("a", 400)) // 估算 100+1 = 101
+	s.UpsertSysMessage(strings.Repeat("a", 400)) // tiktoken 计数
 	want := sharedkernel.EstimateTokenInt(strings.Repeat("a", 400))
 	if s.WindowToken.TokenInput != want {
 		t.Errorf("替换后窗口占用应为新提示词估算值 %d，实际 %+v", want, s.WindowToken)

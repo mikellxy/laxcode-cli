@@ -10,9 +10,9 @@ const (
 type Message struct {
 	// Seq 在 session 内单调递增，system 首次创建时也会占用一个序号。
 	Seq uint64 `json:"seq,omitempty"`
-	// OriginalSeq 指向该工作集消息对应的不可变原始消息。当前压缩策略不合并
-	// 多条消息，因此始终与 Seq 相同；将来支持摘要合并时再扩展为多来源模型。
-	OriginalSeq uint64       `json:"original_seq,omitempty"`
+	// OriginalSeq 指向该工作集消息覆盖的不可变原始消息。普通消息只包含自身
+	// Seq；摘要消息包含所有被合并消息的来源序号，严格升序且不重复。
+	OriginalSeq []uint64     `json:"original_seq,omitempty"`
 	Artifact    *ArtifactRef `json:"artifact,omitempty"`
 	Role        string       `json:"role"`
 	Content     string       `json:"content"`
@@ -37,6 +37,7 @@ type ArtifactRef struct {
 
 // Clone 隔离一条消息的可变字段；正文 string 可安全共享。
 func (m Message) Clone() Message {
+	m.OriginalSeq = append([]uint64(nil), m.OriginalSeq...)
 	m.ToolCalls = append([]ToolCall(nil), m.ToolCalls...)
 	for i := range m.ToolCalls {
 		m.ToolCalls[i].Arguments = append([]byte(nil), m.ToolCalls[i].Arguments...)

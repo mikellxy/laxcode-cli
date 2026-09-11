@@ -88,7 +88,7 @@ func (m *memRepo) CommitCreateMessage(_ context.Context, id string, snapshot ses
 	} else if snapshot.Revision != 0 || snapshot.LastSeq != 1 || snapshot.MemoryGeneration != 1 || len(snapshot.Messages) != 1 {
 		return 0, errRepo
 	}
-	if original.Seq != snapshot.LastSeq || original.OriginalSeq != original.Seq {
+	if original.Seq != snapshot.LastSeq || len(original.OriginalSeq) != 1 || original.OriginalSeq[0] != original.Seq {
 		return 0, errRepo
 	}
 	m.msgs[id] = append(m.msgs[id], original.Clone())
@@ -349,7 +349,7 @@ func newTestSession(id string, repo session.SessionRepository) *session.Session 
 func newTestService(t *testing.T, id, sysPrompt string, repo session.SessionRepository,
 	llm llmprovider.LLMClient, reg tools.Registry) *ReActService {
 	t.Helper()
-	svc := NewReActService(session.NewSession(id), repo, llm, reg, func(*ReactEvent) {}, nil)
+	svc := NewReActService(session.NewSession(id), repo, llm, nil, reg, func(*ReactEvent) {}, nil)
 	if err := svc.InitSession(context.Background()); err != nil {
 		t.Fatalf("InitSession: %v", err)
 	}

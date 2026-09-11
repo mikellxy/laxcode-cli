@@ -41,7 +41,7 @@ type SubAgentDeps struct {
 // 它编排一个子 ReActService：
 //   - 全新子会话（id=sub:<ts>-<parentID>，复用父 SessRepo），历史独立，绝不写回父对话；
 //   - 受限工具集（仅 bash + read_file，且不含 sub-agent 自身 → 天然防递归）；
-//   - planMode=false，继承父的 LLMClient 与 tracer（子 span 树挂在同一 trace 下）；
+//   - planMode=false，继承父的生成/摘要 LLMClient 与 tracer（子 span 树挂在同一 trace 下）；
 //   - 事件静默（子 Agent 中间过程不外发）。
 //
 // 语义对齐老 internal/engine/subagent.go；置于 application 层（可依赖 domain），
@@ -53,7 +53,7 @@ type SubAgent struct {
 }
 
 // NewSubAgent 以父 ReActService、工作目录与端口集合构造子 Agent 工具。父的
-// LLMClient / tracer / SessRepo 经 parent 复用；workDir 用于构建子 Agent 的
+// 生成与摘要 LLMClient / tracer / SessRepo 经 parent 复用；workDir 用于构建子 Agent 的
 // 受限工具集，子任务可通过 work_dir 入参覆盖。调用方须在 parent 装配完成后
 // 注册本工具。
 func NewSubAgent(parent *ReActService, workDir string, deps SubAgentDeps) *SubAgent {
@@ -126,7 +126,8 @@ func (s *SubAgent) Execute(ctx context.Context, args json.RawMessage) (string, e
 	defer childReg.Close()
 
 	// 事件静默：子 Agent 中间过程不外发（consumer 直接丢弃）。
-	childSvc := NewReActService(childSess, s.parent.SessRepo, s.parent.LLMClient, childReg, func(*ReactEvent) {}, s.parent.tracer, s.parent.Artifacts)
+	childSvc := NewReActService(childSess, s.parent.SessRepo, s.parent.LLMClient,
+		s.parent.ContextSummaryLLMClient, childReg, func(*ReactEvent) {}, s.parent.tracer, s.parent.Artifacts)
 	if err := childSvc.InitSession(ctx); err != nil {
 		return "", fmt.Errorf("init session: %w", err)
 	}

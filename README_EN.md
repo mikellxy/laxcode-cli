@@ -35,7 +35,12 @@ Write the following into the config file
 {
   "OPENAI_API_KEY": "sk-xxxxxxxxxxxxxxxx",
   "OPENAI_BASE_URL": "https://api.openai.com/v1", # any OpenAI-compatible endpoint
-  "OPENAI_MODEL": "gpt-4o-mini"
+  "OPENAI_MODEL": "gpt-4o-mini",
+  "OPENAI_CONTEXT_WINDOW": 128000,
+  "OPENAI_MAX_OUTPUT_TOKENS": 16384,
+  "COMPACTION_OPENAI_MODEL": "gpt-4o-mini",
+  "COMPACTION_OPENAI_CONTEXT_WINDOW": 128000,
+  "COMPACTION_OPENAI_MAX_OUTPUT_TOKENS": 4096
 }
 ```
 * **Using environment variables**
@@ -43,6 +48,10 @@ Write the following into the config file
 export OPENAI_API_KEY=sk-xxxxxxxxxxxxxxxx
 export OPENAI_BASE_URL=https://api.openai.com/v1     # any OpenAI-compatible endpoint
 export OPENAI_MODEL=gpt-4o-mini
+export OPENAI_CONTEXT_WINDOW=128000
+export OPENAI_MAX_OUTPUT_TOKENS=16384
+# Omitted compaction-provider settings inherit the main provider
+export COMPACTION_OPENAI_MODEL=gpt-4o-mini
 ```
 
 ### 1.3 Interactive Terminal Mode
@@ -190,13 +199,13 @@ Edge handling tailored for agent scenarios:
 - A sub-agent can have its own persona, system prompt and permission scope, decoupled from the main agent's responsibilities
 
 ## 4. Context Compaction
-The existing trigger and target remain 80% and 60% of available input capacity. Requests include messages and tool definitions in token counting; compatible providers may fall back to a local estimate when remote counting is unavailable. The deterministic `simpleStrategy` does not call an additional summarization model.
+The trigger and target remain 80% and 60% of available input capacity. Requests include messages and tool definitions in token counting; compatible providers may fall back to a local estimate when remote counting is unavailable. The deterministic `simpleStrategy` runs first. Only when local compaction cannot reach the target does the provider configured by `COMPACTION_OPENAI_*` generate a structured summary; omitted compaction settings inherit the main provider.
 
 - A `ToolCallGroup` contains one assistant's tool calls and all matching results. Every message from the third most recent group's start through the end is protected, including additional ordinary assistant and user messages. Pending or crossing groups extend that interval.
 - Older large tool outputs are archived before being replaced with `read_artifact` references. The session-scoped tool verifies the content digest and reads pages of up to 4000 Unicode characters using offsets.
-- Older reasoning can be cleared and older assistant text can be truncated at UTF-8 boundaries. System and user messages are preserved. A candidate context is recounted and committed only after reaching the target; failure leaves the active context unchanged and prevents generation.
+- Older reasoning can be cleared and older assistant text can be truncated at UTF-8 boundaries. When local compaction is exhausted, history between the system message and protected region is replaced by one structured user summary. A candidate context is recounted and committed only after reaching the target; failure leaves the active context unchanged and prevents generation.
 - `Session` holds only the latest `RequestContext`. SQLite uses two business tables, `request_contexts` and `messages`: every new message atomically creates an immutable original and a row in the current memory generation. Compaction writes a complete next generation before switching the context head, leaving older generations sealed. Committed originals are also appended to `history.jsonl` as a best-effort backup.
-- The initial system message participates in the session-local monotonic `Seq`; later startups update only its memory row without changing the original or allocating a new sequence. Each memory row has one `OriginalSeq`. Interrupted execution and missing tool results are derived from the message tail and `ToolCallID`, without separate turn or call-group identifiers.
+- The initial system message participates in the session-local monotonic `Seq`; later startups update only its memory row without changing the original or allocating a new sequence. `OriginalSeq` is a sorted array: ordinary messages contain their own sequence, while summaries contain the deduplicated sources of every merged message and use the smallest source as `Seq`. Interrupted execution and missing tool results are derived from the message tail and `ToolCallID`, without separate turn or call-group identifiers.
 
 ## 5. Plan Mode
 

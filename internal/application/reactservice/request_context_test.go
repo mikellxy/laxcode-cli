@@ -36,7 +36,7 @@ func TestCompactionSnapshotAndArtifactSurviveRestart(t *testing.T) {
 		return 80, nil
 	}}
 	reg := tools.NewDefaultRegistry(nil)
-	svc := NewReActService(s, repo, llm, reg, nil, nil, artifacts)
+	svc := NewReActService(s, repo, llm, nil, reg, nil, nil, artifacts)
 	if err := svc.InitSysPrompt(ctx, "sys"); err != nil {
 		t.Fatal(err)
 	}
@@ -60,7 +60,7 @@ func TestCompactionSnapshotAndArtifactSurviveRestart(t *testing.T) {
 	if before.Messages[2].Artifact == nil {
 		t.Fatal("no artifact reference")
 	}
-	resumed := NewReActService(session.NewSession(s.ID), repo, llm, tools.NewDefaultRegistry(nil), nil, nil, artifacts)
+	resumed := NewReActService(session.NewSession(s.ID), repo, llm, nil, tools.NewDefaultRegistry(nil), nil, nil, artifacts)
 	if err := resumed.InitSession(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -101,7 +101,7 @@ func TestFailedCompactionNeverReplacesCurrentContext(t *testing.T) {
 		t.Run(failure, func(t *testing.T) {
 			repo := newMemRepo()
 			s := newTestSession("failure", repo)
-			svc := NewReActService(s, repo, &scriptedLLM{}, tools.NewDefaultRegistry(nil), nil, nil, repo)
+			svc := NewReActService(s, repo, &scriptedLLM{}, nil, tools.NewDefaultRegistry(nil), nil, nil, repo)
 			for _, id := range []string{"old", "a", "b", "c"} {
 				if err := svc.handleTurnMsg(context.Background(), assistantMsgWithTool(sharedkernel.ToolCall{ID: id, Name: "tool"})); err != nil {
 					t.Fatal(err)
@@ -143,7 +143,7 @@ func TestFailedCompactionNeverReplacesCurrentContext(t *testing.T) {
 func TestAppendCommitFailurePreservesContextAndRetryIdentity(t *testing.T) {
 	repo := newMemRepo()
 	s := newTestSession("append-fail", repo)
-	svc := NewReActService(s, repo, &scriptedLLM{}, tools.NewDefaultRegistry(nil), nil, nil)
+	svc := NewReActService(s, repo, &scriptedLLM{}, nil, tools.NewDefaultRegistry(nil), nil, nil)
 	ctx := context.Background()
 	if err := svc.handleTurnMsg(ctx, assistantMsgWithTool(sharedkernel.ToolCall{ID: "old", Arguments: json.RawMessage(`{}`)})); err != nil {
 		t.Fatal(err)
@@ -160,12 +160,12 @@ func TestAppendCommitFailurePreservesContextAndRetryIdentity(t *testing.T) {
 	if !reflect.DeepEqual(before, s.Snapshot()) || !reflect.DeepEqual(before, repo.contexts[s.ID]) {
 		t.Fatal("failed append changed committed state")
 	}
-	seq, originalSeq := msg.Seq, msg.OriginalSeq
+	seq, originalSeq := msg.Seq, append([]uint64(nil), msg.OriginalSeq...)
 	repo.failAppend = false
 	if err := svc.handleTurnMsg(ctx, &msg); err != nil {
 		t.Fatal(err)
 	}
-	if msg.Seq != seq || msg.OriginalSeq != originalSeq {
+	if msg.Seq != seq || !reflect.DeepEqual(msg.OriginalSeq, originalSeq) {
 		t.Fatal("retry changed identity")
 	}
 	msg.Artifact.ID = "caller edit"

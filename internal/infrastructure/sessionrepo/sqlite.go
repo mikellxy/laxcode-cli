@@ -51,7 +51,7 @@ type messageModel struct {
 	MessageType      string    `gorm:"column:message_type;type:varchar(32);primaryKey;priority:2"`
 	MemoryGeneration uint64    `gorm:"column:memory_generation;primaryKey;priority:3"`
 	Seq              uint64    `gorm:"column:seq;primaryKey;priority:4"`
-	OriginalSeq      uint64    `gorm:"column:original_seq;not null"`
+	OriginalSeqJSON  []byte    `gorm:"column:original_seq_json;type:json;not null"`
 	Role             string    `gorm:"column:role;type:varchar(32);not null"`
 	ToolCallID       string    `gorm:"column:tool_call_id;type:varchar(128);not null"`
 	Content          string    `gorm:"column:content;type:text;not null"`
@@ -122,7 +122,7 @@ func (r *SqliteSessionRepo) migrate() error {
 				message_type VARCHAR(32) NOT NULL CHECK (message_type IN ('original', 'in_memory')),
 				memory_generation BIGINT NOT NULL CHECK (memory_generation >= 0),
 				seq BIGINT NOT NULL CHECK (seq >= 1),
-				original_seq BIGINT NOT NULL CHECK (original_seq >= 1),
+				original_seq_json JSON NOT NULL CHECK (json_valid(original_seq_json) AND json_array_length(original_seq_json) >= 1),
 				role VARCHAR(32) NOT NULL,
 				tool_call_id VARCHAR(128) NOT NULL DEFAULT '',
 				content TEXT NOT NULL,
@@ -136,7 +136,9 @@ func (r *SqliteSessionRepo) migrate() error {
 				created_at DATETIME NOT NULL,
 				updated_at DATETIME NOT NULL,
 				PRIMARY KEY (session_id, message_type, memory_generation, seq),
-				CHECK ((message_type = 'original' AND memory_generation = 0 AND original_seq = seq)
+				CHECK ((message_type = 'original' AND memory_generation = 0
+						AND json_array_length(original_seq_json) = 1
+						AND json_extract(original_seq_json, '$[0]') = seq)
 					OR (message_type = 'in_memory' AND memory_generation >= 1)),
 				FOREIGN KEY (session_id) REFERENCES request_contexts(session_id) ON UPDATE CASCADE ON DELETE CASCADE
 			)`,
@@ -355,7 +357,8 @@ func loadCurrentContext(tx *gorm.DB, id string) (requestContextModel, bool, erro
 }
 
 func validateCreatedMessage(snapshot session.RequestContext, original, memory sharedkernel.Message) error {
-	if original.Seq == 0 || original.Seq != snapshot.LastSeq || original.OriginalSeq != original.Seq {
+	if original.Seq == 0 || original.Seq != snapshot.LastSeq ||
+		len(original.OriginalSeq) != 1 || original.OriginalSeq[0] != original.Seq {
 		return fmt.Errorf("%w: invalid original identity", ErrStaleSequence)
 	}
 	if !equalMessage(original, memory) {
@@ -440,9 +443,13 @@ func messageToModel(id, messageType string, generation uint64, msg sharedkernel.
 	if err != nil {
 		return messageModel{}, err
 	}
+	originalSeq, err := json.Marshal(msg.OriginalSeq)
+	if err != nil {
+		return messageModel{}, err
+	}
 	row := messageModel{
 		SessionID: id, MessageType: messageType, MemoryGeneration: generation,
-		Seq: msg.Seq, OriginalSeq: msg.OriginalSeq, Role: msg.Role,
+		Seq: msg.Seq, OriginalSeqJSON: originalSeq, Role: msg.Role,
 		ToolCallID: msg.ToolCallID, Content: msg.Content, ReasoningID: msg.ReasoningID,
 		ReasoningContent: msg.ReasoningContent, ToolCallsJSON: toolCalls,
 		TokenInput: int64(msg.TokenUsed.TokenInput), TokenOutput: int64(msg.TokenUsed.TokenOutput),
@@ -458,7 +465,7 @@ func messageToModel(id, messageType string, generation uint64, msg sharedkernel.
 
 func messagePayload(row messageModel) map[string]any {
 	return map[string]any{
-		"original_seq": row.OriginalSeq, "role": row.Role, "tool_call_id": row.ToolCallID,
+		"original_seq_json": row.OriginalSeqJSON, "role": row.Role, "tool_call_id": row.ToolCallID,
 		"content": row.Content, "reasoning_id": row.ReasoningID,
 		"reasoning_content": row.ReasoningContent, "tool_calls_json": row.ToolCallsJSON,
 		"artifact_id": row.ArtifactID, "artifact_byte_size": row.ArtifactByteSize,
@@ -467,6 +474,10 @@ func messagePayload(row messageModel) map[string]any {
 }
 
 func modelToMessage(row messageModel) (sharedkernel.Message, error) {
+	var originalSeq []uint64
+	if err := json.Unmarshal(row.OriginalSeqJSON, &originalSeq); err != nil {
+		return sharedkernel.Message{}, err
+	}
 	var calls []sharedkernel.ToolCall
 	if len(row.ToolCallsJSON) != 0 && string(row.ToolCallsJSON) != "null" {
 		if err := json.Unmarshal(row.ToolCallsJSON, &calls); err != nil {
@@ -474,7 +485,7 @@ func modelToMessage(row messageModel) (sharedkernel.Message, error) {
 		}
 	}
 	msg := sharedkernel.Message{
-		Seq: row.Seq, OriginalSeq: row.OriginalSeq, Role: row.Role, Content: row.Content,
+		Seq: row.Seq, OriginalSeq: originalSeq, Role: row.Role, Content: row.Content,
 		ReasoningID: row.ReasoningID, ReasoningContent: row.ReasoningContent,
 		ToolCalls: calls, ToolCallID: row.ToolCallID,
 		TokenUsed: sharedkernel.TokenStatistics{TokenInput: int(row.TokenInput), TokenOutput: int(row.TokenOutput)},

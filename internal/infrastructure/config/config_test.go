@@ -118,6 +118,29 @@ func TestParseEnvAndFileContextBudgetFromEnv(t *testing.T) {
 	}
 }
 
+func TestParseEnvAndFileCompactionProviderOverridesAndFallbacks(t *testing.T) {
+	swapConfigGlobals(t)
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("OPENAI_API_KEY", "main-key")
+	t.Setenv("OPENAI_BASE_URL", "https://main.example/v1")
+	t.Setenv("OPENAI_MODEL", "main-model")
+	t.Setenv("OPENAI_CONTEXT_WINDOW", "100000")
+	t.Setenv("OPENAI_MAX_OUTPUT_TOKENS", "10000")
+	t.Setenv("COMPACTION_OPENAI_MODEL", "summary-model")
+	t.Setenv("COMPACTION_OPENAI_MAX_OUTPUT_TOKENS", "2000")
+
+	if err := ParseEnvAndFile(); err != nil {
+		t.Fatal(err)
+	}
+	if EnvAndFileConf.CompactionOpenaiApiKey != "main-key" ||
+		EnvAndFileConf.CompactionOpenaiBaseUrl != "https://main.example/v1" ||
+		EnvAndFileConf.CompactionOpenaiModel != "summary-model" ||
+		EnvAndFileConf.CompactionOpenaiContextWindow != 100000 ||
+		EnvAndFileConf.CompactionOpenaiMaxOutputTokens != 2000 {
+		t.Fatalf("unexpected compaction provider config: %+v", EnvAndFileConf)
+	}
+}
+
 func TestParseEnvAndFileRejectsInvalidContextBudget(t *testing.T) {
 	swapConfigGlobals(t)
 	t.Setenv("HOME", t.TempDir())

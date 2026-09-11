@@ -84,7 +84,7 @@ func TestSubAgentNameAndDefinition(t *testing.T) {
 func TestSubAgentExecuteBadJSON(t *testing.T) {
 	repo := newMemRepo()
 	sess := newTestSession("parent", repo)
-	parent := NewReActService(sess, repo, &scriptedLLM{}, tools.NewDefaultRegistry(nil), nil, nil)
+	parent := NewReActService(sess, repo, &scriptedLLM{}, nil, tools.NewDefaultRegistry(nil), nil, nil)
 	sa := newTestSubAgent(parent, "/tmp/wd")
 
 	_, err := sa.Execute(context.Background(), json.RawMessage(`{bad json`))
@@ -96,7 +96,7 @@ func TestSubAgentExecuteBadJSON(t *testing.T) {
 func TestSubAgentExecuteMissingTask(t *testing.T) {
 	repo := newMemRepo()
 	sess := newTestSession("parent", repo)
-	parent := NewReActService(sess, repo, &scriptedLLM{}, tools.NewDefaultRegistry(nil), nil, nil)
+	parent := NewReActService(sess, repo, &scriptedLLM{}, nil, tools.NewDefaultRegistry(nil), nil, nil)
 	sa := newTestSubAgent(parent, "/tmp/wd")
 
 	_, err := sa.Execute(context.Background(), json.RawMessage(`{"abstract":"x"}`))
@@ -111,7 +111,7 @@ func TestSubAgentExecuteHappyPath(t *testing.T) {
 	llm := &scriptedLLM{responses: []scriptedResp{
 		{msg: assistantMsg("child result")},
 	}}
-	parent := NewReActService(sess, repo, llm, tools.NewDefaultRegistry(nil), nil, nil)
+	parent := NewReActService(sess, repo, llm, nil, tools.NewDefaultRegistry(nil), nil, nil)
 	sa := newTestSubAgent(parent, "/tmp/wd")
 
 	out, err := sa.Execute(context.Background(), json.RawMessage(`{"task":"count files","abstract":"counting","work_dir":"/tmp/wd"}`))
@@ -164,7 +164,7 @@ func TestSubAgentExecuteChildFailureReturnsString(t *testing.T) {
 	llm := &scriptedLLM{responses: []scriptedResp{
 		{err: errors.New("child llm failed")},
 	}}
-	parent := NewReActService(sess, repo, llm, tools.NewDefaultRegistry(nil), nil, nil)
+	parent := NewReActService(sess, repo, llm, nil, tools.NewDefaultRegistry(nil), nil, nil)
 	sa := newTestSubAgent(parent, "/tmp/wd")
 
 	out, err := sa.Execute(context.Background(), json.RawMessage(`{"task":"x"}`))
@@ -194,7 +194,7 @@ func TestSubAgentChildPromptIncludesSkills(t *testing.T) {
 	sess := newTestSession("parent", repo)
 	parent := NewReActService(sess, repo, &scriptedLLM{
 		responses: []scriptedResp{{msg: assistantMsg("ok")}},
-	}, tools.NewDefaultRegistry(nil), nil, nil)
+	}, nil, tools.NewDefaultRegistry(nil), nil, nil)
 	// 构造时给一个不存在技能的目录，确保索引确实来自 work_dir 入参覆盖
 	sa := newTestSubAgent(parent, t.TempDir())
 
@@ -226,7 +226,7 @@ func TestSubAgentChildPromptNoSkillsNoIndex(t *testing.T) {
 	sess := newTestSession("parent", repo)
 	parent := NewReActService(sess, repo, &scriptedLLM{
 		responses: []scriptedResp{{msg: assistantMsg("ok")}},
-	}, tools.NewDefaultRegistry(nil), nil, nil)
+	}, nil, tools.NewDefaultRegistry(nil), nil, nil)
 	sa := newTestSubAgent(parent, t.TempDir())
 
 	if _, err := sa.Execute(context.Background(), json.RawMessage(`{"task":"t"}`)); err != nil {
@@ -260,7 +260,7 @@ func TestSubAgentChildUsesWorkDirOverride(t *testing.T) {
 	sess := newTestSession("parent", repo)
 	parent := NewReActService(sess, repo, &scriptedLLM{
 		responses: []scriptedResp{{msg: assistantMsg("ok")}},
-	}, tools.NewDefaultRegistry(nil), nil, nil)
+	}, nil, tools.NewDefaultRegistry(nil), nil, nil)
 	// work_dir 入参覆盖构造时目录——子工具集以覆盖目录为工作区，
 	// 由 child 注册表构造（bash/read_file）消费；无法直接观测目录，
 	// 这里验证覆盖路径不报错即可
@@ -277,7 +277,7 @@ func TestSubAgentWithParentSessionRepo(t *testing.T) {
 	sess := newTestSession("parent-1", repo)
 	parent := NewReActService(sess, repo, &scriptedLLM{
 		responses: []scriptedResp{{msg: assistantMsg("result-1")}},
-	}, tools.NewDefaultRegistry(nil), nil, nil)
+	}, nil, tools.NewDefaultRegistry(nil), nil, nil)
 	sa := newTestSubAgent(parent, "/wd")
 	if _, err := sa.Execute(context.Background(), json.RawMessage(`{"task":"t","work_dir":"/wd"}`)); err != nil {
 		t.Fatalf("Execute: %v", err)

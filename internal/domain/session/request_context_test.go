@@ -27,9 +27,14 @@ func TestSequencesAndOriginsSurviveSnapshotAndResume(t *testing.T) {
 	}
 	for i, msg := range s.Messages {
 		want := uint64(i + 1)
-		if msg.Seq != want || msg.OriginalSeq != want {
-			t.Fatalf("message %d identity=(%d,%d), want (%d,%d)", i, msg.Seq, msg.OriginalSeq, want, want)
+		if msg.Seq != want || !reflect.DeepEqual(msg.OriginalSeq, []uint64{want}) {
+			t.Fatalf("message %d identity=(%d,%v), want (%d,[%d])", i, msg.Seq, msg.OriginalSeq, want, want)
 		}
+	}
+	detached := s.Snapshot()
+	detached.Messages[1].OriginalSeq[0] = 99
+	if s.Messages[1].OriginalSeq[0] != 2 {
+		t.Fatal("snapshot aliased original sequence array")
 	}
 	snapshot := s.Snapshot()
 	resumed := NewSession("ids")
@@ -43,7 +48,7 @@ func TestSequencesAndOriginsSurviveSnapshotAndResume(t *testing.T) {
 	if err := resumed.AppendMessage(&newMsg); err != nil {
 		t.Fatal(err)
 	}
-	if newMsg.Seq != 7 || newMsg.OriginalSeq != 7 {
+	if newMsg.Seq != 7 || !reflect.DeepEqual(newMsg.OriginalSeq, []uint64{7}) {
 		t.Fatalf("identity reused after restart: %+v", newMsg)
 	}
 	resumed.Messages[2].ToolCalls[0].Arguments[0] = 'x'
@@ -59,7 +64,8 @@ func TestInvalidSnapshotDoesNotReplaceWorkingContext(t *testing.T) {
 	for _, mutate := range []func(*RequestContext){
 		func(r *RequestContext) { r.MemoryGeneration = 0 },
 		func(r *RequestContext) { r.LastSeq++ },
-		func(r *RequestContext) { r.Messages[0].OriginalSeq = 99 },
+		func(r *RequestContext) { r.Messages[0].OriginalSeq = []uint64{99} },
+		func(r *RequestContext) { r.Messages[0].OriginalSeq = []uint64{1, 1} },
 		func(r *RequestContext) { r.Messages[0].Role = sharedkernel.RoleUser },
 	} {
 		bad := before.Clone()

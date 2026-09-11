@@ -37,7 +37,10 @@ touch ~/.laxcode/settings.json
   "OPENAI_BASE_URL": "https://api.openai.com/v1", # 任意 OpenAI 兼容端点
   "OPENAI_MODEL": "gpt-4o-mini",
   "OPENAI_CONTEXT_WINDOW": 128000,
-  "OPENAI_MAX_OUTPUT_TOKENS": 16384
+  "OPENAI_MAX_OUTPUT_TOKENS": 16384,
+  "COMPACTION_OPENAI_MODEL": "gpt-4o-mini",
+  "COMPACTION_OPENAI_CONTEXT_WINDOW": 128000,
+  "COMPACTION_OPENAI_MAX_OUTPUT_TOKENS": 4096
 }
 ```
 * **使用环境变量**
@@ -47,6 +50,8 @@ export OPENAI_BASE_URL=https://api.openai.com/v1     # 任意 OpenAI 兼容端�
 export OPENAI_MODEL=gpt-4o-mini
 export OPENAI_CONTEXT_WINDOW=128000
 export OPENAI_MAX_OUTPUT_TOKENS=16384
+# 压缩 provider 的未配置项会继承主 provider
+export COMPACTION_OPENAI_MODEL=gpt-4o-mini
 ```
 
 ### 1.3 终端交互模式
@@ -193,13 +198,13 @@ LaxCode 在 ReAct 循环中完整实现 openai function call 协议。启动时�
 
 ## 4. 上下文压缩
 
-每次调用 LLM 前，按当前模型预算计算下一请求占用，包含消息与工具定义。触发阈值仍是可用输入容量的 80%，压缩目标仍是 60%。兼容 provider 不支持远端计数时使用本地估算，估算不等同于精确计数。整个过程使用确定性的 `simpleStrategy`，不调用额外模型生成摘要。
+每次调用 LLM 前，按当前模型预算计算下一请求占用，包含消息与工具定义。触发阈值仍是可用输入容量的 80%，压缩目标仍是 60%。兼容 provider 不支持远端计数时使用本地估算，估算不等同于精确计数。系统先执行确定性的 `simpleStrategy`；本地压缩仍无法达到目标时，才调用 `COMPACTION_OPENAI_*` 配置的 provider 生成结构化摘要。压缩 provider 的未配置项继承主 provider。
 
 - 一条 assistant 发起的全部工具调用及其结果组成一个 `ToolCallGroup`。从最近第三组的起点到历史末尾，所有消息保持原样，区间内的 assistant 消息可以超过三条；未完成或跨界调用组使保护区向前扩展。
 - 保护区之前的大工具输出先存入 artifact，再替换为带 `artifact_id` 和 `read_artifact` 调用提示的引用。读取工具按 Unicode 字符偏移分页，单次最多 4000 字符，校验内容摘要并限制在当前会话内。
-- 旧 reasoning 可清除，旧 assistant 正文做 UTF-8 安全的头尾裁剪。系统和用户消息不裁剪。候选上下文重新计数达标后才提交；失败保留当前上下文，且不发送生成请求。
+- 旧 reasoning 可清除，旧 assistant 正文做 UTF-8 安全的头尾裁剪。本地压缩耗尽后，系统消息与保护区之间的历史会合并为一条结构化 user 摘要；系统消息和保护区保持不变。候选上下文重新计数达标后才提交；失败保留当前上下文，且不发送生成请求。
 - `Session` 只持有最新 `RequestContext`。SQLite 仅使用 `request_contexts` 和 `messages`：每条新消息原子写入不可变 original 与当前 memory generation；压缩时完整创建下一 generation 后切换 head，旧代封存。original 提交成功后再 best-effort 追加到 `history.jsonl`，冷备失败不影响会话。
-- system 首次创建时与其他消息一样占用 session 内递增的 `Seq`，后续启动只更新当前 generation 的 memory，不改 original、不分配新 Seq。每条 memory 通过单值 `OriginalSeq` 关联原文；中断状态及缺失工具结果直接由消息尾部和 `ToolCallID` 推导。
+- system 首次创建时与其他消息一样占用 session 内递增的 `Seq`，后续启动只更新当前 generation 的 memory，不改 original、不分配新 Seq。`OriginalSeq` 是严格升序的数组：普通消息只包含自身，摘要消息包含所有被合并原文的去重来源；摘要 `Seq` 取来源中的最小值。中断状态及缺失工具结果直接由消息尾部和 `ToolCallID` 推导。
 
 ## 5. Plan Mode
 

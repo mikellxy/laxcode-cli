@@ -1,6 +1,13 @@
 package sharedkernel
 
-import "unicode"
+import (
+	"fmt"
+	"sync"
+	"unicode"
+
+	tiktoken "github.com/pkoukk/tiktoken-go"
+	tiktoken_loader "github.com/pkoukk/tiktoken-go-loader"
+)
 
 // TokenStatistics 是一对 token 计数（输入侧 / 输出侧）。它同时承载两种口径，
 // 由持有方说明语义：assistant 消息的 TokenUsed 是模型返回的实测计费口径，
@@ -58,8 +65,38 @@ func EstimateToken(s string) float64 {
 	return tokens
 }
 
-// EstimateTokenInt 返回向上取整整数token数量
+// estimateEncodingName 与 llmprovider 的本地兜底计数保持一致，统一使用
+// cl100k_base：它是 OpenAI 系模型的通用 BPE，对多数兼容端点都能给出量级正确的
+// 估算。编码对象全局惰性加载一次后复用；离线 loader 内嵌 BPE，运行期不再联网。
+const estimateEncodingName = "cl100k_base"
+
+var (
+	estimateEncodingOnce sync.Once
+	estimateEncoding     *tiktoken.Tiktoken
+	estimateEncodingErr  error
+)
+
+// getEstimateEncoding 惰性装配全局 tiktoken 编码，并发安全且只初始化一次。
+func getEstimateEncoding() (*tiktoken.Tiktoken, error) {
+	estimateEncodingOnce.Do(func() {
+		tiktoken.SetBpeLoader(tiktoken_loader.NewOfflineLoader())
+		estimateEncoding, estimateEncodingErr = tiktoken.GetEncoding(estimateEncodingName)
+	})
+	if estimateEncodingErr != nil {
+		return nil, fmt.Errorf("load tiktoken encoding %q: %w", estimateEncodingName, estimateEncodingErr)
+	}
+	return estimateEncoding, nil
+}
+
+// EstimateTokenInt 用 tiktoken(cl100k_base) 对单段文本计数，口径与 llmprovider
+// 本地兜底一致，供窗口预算判断（系统提示词占用、压缩节省量）使用；它不是计费
+// 口径，因此不写进 Message.TokenUsed。放在 sharedkernel 是为了让 session 与
+// compactor 共用同一份计数规则，避免同一算法散落两处各自漂移。tiktoken 万一
+// 不可用则退回 EstimateToken 启发式，保证函数恒有确定返回值、不 panic。
 func EstimateTokenInt(s string) int {
-	t := EstimateToken(s)
-	return int(t) + 1
+	encoding, err := getEstimateEncoding()
+	if err != nil {
+		return int(EstimateToken(s)) + 1
+	}
+	return len(encoding.Encode(s, nil, nil))
 }

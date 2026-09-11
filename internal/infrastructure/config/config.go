@@ -11,17 +11,22 @@ import (
 )
 
 type envAndFileConf struct {
-	OpenaiApiKey          string `mapstructure:"openai_api_key"`
-	OpenaiBaseUrl         string `mapstructure:"openai_base_url"`
-	OpenaiModel           string `mapstructure:"openai_model"`
-	OpenaiContextWindow   int    `mapstructure:"openai_context_window"`
-	OpenaiMaxOutputTokens int    `mapstructure:"openai_max_output_tokens"`
+	OpenaiApiKey                    string `mapstructure:"openai_api_key"`
+	OpenaiBaseUrl                   string `mapstructure:"openai_base_url"`
+	OpenaiModel                     string `mapstructure:"openai_model"`
+	OpenaiContextWindow             int    `mapstructure:"openai_context_window"`
+	OpenaiMaxOutputTokens           int    `mapstructure:"openai_max_output_tokens"`
+	CompactionOpenaiApiKey          string `mapstructure:"compaction_openai_api_key"`
+	CompactionOpenaiBaseUrl         string `mapstructure:"compaction_openai_base_url"`
+	CompactionOpenaiModel           string `mapstructure:"compaction_openai_model"`
+	CompactionOpenaiContextWindow   int    `mapstructure:"compaction_openai_context_window"`
+	CompactionOpenaiMaxOutputTokens int    `mapstructure:"compaction_openai_max_output_tokens"`
 }
 
 const (
 	// 兼容端点的 /models 响应不会标准化暴露 context window，
 	// 因此给出保守默认值，并允许按实际部署显式配置。
-	DefaultContextWindow   = 32768
+	DefaultContextWindow   = 200_000
 	DefaultMaxOutputTokens = 4096
 )
 
@@ -74,10 +79,31 @@ func ParseEnvAndFile() error {
 	EnvOrFile.BindEnv("openai_model", "OPENAI_MODEL")
 	EnvOrFile.BindEnv("openai_context_window", "OPENAI_CONTEXT_WINDOW")
 	EnvOrFile.BindEnv("openai_max_output_tokens", "OPENAI_MAX_OUTPUT_TOKENS")
+	EnvOrFile.BindEnv("compaction_openai_api_key", "COMPACTION_OPENAI_API_KEY")
+	EnvOrFile.BindEnv("compaction_openai_base_url", "COMPACTION_OPENAI_BASE_URL")
+	EnvOrFile.BindEnv("compaction_openai_model", "COMPACTION_OPENAI_MODEL")
+	EnvOrFile.BindEnv("compaction_openai_context_window", "COMPACTION_OPENAI_CONTEXT_WINDOW")
+	EnvOrFile.BindEnv("compaction_openai_max_output_tokens", "COMPACTION_OPENAI_MAX_OUTPUT_TOKENS")
 	EnvOrFile.SetEnvKeyReplacer(strings.NewReplacer("_", "_"))
 
 	if err = EnvOrFile.Unmarshal(&EnvAndFileConf); err != nil {
 		return err
+	}
+	// 压缩 provider 默认继承主 provider；通常只需配置一个更便宜的模型。
+	if EnvAndFileConf.CompactionOpenaiApiKey == "" {
+		EnvAndFileConf.CompactionOpenaiApiKey = EnvAndFileConf.OpenaiApiKey
+	}
+	if EnvAndFileConf.CompactionOpenaiBaseUrl == "" {
+		EnvAndFileConf.CompactionOpenaiBaseUrl = EnvAndFileConf.OpenaiBaseUrl
+	}
+	if EnvAndFileConf.CompactionOpenaiModel == "" {
+		EnvAndFileConf.CompactionOpenaiModel = EnvAndFileConf.OpenaiModel
+	}
+	if EnvAndFileConf.CompactionOpenaiContextWindow == 0 {
+		EnvAndFileConf.CompactionOpenaiContextWindow = EnvAndFileConf.OpenaiContextWindow
+	}
+	if EnvAndFileConf.CompactionOpenaiMaxOutputTokens == 0 {
+		EnvAndFileConf.CompactionOpenaiMaxOutputTokens = EnvAndFileConf.OpenaiMaxOutputTokens
 	}
 	if EnvAndFileConf.OpenaiContextWindow <= 0 {
 		return errors.New("openai_context_window must be positive")
@@ -85,6 +111,13 @@ func ParseEnvAndFile() error {
 	if EnvAndFileConf.OpenaiMaxOutputTokens <= 0 ||
 		EnvAndFileConf.OpenaiMaxOutputTokens >= EnvAndFileConf.OpenaiContextWindow {
 		return errors.New("openai_max_output_tokens must be positive and smaller than openai_context_window")
+	}
+	if EnvAndFileConf.CompactionOpenaiContextWindow <= 0 {
+		return errors.New("compaction_openai_context_window must be positive")
+	}
+	if EnvAndFileConf.CompactionOpenaiMaxOutputTokens <= 0 ||
+		EnvAndFileConf.CompactionOpenaiMaxOutputTokens >= EnvAndFileConf.CompactionOpenaiContextWindow {
+		return errors.New("compaction_openai_max_output_tokens must be positive and smaller than compaction_openai_context_window")
 	}
 
 	return nil

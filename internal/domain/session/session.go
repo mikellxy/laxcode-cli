@@ -69,7 +69,7 @@ func (s *Session) UpsertSysMessage(content string) sharedkernel.Message {
 		if err != nil {
 			panic(err)
 		}
-		sysMsg = sharedkernel.Message{Seq: seq, OriginalSeq: seq, Role: sharedkernel.RoleSystem, Content: content}
+		sysMsg = sharedkernel.Message{Seq: seq, OriginalSeq: []uint64{seq}, Role: sharedkernel.RoleSystem, Content: content}
 		s.Messages = []sharedkernel.Message{sysMsg}
 		s.LastSeq = seq
 	} else if s.Messages[0].Role == sharedkernel.RoleSystem {
@@ -98,8 +98,9 @@ func (s *Session) BuildUserMessage(content string) sharedkernel.Message {
 }
 
 // AppendMessage 把一条模型 / 用户 / 工具消息追加进序列，并结算 token 账目：
-// 只有 assistant 消息携带模型返回的实测用量，故累计用量只在此增长，窗口占用
-// 以本次实测值整体覆盖（实测输入本就包含系统提示词与当时全部历史）。
+// 正常消息追加路径只有 assistant 消息携带模型返回的实测用量，故累计用量在
+// 此处增长；上下文摘要调用的额外用量由 application 在压缩候选中累计。窗口
+// 占用以本次正常生成的实测值整体覆盖（实测输入包含系统提示词与当时全部历史）。
 //
 // 系统消息被拒（见 ErrSystemViaAppend）：它恒居首位且独立落盘，若混进追加
 // 路径，续聊时就会出现两条系统提示词一起发给模型。

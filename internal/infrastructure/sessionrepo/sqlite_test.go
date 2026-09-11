@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/mikellxy/laxcode/internal/domain/compactor"
 	"github.com/mikellxy/laxcode/internal/domain/session"
 	"github.com/mikellxy/laxcode/internal/domain/sharedkernel"
 )
@@ -126,6 +127,50 @@ func TestTwoTableLifecycleAndGenerationHistory(t *testing.T) {
 	}
 }
 
+func TestSummaryOriginalSequencesRoundTrip(t *testing.T) {
+	repo, _ := newTestRepo(t)
+	s := createSystem(t, repo, "summary-origins", "system")
+	for _, msg := range []*sharedkernel.Message{
+		{Role: sharedkernel.RoleUser, Content: "question one"},
+		{Role: sharedkernel.RoleAssistant, Content: "answer one"},
+		{Role: sharedkernel.RoleUser, Content: "current question"},
+	} {
+		appendMessage(t, repo, s, msg)
+	}
+	candidate := s.Clone()
+	merged, err := compactor.MergeSummary(candidate.Messages, 3, `{"objective":"current question"}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidate.Messages = merged
+	if err := candidate.AdvanceMemoryGeneration(); err != nil {
+		t.Fatal(err)
+	}
+	revision, err := repo.CommitNextMemoryGeneration(context.Background(), s.ID, candidate.Snapshot())
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidate.Revision = revision
+	*s = *candidate
+
+	loaded, err := repo.GetRequestContext(context.Background(), s.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(loaded, s.Snapshot()) ||
+		!reflect.DeepEqual(loaded.Messages[1].OriginalSeq, []uint64{2, 3}) {
+		t.Fatalf("summary origins did not round trip: %+v", loaded)
+	}
+	var row messageModel
+	if err := repo.db.Where("session_id = ? AND message_type = ? AND memory_generation = ? AND seq = ?",
+		s.ID, messageTypeMemory, 2, 2).Take(&row).Error; err != nil {
+		t.Fatal(err)
+	}
+	if string(row.OriginalSeqJSON) != "[2,3]" {
+		t.Fatalf("unexpected persisted original sequence JSON: %s", row.OriginalSeqJSON)
+	}
+}
+
 func TestSchemaContainsOnlyTwoBusinessTables(t *testing.T) {
 	repo, _ := newTestRepo(t)
 	var names []string
@@ -156,7 +201,7 @@ func TestCreateRejectsStaleRevisionAndSequence(t *testing.T) {
 	}
 	wrong := msg.Clone()
 	wrong.Seq++
-	wrong.OriginalSeq = wrong.Seq
+	wrong.OriginalSeq = []uint64{wrong.Seq}
 	if _, err := repo.CommitCreateMessage(context.Background(), s.ID, candidate.Snapshot(), wrong, wrong); !errors.Is(err, ErrStaleSequence) {
 		t.Fatalf("stale sequence: %v", err)
 	}

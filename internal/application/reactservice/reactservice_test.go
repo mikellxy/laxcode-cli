@@ -19,7 +19,7 @@ func TestNewReActService(t *testing.T) {
 	repo := newMemRepo()
 	sess := newTestSession("s-main", repo)
 	reg := tools.NewDefaultRegistry(nil)
-	svc := NewReActService(sess, repo, &scriptedLLM{}, reg, nil, nil)
+	svc := NewReActService(sess, repo, &scriptedLLM{}, nil, reg, nil, nil)
 	if svc == nil {
 		t.Fatal("NewReActService 返回 nil")
 	}
@@ -35,7 +35,7 @@ func TestRunReturnsImmediateAnswer(t *testing.T) {
 		{msg: assistantMsg("final answer")},
 	}}
 	rec := &eventRecorder{}
-	svc := NewReActService(sess, repo, llm, tools.NewDefaultRegistry(nil), rec.record, nil)
+	svc := NewReActService(sess, repo, llm, nil, tools.NewDefaultRegistry(nil), rec.record, nil)
 
 	msg, err := svc.think(context.Background())
 	if err != nil {
@@ -69,7 +69,7 @@ func TestRunEmitsReasoningEvent(t *testing.T) {
 		},
 	}}}
 	rec := &eventRecorder{}
-	svc := NewReActService(sess, repo, llm, tools.NewDefaultRegistry(nil), rec.record, nil)
+	svc := NewReActService(sess, repo, llm, nil, tools.NewDefaultRegistry(nil), rec.record, nil)
 
 	if _, err := svc.think(context.Background()); err != nil {
 		t.Fatalf("Run: %v", err)
@@ -98,7 +98,7 @@ func TestRunToolCallLoop(t *testing.T) {
 	reg := tools.NewDefaultRegistry(nil)
 	reg.Register(echoTool{})
 	rec := &eventRecorder{}
-	svc := NewReActService(sess, repo, llm, reg, rec.record, nil)
+	svc := NewReActService(sess, repo, llm, nil, reg, rec.record, nil)
 
 	msg, err := svc.think(context.Background())
 	if err != nil {
@@ -207,7 +207,7 @@ func TestRunForwardsChunksBeforeStreamReturns(t *testing.T) {
 				}
 				return assistantMsg("hello"), nil
 			})
-			svc := NewReActService(sess, repo, llm, tools.NewDefaultRegistry(nil), rec.record, nil)
+			svc := NewReActService(sess, repo, llm, nil, tools.NewDefaultRegistry(nil), rec.record, nil)
 			msg, err := svc.think(context.Background())
 			if !errors.Is(err, streamErr) {
 				t.Fatalf("错误未透传：%v", err)
@@ -230,7 +230,7 @@ func TestRunPropagatesGenerateError(t *testing.T) {
 	llm := &scriptedLLM{responses: []scriptedResp{
 		{err: errors.New("llm down")},
 	}}
-	svc := NewReActService(sess, repo, llm, tools.NewDefaultRegistry(nil), func(*ReactEvent) {}, nil)
+	svc := NewReActService(sess, repo, llm, nil, tools.NewDefaultRegistry(nil), func(*ReactEvent) {}, nil)
 
 	_, err := svc.think(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "llm down") {
@@ -251,7 +251,7 @@ func TestRunUnknownToolDoesNotHang(t *testing.T) {
 	}}
 	reg := tools.NewDefaultRegistry(nil)
 	reg.Register(echoTool{}) // 不含 ghost_tool
-	svc := NewReActService(sess, repo, llm, reg, func(*ReactEvent) {}, nil)
+	svc := NewReActService(sess, repo, llm, nil, reg, func(*ReactEvent) {}, nil)
 
 	msg, err := svc.think(context.Background())
 	if err != nil {
@@ -282,7 +282,7 @@ func TestRunRegistersTokenUsageToSession(t *testing.T) {
 			},
 		}},
 	}}
-	svc := NewReActService(sess, repo, llm, tools.NewDefaultRegistry(nil), func(*ReactEvent) {}, nil, repo)
+	svc := NewReActService(sess, repo, llm, nil, tools.NewDefaultRegistry(nil), func(*ReactEvent) {}, nil, repo)
 	if _, err := svc.think(context.Background()); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -317,7 +317,7 @@ func TestInitSessionRestoresHistoryAndMeta(t *testing.T) {
 		t.Fatalf("预置工作集：%v", err)
 	}
 
-	svc := NewReActService(session.NewSession(sid), repo, &scriptedLLM{}, tools.NewDefaultRegistry(nil), nil, nil)
+	svc := NewReActService(session.NewSession(sid), repo, &scriptedLLM{}, nil, tools.NewDefaultRegistry(nil), nil, nil)
 	if err := svc.InitSession(ctx); err != nil {
 		t.Fatalf("InitSession: %v", err)
 	}
@@ -346,7 +346,7 @@ func TestInitSessionPropagatesRepoError(t *testing.T) {
 
 	repo := newMemRepo()
 	repo.failLoadContext = true
-	svc := NewReActService(session.NewSession("s1"), repo, &scriptedLLM{}, tools.NewDefaultRegistry(nil), nil, nil)
+	svc := NewReActService(session.NewSession("s1"), repo, &scriptedLLM{}, nil, tools.NewDefaultRegistry(nil), nil, nil)
 	if err := svc.InitSession(ctx); !errors.Is(err, errRepo) {
 		t.Errorf("GetRequestContext 失败应透传，实际 %v", err)
 	}
@@ -388,7 +388,7 @@ func TestInitSysPromptWritesRepoAndKeepsSysAtHead(t *testing.T) {
 func TestInitSysPromptPropagatesRepoError(t *testing.T) {
 	repo := newMemRepo()
 	repo.failAppend = true
-	svc := NewReActService(session.NewSession("s1"), repo, &scriptedLLM{}, tools.NewDefaultRegistry(nil), nil, nil)
+	svc := NewReActService(session.NewSession("s1"), repo, &scriptedLLM{}, nil, tools.NewDefaultRegistry(nil), nil, nil)
 	if err := svc.InitSysPrompt(context.Background(), "p"); !errors.Is(err, errRepo) {
 		t.Errorf("UpsertSysMessage 失败应透传，实际 %v", err)
 	}
@@ -466,7 +466,7 @@ func TestChatContinuesCommittedInterruptedInput(t *testing.T) {
 		t.Fatal(err)
 	}
 	// 模拟重启：新服务只从持久化工作集恢复。
-	svc = NewReActService(session.NewSession("s-recover-pending"), repo, llm, tools.NewDefaultRegistry(nil), rec.record, nil)
+	svc = NewReActService(session.NewSession("s-recover-pending"), repo, llm, nil, tools.NewDefaultRegistry(nil), rec.record, nil)
 	if err := svc.InitSession(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -534,7 +534,7 @@ func TestChatSynthesizesOnlyMissingToolResults(t *testing.T) {
 	if synthetic.Role != sharedkernel.RoleTool || synthetic.ToolCallID != "b" || synthetic.Content != recoveryToolResultPrompt {
 		t.Fatalf("只应为缺失的 b 构造恢复结果，实际 %+v", synthetic)
 	}
-	if synthetic.OriginalSeq != synthetic.Seq {
+	if len(synthetic.OriginalSeq) != 1 || synthetic.OriginalSeq[0] != synthetic.Seq {
 		t.Fatalf("synthetic tool result 未获得稳定原始序号：%+v", synthetic)
 	}
 	if msgs[5].Role != sharedkernel.RoleUser || msgs[5].Content != "new question" ||
@@ -627,7 +627,7 @@ func TestRunPersistsMetaAfterAssistantMessage(t *testing.T) {
 		TokenUsed: sharedkernel.TokenStatistics{TokenInput: 100, TokenOutput: 20},
 	}}}}
 	sess := newTestSession("s-meta", repo)
-	svc := NewReActService(sess, repo, llm, tools.NewDefaultRegistry(nil), func(*ReactEvent) {}, nil, repo)
+	svc := NewReActService(sess, repo, llm, nil, tools.NewDefaultRegistry(nil), func(*ReactEvent) {}, nil, repo)
 
 	if _, err := svc.think(context.Background()); err != nil {
 		t.Fatalf("think: %v", err)
@@ -645,7 +645,7 @@ func TestRequestContextIncludesUserMessagesAndUsage(t *testing.T) {
 	ctx := context.Background()
 	repo := newMemRepo()
 	sess := newTestSession("s-persist", repo)
-	svc := NewReActService(sess, repo, &scriptedLLM{}, tools.NewDefaultRegistry(nil), nil, nil)
+	svc := NewReActService(sess, repo, &scriptedLLM{}, nil, tools.NewDefaultRegistry(nil), nil, nil)
 
 	if err := svc.handleTurnMsg(ctx, &sharedkernel.Message{Role: sharedkernel.RoleUser, Content: "q"}); err != nil {
 		t.Fatal(err)
@@ -673,7 +673,7 @@ func TestRunPropagatesContextPersistError(t *testing.T) {
 	}}}}
 	sess := newTestSession("s-meta-fail", repo)
 	repo.failSaveContext = true
-	svc := NewReActService(sess, repo, llm, tools.NewDefaultRegistry(nil), func(*ReactEvent) {}, nil, repo)
+	svc := NewReActService(sess, repo, llm, nil, tools.NewDefaultRegistry(nil), func(*ReactEvent) {}, nil, repo)
 
 	_, err := svc.think(context.Background())
 	if !errors.Is(err, errRepo) {
@@ -693,7 +693,7 @@ func TestRunCompactsHistoryBeforeGenerate(t *testing.T) {
 
 	repo := newMemRepo()
 	sess := newTestSession("s-compact", repo)
-	svc := NewReActService(sess, repo, &scriptedLLM{}, tools.NewDefaultRegistry(nil), func(*ReactEvent) {}, nil, repo)
+	svc := NewReActService(sess, repo, &scriptedLLM{}, nil, tools.NewDefaultRegistry(nil), func(*ReactEvent) {}, nil, repo)
 	user := sess.BuildUserMessage("q")
 	candidate, err := sess.WithAppendedMessage(&user)
 	if err != nil {
@@ -781,7 +781,7 @@ func TestRunCompactsHistoryBeforeGenerate(t *testing.T) {
 func TestRunDoesNotGenerateWhenCompactionCannotReachExactTarget(t *testing.T) {
 	repo := newMemRepo()
 	sess := newTestSession("s-compact-unreachable", repo)
-	svc := NewReActService(sess, repo, &scriptedLLM{}, tools.NewDefaultRegistry(nil), func(*ReactEvent) {}, nil, repo)
+	svc := NewReActService(sess, repo, &scriptedLLM{}, nil, tools.NewDefaultRegistry(nil), func(*ReactEvent) {}, nil, repo)
 	user := sess.BuildUserMessage("q")
 	candidate, err := sess.WithAppendedMessage(&user)
 	if err != nil {
@@ -828,5 +828,98 @@ func TestRunDoesNotGenerateWhenCompactionCannotReachExactTarget(t *testing.T) {
 	}
 	if llm.calls != 0 {
 		t.Fatalf("generation must not run above exact target, calls=%d", llm.calls)
+	}
+}
+
+func TestCompactionFallsBackToStructuredLLMSummary(t *testing.T) {
+	repo := newMemRepo()
+	sess := newTestSession("s-llm-summary", repo)
+	svc := NewReActService(sess, repo, &scriptedLLM{}, nil, tools.NewDefaultRegistry(nil), func(*ReactEvent) {}, nil, repo)
+	user := sess.BuildUserMessage("保留这个目标")
+	candidate, err := sess.WithAppendedMessage(&user)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.commitCreatedMessage(context.Background(), candidate, user, user); err != nil {
+		t.Fatal(err)
+	}
+	for _, msg := range []*sharedkernel.Message{
+		assistantMsgWithTool(sharedkernel.ToolCall{ID: "old", Name: "old-tool"}),
+		{Role: sharedkernel.RoleTool, ToolCallID: "old", Content: strings.Repeat("旧工具输出", 1000)},
+		assistantMsgWithTool(sharedkernel.ToolCall{ID: "m1", Name: "mid-tool"}),
+		{Role: sharedkernel.RoleTool, ToolCallID: "m1", Content: "x1"},
+		assistantMsgWithTool(sharedkernel.ToolCall{ID: "m2", Name: "mid-tool"}),
+		{Role: sharedkernel.RoleTool, ToolCallID: "m2", Content: "x2"},
+		assistantMsgWithTool(sharedkernel.ToolCall{ID: "latest", Name: "latest-tool"}),
+		{Role: sharedkernel.RoleTool, ToolCallID: "latest", Content: "fresh"},
+	} {
+		if err := svc.handleTurnMsg(context.Background(), msg); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	mainLLM := &scriptedLLM{
+		budget: llmprovider.ContextBudget{ContextWindow: 100, ReservedOutputTokens: 10},
+		countFn: func(msgs []sharedkernel.Message, _ []sharedkernel.ToolDefinition) (int, error) {
+			for _, msg := range msgs {
+				if strings.Contains(msg.Content, "结构化历史摘要") {
+					return 50, nil
+				}
+			}
+			for _, msg := range msgs {
+				if strings.Contains(msg.Content, "read_artifact") {
+					return 70, nil
+				}
+			}
+			return 80, nil
+		},
+	}
+	summaryLLM := &scriptedLLM{responses: []scriptedResp{{msg: &sharedkernel.Message{
+		Role:      sharedkernel.RoleAssistant,
+		Content:   `{"objective":"保留这个目标","facts":[],"decisions":[],"constraints":[],"completed":[],"pending":["继续处理"],"artifacts":[],"warnings":[]}`,
+		TokenUsed: sharedkernel.TokenStatistics{TokenInput: 11, TokenOutput: 3},
+	}}}}
+	svc.LLMClient = mainLLM
+	svc.ContextSummaryLLMClient = summaryLLM
+
+	if err := svc.compactContext(context.Background(), svc.ToolRegistry.GetAvailableTools()); err != nil {
+		t.Fatal(err)
+	}
+	if summaryLLM.calls != 1 || summaryLLM.countCalls != 1 {
+		t.Fatalf("summary provider calls: generate=%d count=%d", summaryLLM.calls, summaryLLM.countCalls)
+	}
+	if len(sess.Messages) != 8 {
+		t.Fatalf("old history was not merged into one message: %+v", sess.Messages)
+	}
+	summary := sess.Messages[1]
+	if summary.Role != sharedkernel.RoleUser || summary.Seq != 2 ||
+		!reflect.DeepEqual(summary.OriginalSeq, []uint64{2, 3, 4}) {
+		t.Fatalf("unexpected summary message: %+v", summary)
+	}
+	if !strings.Contains(summary.Content, `"objective":"保留这个目标"`) {
+		t.Fatalf("summary content was not normalized: %q", summary.Content)
+	}
+	if sess.Messages[2].Seq != 5 || sess.Messages[len(sess.Messages)-1].Seq != 10 || sess.LastSeq != 10 {
+		t.Fatalf("protected context or last sequence changed: %+v", sess.Messages)
+	}
+	if sess.TokenUsed.TokenInput != 11 || sess.TokenUsed.TokenOutput != 3 {
+		t.Fatalf("summary usage not accounted: %+v", sess.TokenUsed)
+	}
+	if sess.MemoryGeneration != 2 || repo.generationCalls != 1 {
+		t.Fatalf("summary compaction must commit one generation: generation=%d commits=%d",
+			sess.MemoryGeneration, repo.generationCalls)
+	}
+}
+
+func TestNormalizeContextSummaryRejectsUnstructuredOutput(t *testing.T) {
+	for _, content := range []string{
+		"plain text",
+		"```json\n{\"objective\":\"x\"}\n```",
+		`{"objective":"","facts":[],"decisions":[],"constraints":[],"completed":[],"pending":[],"artifacts":[],"warnings":[]}`,
+		`{"objective":"x","unexpected":true}`,
+	} {
+		if _, err := normalizeContextSummary(content); err == nil {
+			t.Fatalf("accepted invalid structured summary: %q", content)
+		}
 	}
 }
