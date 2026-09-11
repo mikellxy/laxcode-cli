@@ -282,7 +282,7 @@ func TestRunRegistersTokenUsageToSession(t *testing.T) {
 			},
 		}},
 	}}
-	svc := NewReActService(sess, repo, llm, tools.NewDefaultRegistry(nil), func(*ReactEvent) {}, nil)
+	svc := NewReActService(sess, repo, llm, tools.NewDefaultRegistry(nil), func(*ReactEvent) {}, nil, repo)
 	if _, err := svc.think(context.Background()); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -298,19 +298,24 @@ func TestInitSessionRestoresHistoryAndMeta(t *testing.T) {
 	repo := newMemRepo()
 	sid := "s-resume"
 	// 预置一份“上一次运行”留下的会话状态
-	sys := &sharedkernel.Message{Role: sharedkernel.RoleSystem, Content: "旧提示词"}
-	if err := repo.UpsertSysMessage(ctx, sid, sys); err != nil {
-		t.Fatalf("预置系统消息：%v", err)
+	stored := session.NewSession(sid)
+	stored.UpsertSysMessage("旧提示词")
+	revision, err := repo.SaveCheckpoint(ctx, sid, stored.Snapshot())
+	if err != nil {
+		t.Fatalf("预置系统提示词：%v", err)
 	}
-	if err := repo.AppendMessage(ctx, sid, &sharedkernel.Message{Role: sharedkernel.RoleUser, Content: "上一轮提问"}); err != nil {
-		t.Fatalf("预置历史：%v", err)
+	stored.Revision = revision
+	userMsg := sharedkernel.Message{Role: sharedkernel.RoleUser, Content: "上一轮提问"}
+	if err := stored.AppendMessage(&userMsg); err != nil {
+		t.Fatal(err)
 	}
-	if err := repo.UpdateMeta(ctx, sid, &sharedkernel.SessionMeta{
-		TokenUsed:   sharedkernel.TokenStatistics{TokenInput: 300, TokenOutput: 40},
-		WindowToken: sharedkernel.TokenStatistics{TokenInput: 120, TokenOutput: 8},
-	}); err != nil {
-		t.Fatalf("预置 meta：%v", err)
+	stored.TokenUsed = sharedkernel.TokenStatistics{TokenInput: 300, TokenOutput: 40}
+	stored.WindowToken = sharedkernel.TokenStatistics{TokenInput: 120, TokenOutput: 8}
+	revision, err = repo.CommitAppendedMessage(ctx, sid, stored.Snapshot(), userMsg)
+	if err != nil {
+		t.Fatalf("预置工作集：%v", err)
 	}
+	stored.Revision = revision
 
 	svc := NewReActService(session.NewSession(sid), repo, &scriptedLLM{}, tools.NewDefaultRegistry(nil), nil, nil)
 	if err := svc.InitSession(ctx); err != nil {
@@ -340,17 +345,10 @@ func TestInitSessionPropagatesRepoError(t *testing.T) {
 	ctx := context.Background()
 
 	repo := newMemRepo()
-	repo.failGetMessages = true
+	repo.failLoadContext = true
 	svc := NewReActService(session.NewSession("s1"), repo, &scriptedLLM{}, tools.NewDefaultRegistry(nil), nil, nil)
 	if err := svc.InitSession(ctx); !errors.Is(err, errRepo) {
-		t.Errorf("GetMessages 失败应透传，实际 %v", err)
-	}
-
-	repoMeta := newMemRepo()
-	repoMeta.failGetMeta = true
-	svcMeta := NewReActService(session.NewSession("s1"), repoMeta, &scriptedLLM{}, tools.NewDefaultRegistry(nil), nil, nil)
-	if err := svcMeta.InitSession(ctx); !errors.Is(err, errRepo) {
-		t.Errorf("GetMeta 失败应透传，实际 %v", err)
+		t.Errorf("GetRequestContext 失败应透传，实际 %v", err)
 	}
 }
 
@@ -381,11 +379,14 @@ func TestInitSysPromptWritesRepoAndKeepsSysAtHead(t *testing.T) {
 	if stored := repo.storedMsgs("s-sys"); len(stored) != 0 {
 		t.Errorf("系统提示词不应写进 history，实际 %+v", stored)
 	}
+	if repo.checkpointCalls != 2 || repo.appendCalls != 0 {
+		t.Fatalf("系统提示词应只走 checkpoint：checkpoint=%d append=%d", repo.checkpointCalls, repo.appendCalls)
+	}
 }
 
 func TestInitSysPromptPropagatesRepoError(t *testing.T) {
 	repo := newMemRepo()
-	repo.failUpsertSys = true
+	repo.failCheckpoint = true
 	svc := NewReActService(session.NewSession("s1"), repo, &scriptedLLM{}, tools.NewDefaultRegistry(nil), nil, nil)
 	if err := svc.InitSysPrompt(context.Background(), "p"); !errors.Is(err, errRepo) {
 		t.Errorf("UpsertSysMessage 失败应透传，实际 %v", err)
@@ -426,18 +427,19 @@ func TestChatAppendsUserMessageToRepoAndSession(t *testing.T) {
 	if stored[0].Role != sharedkernel.RoleUser || stored[1].Role != sharedkernel.RoleAssistant {
 		t.Errorf("history 落盘顺序不符：%+v", stored)
 	}
+	if repo.checkpointCalls != 1 || repo.appendCalls != 2 {
+		t.Fatalf("Chat 应由一次初始化 checkpoint 和两次 append 组成：checkpoint=%d append=%d",
+			repo.checkpointCalls, repo.appendCalls)
+	}
 	if sys, ok := repo.storedSys("s-chat"); !ok || sys.Content != "system prompt" {
 		t.Errorf("系统提示词应独立落盘，实际 %+v / %v", sys, ok)
 	}
 }
 
-func TestChatRecoversPendingCommitBeforeNewInput(t *testing.T) {
+func TestChatContinuesCommittedInterruptedInput(t *testing.T) {
 	ctx := context.Background()
 	repo := newMemRepo()
-	llm := &scriptedLLM{responses: []scriptedResp{
-		{msg: assistantMsg("recovered answer")},
-		{msg: assistantMsg("new answer")},
-	}}
+	llm := &scriptedLLM{responses: []scriptedResp{{msg: assistantMsg("combined answer")}}}
 	rec := &eventRecorder{}
 	svc := newTestService(t, "s-recover-pending", "system prompt", repo, llm, tools.NewDefaultRegistry(nil))
 	svc.ReActEventConsumerF = rec.record
@@ -447,7 +449,7 @@ func TestChatRecoversPendingCommitBeforeNewInput(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := svc.commitContext(ctx, candidate, &user); err != nil {
+	if err := svc.commitAppendedMessage(ctx, candidate, user); err != nil {
 		t.Fatal(err)
 	}
 	callMsg := assistantMsgWithTool(sharedkernel.ToolCall{ID: "call", Name: "side_effect"})
@@ -455,33 +457,37 @@ func TestChatRecoversPendingCommitBeforeNewInput(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// 工具结果已进入 pending，但 Save 返回失败；内存仍停在 tool-call assistant。
-	repo.failWithPending = true
-	pendingResult := &sharedkernel.Message{
+	// 工具结果已经原子提交，但进程在模型收束前退出。
+	committedResult := &sharedkernel.Message{
 		Role: sharedkernel.RoleTool, ToolCallID: "call", Content: "uncertain result",
 	}
-	if err := svc.handleTurnMsg(ctx, pendingResult); !errors.Is(err, ErrPersistRequestContext) {
-		t.Fatalf("应返回可识别的持久化错误，实际 %v", err)
+	if err := svc.handleTurnMsg(ctx, committedResult); err != nil {
+		t.Fatal(err)
 	}
-	if svc.Session.LastSeq != 2 {
-		t.Fatalf("失败提交不应切换内存上下文，LastSeq=%d", svc.Session.LastSeq)
+	// 模拟重启：新服务只从持久化工作集恢复。
+	svc = NewReActService(session.NewSession("s-recover-pending"), repo, llm, tools.NewDefaultRegistry(nil), rec.record, nil)
+	if err := svc.InitSession(ctx); err != nil {
+		t.Fatal(err)
 	}
-	repo.failWithPending = false
 
 	final, err := svc.Chat(ctx, "new question")
 	if err != nil {
 		t.Fatalf("恢复后 Chat: %v", err)
 	}
-	if final.Content != "new answer" || llm.calls != 2 {
-		t.Fatalf("应先收束旧轮次再处理新输入：final=%+v calls=%d", final, llm.calls)
+	if final.Content != "combined answer" || llm.calls != 1 {
+		t.Fatalf("旧轮次与新输入应合并为一次推理：final=%+v calls=%d", final, llm.calls)
 	}
 	msgs := svc.Session.Messages
-	if len(msgs) != 7 || msgs[3].Role != sharedkernel.RoleTool || msgs[3].Content != "uncertain result" {
-		t.Fatalf("pending tool result 应被前滚且不重复补写：%+v", msgs)
+	if len(msgs) != 6 || msgs[3].Role != sharedkernel.RoleTool || msgs[3].Content != "uncertain result" {
+		t.Fatalf("已提交 tool result 应恢复且不重复补写：%+v", msgs)
 	}
-	if msgs[4].Role != sharedkernel.RoleAssistant || msgs[4].Content != "recovered answer" ||
-		msgs[5].Role != sharedkernel.RoleUser || msgs[5].Content != "new question" {
-		t.Fatalf("恢复与新输入顺序不符：%+v", msgs)
+	if msgs[4].Role != sharedkernel.RoleUser || msgs[4].Content != "new question" ||
+		msgs[5].Role != sharedkernel.RoleAssistant || msgs[5].Content != "combined answer" {
+		t.Fatalf("恢复工具结果、新输入与回答顺序不符：%+v", msgs)
+	}
+	if len(llm.lastMsgs) != 5 || llm.lastMsgs[3].Role != sharedkernel.RoleTool ||
+		llm.lastMsgs[4].Role != sharedkernel.RoleUser || llm.lastMsgs[4].Content != "new question" {
+		t.Fatalf("模型应同时看到前滚结果和新输入：%+v", llm.lastMsgs)
 	}
 	if svc.Session.ActiveChatID != "" {
 		t.Fatalf("两轮均完成后不应残留 ActiveChatID：%q", svc.Session.ActiveChatID)
@@ -494,10 +500,7 @@ func TestChatRecoversPendingCommitBeforeNewInput(t *testing.T) {
 func TestChatSynthesizesOnlyMissingToolResults(t *testing.T) {
 	ctx := context.Background()
 	repo := newMemRepo()
-	llm := &scriptedLLM{responses: []scriptedResp{
-		{msg: assistantMsg("old done")},
-		{msg: assistantMsg("new done")},
-	}}
+	llm := &scriptedLLM{responses: []scriptedResp{{msg: assistantMsg("combined done")}}}
 	svc := newTestService(t, "s-recover-missing", "system prompt", repo, llm, tools.NewDefaultRegistry(nil))
 
 	user := svc.Session.BuildUserMessage("old question")
@@ -505,7 +508,7 @@ func TestChatSynthesizesOnlyMissingToolResults(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := svc.commitContext(ctx, candidate, &user); err != nil {
+	if err := svc.commitAppendedMessage(ctx, candidate, user); err != nil {
 		t.Fatal(err)
 	}
 	if err := svc.handleTurnMsg(ctx, assistantMsgWithTool(
@@ -520,11 +523,16 @@ func TestChatSynthesizesOnlyMissingToolResults(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// 模拟 Ctrl+C 后重新启动：新服务只从持久化快照恢复旧执行链。
+	svc = newTestService(t, "s-recover-missing", "system prompt", repo, llm, tools.NewDefaultRegistry(nil))
+	if svc.Session.ActiveChatID == "" {
+		t.Fatal("重启后应保留未完成执行链的 ActiveChatID")
+	}
 	if _, err := svc.Chat(ctx, "new question"); err != nil {
 		t.Fatal(err)
 	}
 	msgs := svc.Session.Messages
-	if len(msgs) != 8 {
+	if len(msgs) != 7 {
 		t.Fatalf("消息数=%d：%+v", len(msgs), msgs)
 	}
 	synthetic := msgs[4]
@@ -533,6 +541,58 @@ func TestChatSynthesizesOnlyMissingToolResults(t *testing.T) {
 	}
 	if synthetic.TurnID != msgs[2].TurnID || synthetic.ToolCallGroupID != msgs[2].ToolCallGroupID {
 		t.Fatalf("synthetic tool result 未继承调用组标识：%+v / %+v", msgs[2], synthetic)
+	}
+	if msgs[5].Role != sharedkernel.RoleUser || msgs[5].Content != "new question" ||
+		msgs[6].Role != sharedkernel.RoleAssistant || msgs[6].Content != "combined done" {
+		t.Fatalf("新输入应紧跟在补齐的工具结果之后：%+v", msgs)
+	}
+	if llm.calls != 1 || len(llm.lastMsgs) != 6 ||
+		llm.lastMsgs[4].Role != sharedkernel.RoleTool || llm.lastMsgs[4].ToolCallID != "b" ||
+		llm.lastMsgs[5].Role != sharedkernel.RoleUser {
+		t.Fatalf("模型请求应包含补齐结果和新输入：calls=%d msgs=%+v", llm.calls, llm.lastMsgs)
+	}
+}
+
+func TestChatPersistsNewInputBeforeContinuingRecoveredChat(t *testing.T) {
+	ctx := context.Background()
+	repo := newMemRepo()
+	svc := newTestService(t, "s-recover-cancelled", "system prompt", repo,
+		&scriptedLLM{}, tools.NewDefaultRegistry(nil))
+
+	oldUser := svc.Session.BuildUserMessage("old question")
+	candidate, err := svc.Session.WithStartedChat(&oldUser)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.commitAppendedMessage(ctx, candidate, oldUser); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.handleTurnMsg(ctx, assistantMsgWithTool(
+		sharedkernel.ToolCall{ID: "call", Name: "side_effect"},
+	)); err != nil {
+		t.Fatal(err)
+	}
+
+	// 重启后恢复缺失工具结果，但模型调用再次被 Ctrl+C 终止。
+	llm := &scriptedLLM{responses: []scriptedResp{{err: context.Canceled}}}
+	svc = newTestService(t, "s-recover-cancelled", "system prompt", repo, llm, tools.NewDefaultRegistry(nil))
+	if _, err := svc.Chat(ctx, "changed requirement"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("模型取消错误应透传，实际 %v", err)
+	}
+
+	snapshot, err := repo.GetRequestContext(ctx, "s-recover-cancelled")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.ActiveChatID != "chat-1" {
+		t.Fatalf("再次中断后应保留原执行链，实际 %q", snapshot.ActiveChatID)
+	}
+	if len(snapshot.Messages) != 5 ||
+		snapshot.Messages[3].Role != sharedkernel.RoleTool ||
+		snapshot.Messages[3].ToolCallID != "call" ||
+		snapshot.Messages[4].Role != sharedkernel.RoleUser ||
+		snapshot.Messages[4].Content != "changed requirement" {
+		t.Fatalf("新输入必须在模型调用前持久化：%+v", snapshot.Messages)
 	}
 }
 
@@ -557,7 +617,7 @@ func TestChatRepoFailureDoesNotMutateSession(t *testing.T) {
 	repo := newMemRepo()
 	svc := newTestService(t, "s-append-fail", "system prompt", repo,
 		&scriptedLLM{responses: []scriptedResp{{msg: assistantMsg("never")}}}, tools.NewDefaultRegistry(nil))
-	repo.failAppend = true // 装配完成后再注入故障
+	repo.failSaveContext = true // 装配完成后再注入故障
 
 	before := len(svc.Session.Messages)
 	if _, err := svc.Chat(context.Background(), "q"); !errors.Is(err, errRepo) {
@@ -576,20 +636,17 @@ func TestRunPersistsMetaAfterAssistantMessage(t *testing.T) {
 		TokenUsed: sharedkernel.TokenStatistics{TokenInput: 100, TokenOutput: 20},
 	}}}}
 	sess := newTestSession("s-meta", repo)
-	svc := NewReActService(sess, repo, llm, tools.NewDefaultRegistry(nil), func(*ReactEvent) {}, nil)
+	svc := NewReActService(sess, repo, llm, tools.NewDefaultRegistry(nil), func(*ReactEvent) {}, nil, repo)
 
 	if _, err := svc.think(context.Background()); err != nil {
 		t.Fatalf("think: %v", err)
 	}
-	meta, ok := repo.storedMeta("s-meta")
-	if !ok {
-		t.Fatal("assistant 消息后应把 token 账目落盘（meta.json），否则续聊丢用量")
+	stored := repo.contexts["s-meta"]
+	if stored.TokenUsed != (sharedkernel.TokenStatistics{TokenInput: 100, TokenOutput: 20}) {
+		t.Errorf("累计用量不符：%+v", stored.TokenUsed)
 	}
-	if meta.TokenUsed != (sharedkernel.TokenStatistics{TokenInput: 100, TokenOutput: 20}) {
-		t.Errorf("meta 累计用量不符：%+v", meta)
-	}
-	if meta.WindowToken != (sharedkernel.TokenStatistics{TokenInput: 100, TokenOutput: 20}) {
-		t.Errorf("meta 窗口占用应为本次实测值：%+v", meta.WindowToken)
+	if stored.WindowToken != (sharedkernel.TokenStatistics{TokenInput: 100, TokenOutput: 20}) {
+		t.Errorf("窗口占用应为本次实测值：%+v", stored.WindowToken)
 	}
 }
 
@@ -611,21 +668,21 @@ func TestRequestContextIncludesUserMessagesAndUsage(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("append assistant: %v", err)
 	}
-	meta, ok := repo.storedMeta("s-persist")
-	if !ok || meta.TokenUsed != (sharedkernel.TokenStatistics{TokenInput: 7, TokenOutput: 3}) {
-		t.Errorf("assistant 消息应落盘最新账目，实际 %+v / %v", meta, ok)
+	stored := repo.contexts["s-persist"]
+	if stored.TokenUsed != (sharedkernel.TokenStatistics{TokenInput: 7, TokenOutput: 3}) {
+		t.Errorf("assistant 消息应落盘最新账目，实际 %+v", stored.TokenUsed)
 	}
 }
 
-func TestRunPropagatesMetaPersistError(t *testing.T) {
+func TestRunPropagatesContextPersistError(t *testing.T) {
 	repo := newMemRepo()
-	repo.failUpdateMeta = true
 	llm := &scriptedLLM{responses: []scriptedResp{{msg: &sharedkernel.Message{
 		Role:      sharedkernel.RoleAssistant,
 		TokenUsed: sharedkernel.TokenStatistics{TokenInput: 10, TokenOutput: 1},
 	}}}}
 	sess := newTestSession("s-meta-fail", repo)
-	svc := NewReActService(sess, repo, llm, tools.NewDefaultRegistry(nil), func(*ReactEvent) {}, nil)
+	repo.failSaveContext = true
+	svc := NewReActService(sess, repo, llm, tools.NewDefaultRegistry(nil), func(*ReactEvent) {}, nil, repo)
 
 	_, err := svc.think(context.Background())
 	if !errors.Is(err, errRepo) {
@@ -645,19 +702,33 @@ func TestRunCompactsHistoryBeforeGenerate(t *testing.T) {
 
 	repo := newMemRepo()
 	sess := newTestSession("s-compact", repo)
-	appendOrFatal(t, sess, &sharedkernel.Message{Role: sharedkernel.RoleUser, Content: "q"})
-	appendOrFatal(t, sess, assistantMsgWithTool(sharedkernel.ToolCall{ID: "old", Name: "old-tool"}))
-	appendOrFatal(t, sess, &sharedkernel.Message{
-		Role: sharedkernel.RoleTool, ToolCallID: "old", Content: strings.Repeat("工具输出", 2000),
-	})
+	svc := NewReActService(sess, repo, &scriptedLLM{}, tools.NewDefaultRegistry(nil), func(*ReactEvent) {}, nil, repo)
+	user := sess.BuildUserMessage("q")
+	candidate, err := sess.WithStartedChat(&user)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.commitAppendedMessage(context.Background(), candidate, user); err != nil {
+		t.Fatal(err)
+	}
+	for _, msg := range []*sharedkernel.Message{
+		assistantMsgWithTool(sharedkernel.ToolCall{ID: "old", Name: "old-tool"}),
+		{
+			Role: sharedkernel.RoleTool, ToolCallID: "old", Content: strings.Repeat("工具输出", 2000),
+		},
+		assistantMsgWithTool(sharedkernel.ToolCall{ID: "m1", Name: "mid-tool"}),
+		{Role: sharedkernel.RoleTool, ToolCallID: "m1", Content: "x1"},
+		assistantMsgWithTool(sharedkernel.ToolCall{ID: "m2", Name: "mid-tool"}),
+		{Role: sharedkernel.RoleTool, ToolCallID: "m2", Content: "x2"},
+		assistantMsgWithTool(sharedkernel.ToolCall{ID: "latest", Name: "latest-tool"}),
+		{Role: sharedkernel.RoleTool, ToolCallID: "latest", Content: "fresh"},
+	} {
+		if err := svc.handleTurnMsg(context.Background(), msg); err != nil {
+			t.Fatal(err)
+		}
+	}
 	// 4 个工具调用轮次 > reActToolCallTurnKept(3)：最旧的 old span 落在最近窗口之外会被清理，
 	// 最近 3 轮（m1/m2/latest）完整保留。
-	appendOrFatal(t, sess, assistantMsgWithTool(sharedkernel.ToolCall{ID: "m1", Name: "mid-tool"}))
-	appendOrFatal(t, sess, &sharedkernel.Message{Role: sharedkernel.RoleTool, ToolCallID: "m1", Content: "x1"})
-	appendOrFatal(t, sess, assistantMsgWithTool(sharedkernel.ToolCall{ID: "m2", Name: "mid-tool"}))
-	appendOrFatal(t, sess, &sharedkernel.Message{Role: sharedkernel.RoleTool, ToolCallID: "m2", Content: "x2"})
-	appendOrFatal(t, sess, assistantMsgWithTool(sharedkernel.ToolCall{ID: "latest", Name: "latest-tool"}))
-	appendOrFatal(t, sess, &sharedkernel.Message{Role: sharedkernel.RoleTool, ToolCallID: "latest", Content: "fresh"})
 
 	llm := &scriptedLLM{
 		responses: []scriptedResp{{msg: assistantMsg("done")}},
@@ -671,7 +742,7 @@ func TestRunCompactsHistoryBeforeGenerate(t *testing.T) {
 			return 80, nil
 		},
 	}
-	svc := NewReActService(sess, repo, llm, tools.NewDefaultRegistry(nil), func(*ReactEvent) {}, nil)
+	svc.LLMClient = llm
 	if _, err := svc.think(context.Background()); err != nil {
 		t.Fatalf("think: %v", err)
 	}
@@ -715,19 +786,33 @@ func TestRunCompactsHistoryBeforeGenerate(t *testing.T) {
 func TestRunDoesNotGenerateWhenCompactionCannotReachExactTarget(t *testing.T) {
 	repo := newMemRepo()
 	sess := newTestSession("s-compact-unreachable", repo)
-	appendOrFatal(t, sess, &sharedkernel.Message{Role: sharedkernel.RoleUser, Content: "q"})
-	appendOrFatal(t, sess, assistantMsgWithTool(sharedkernel.ToolCall{ID: "old", Name: "old-tool"}))
-	appendOrFatal(t, sess, &sharedkernel.Message{
-		Role: sharedkernel.RoleTool, ToolCallID: "old", Content: strings.Repeat("large-output", 1000),
-	})
+	svc := NewReActService(sess, repo, &scriptedLLM{}, tools.NewDefaultRegistry(nil), func(*ReactEvent) {}, nil, repo)
+	user := sess.BuildUserMessage("q")
+	candidate, err := sess.WithStartedChat(&user)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.commitAppendedMessage(context.Background(), candidate, user); err != nil {
+		t.Fatal(err)
+	}
+	for _, msg := range []*sharedkernel.Message{
+		assistantMsgWithTool(sharedkernel.ToolCall{ID: "old", Name: "old-tool"}),
+		{
+			Role: sharedkernel.RoleTool, ToolCallID: "old", Content: strings.Repeat("large-output", 1000),
+		},
+		assistantMsgWithTool(sharedkernel.ToolCall{ID: "m1", Name: "mid-tool"}),
+		{Role: sharedkernel.RoleTool, ToolCallID: "m1", Content: "x1"},
+		assistantMsgWithTool(sharedkernel.ToolCall{ID: "m2", Name: "mid-tool"}),
+		{Role: sharedkernel.RoleTool, ToolCallID: "m2", Content: "x2"},
+		assistantMsgWithTool(sharedkernel.ToolCall{ID: "latest", Name: "latest-tool"}),
+		{Role: sharedkernel.RoleTool, ToolCallID: "latest", Content: "fresh"},
+	} {
+		if err := svc.handleTurnMsg(context.Background(), msg); err != nil {
+			t.Fatal(err)
+		}
+	}
 	// 4 个工具调用轮次 > reActToolCallTurnKept(3)：old span 会被清理（→ 70），
 	// 但仍高于精确目标，且此后再无可节省项，压缩无法达标。
-	appendOrFatal(t, sess, assistantMsgWithTool(sharedkernel.ToolCall{ID: "m1", Name: "mid-tool"}))
-	appendOrFatal(t, sess, &sharedkernel.Message{Role: sharedkernel.RoleTool, ToolCallID: "m1", Content: "x1"})
-	appendOrFatal(t, sess, assistantMsgWithTool(sharedkernel.ToolCall{ID: "m2", Name: "mid-tool"}))
-	appendOrFatal(t, sess, &sharedkernel.Message{Role: sharedkernel.RoleTool, ToolCallID: "m2", Content: "x2"})
-	appendOrFatal(t, sess, assistantMsgWithTool(sharedkernel.ToolCall{ID: "latest", Name: "latest-tool"}))
-	appendOrFatal(t, sess, &sharedkernel.Message{Role: sharedkernel.RoleTool, ToolCallID: "latest", Content: "fresh"})
 
 	llm := &scriptedLLM{
 		responses: []scriptedResp{{msg: assistantMsg("must not be generated")}},
@@ -741,19 +826,12 @@ func TestRunDoesNotGenerateWhenCompactionCannotReachExactTarget(t *testing.T) {
 			return 80, nil
 		},
 	}
-	svc := NewReActService(sess, repo, llm, tools.NewDefaultRegistry(nil), func(*ReactEvent) {}, nil)
-	_, err := svc.think(context.Background())
+	svc.LLMClient = llm
+	_, err = svc.think(context.Background())
 	if !errors.Is(err, ErrContextTargetNotReach) {
 		t.Fatalf("expected target-not-reached error, got %v", err)
 	}
 	if llm.calls != 0 {
 		t.Fatalf("generation must not run above exact target, calls=%d", llm.calls)
-	}
-}
-
-func appendOrFatal(t *testing.T, sess *session.Session, msg *sharedkernel.Message) {
-	t.Helper()
-	if err := sess.AppendMessage(msg); err != nil {
-		t.Fatalf("append %s: %v", msg.Role, err)
 	}
 }

@@ -57,7 +57,8 @@ func NewReActService(sess *session.Session,
 	llmClient llmprovider.LLMClient,
 	toolRegistry tools.Registry,
 	reActEventConsumerF func(reactEvent *ReactEvent),
-	tracer telemetry.Tracer) *ReActService {
+	tracer telemetry.Tracer,
+	artifactStores ...tools.ArtifactStore) *ReActService {
 	if reActEventConsumerF == nil {
 		reActEventConsumerF = func(*ReactEvent) {}
 	}
@@ -69,19 +70,20 @@ func NewReActService(sess *session.Session,
 		ReActEventConsumerF: reActEventConsumerF,
 		tracer:              telemetry.OrNoop(tracer),
 	}
-	// FS 仓储同时提供会话级 artifact 存储；子服务绑定自己的 session ID。
-	if store, ok := sessRepo.(tools.ArtifactStore); ok {
+	// ArtifactStore 与数据库会话仓储相互独立；子服务绑定自己的 session ID。
+	if len(artifactStores) > 0 && artifactStores[0] != nil {
+		store := artifactStores[0]
 		r.Artifacts = store
 		toolRegistry.Register(tools.NewReadArtifactTool(store, sess.ID))
 	}
 	return r
 }
 
-// InitSession 只恢复最新工作集；旧格式迁移及未完成提交恢复由仓储处理。
+// InitSession 从数据库恢复最新工作集。
 func (r *ReActService) InitSession(ctx context.Context) error {
 	snapshot, err := r.SessRepo.GetRequestContext(ctx, r.Session.ID)
 	if err != nil {
-		return fmt.Errorf("%w: recover pending context: %w", ErrPersistRequestContext, err)
+		return fmt.Errorf("%w: load request context: %w", ErrPersistRequestContext, err)
 	}
 	return r.Session.Restore(snapshot)
 }
@@ -90,37 +92,41 @@ func (r *ReActService) InitSession(ctx context.Context) error {
 func (r *ReActService) InitSysPrompt(ctx context.Context, p string) error {
 	candidate := r.Session.Clone()
 	candidate.UpsertSysMessage(p)
-	return r.commitContext(ctx, candidate, nil)
+	return r.commitCheckpoint(ctx, candidate)
 }
 
-// Chat 先从仓储前滚 pending 并恢复上一个未完成的 ReAct，再追加本次用户消息。
-// 这样新输入不会越过一个缺少 tool result 或最终 assistant 的旧轮次。
+// Chat 先为数据库中恢复出的未完成 ReAct 补齐缺失的 tool result；随后立即
+// 追加本次用户消息，让模型在同一次后续推理中综合旧工具结果与用户的新要求。
+// 恢复期间 ActiveChatID 保持不变，直到模型生成最终 assistant 才清除。
 func (r *ReActService) Chat(ctx context.Context, p string) (*sharedkernel.Message, error) {
 	if err := r.recoverBeforeChat(ctx); err != nil {
 		return nil, fmt.Errorf("recover previous chat: %w", err)
 	}
 	userMsg := r.Session.BuildUserMessage(p)
-	candidate, err := r.Session.WithStartedChat(&userMsg)
+	var (
+		candidate *session.Session
+		err       error
+	)
+	if r.Session.ActiveChatID == "" {
+		candidate, err = r.Session.WithStartedChat(&userMsg)
+	} else {
+		// 旧 Chat 尚未收束：新输入作为该执行链的补充/变更要求，
+		// 不创建新的 ActiveChatID。
+		candidate, err = r.Session.WithAppendedMessage(&userMsg)
+	}
 	if err != nil {
 		return nil, err
 	}
-	if err := r.commitContext(ctx, candidate, &userMsg); err != nil {
+	if err := r.commitAppendedMessage(ctx, candidate, userMsg); err != nil {
 		return nil, err
 	}
 	return r.think(ctx)
 }
 
-// recoverBeforeChat 是同进程恢复入口。GetRequestContext 会先完成仓储中的
-// pending 提交；恢复出的 ActiveChatID 非空时，补齐未落盘的 tool result，
-// 再让模型把上一轮收束为最终 assistant，成功后才允许开始新对话。
+// recoverBeforeChat 检查启动时从数据库恢复出的工作集。ActiveChatID 非空时只
+// 补齐未持久化的 tool result；Chat 会紧接着追加用户新输入，再把完整序列
+// 一次性交给模型继续推理。
 func (r *ReActService) recoverBeforeChat(ctx context.Context) error {
-	snapshot, err := r.SessRepo.GetRequestContext(ctx, r.Session.ID)
-	if err != nil {
-		return err
-	}
-	if err := r.Session.Restore(snapshot); err != nil {
-		return err
-	}
 	if r.Session.ActiveChatID == "" {
 		return nil
 	}
@@ -139,7 +145,7 @@ func (r *ReActService) recoverBeforeChat(ctx context.Context) error {
 	if tail.Role == sharedkernel.RoleAssistant && len(tail.ToolCalls) == 0 {
 		candidate := r.Session.Clone()
 		candidate.ActiveChatID = ""
-		return r.commitContext(ctx, candidate, nil)
+		return r.commitCheckpoint(ctx, candidate)
 	}
 
 	for _, call := range missingToolResults(r.Session.Messages) {
@@ -152,8 +158,7 @@ func (r *ReActService) recoverBeforeChat(ctx context.Context) error {
 			return err
 		}
 	}
-	_, err = r.think(ctx)
-	return err
+	return nil
 }
 
 func hasUserMessage(messages []sharedkernel.Message) bool {
@@ -409,7 +414,7 @@ func (r *ReActService) compactContext(ctx context.Context, toolDefs []sharedkern
 
 	candidate.ReconcileWindowInput(current)
 	phase = "checkpoint"
-	if err := r.commitContext(ctx, candidate, nil); err != nil {
+	if err := r.commitCheckpoint(ctx, candidate); err != nil {
 		return err
 	}
 	phase = "completed"
@@ -488,21 +493,40 @@ func countToolCallGroups(messages []sharedkernel.Message) int {
 	return count
 }
 
-// handleTurnMsg 先在候选中赋予稳定标识，再提交原始流水与工作集。
-// 仓储通过提交记录恢复中断写入；成功提交后内存才切换。
+// handleTurnMsg 先在候选中赋予稳定标识，再原子提交历史与工作集；成功后内存
+// 才切换。JSONL 冷备失败不会使数据库提交失败。
 func (r *ReActService) handleTurnMsg(ctx context.Context, msg *sharedkernel.Message) error {
 	candidate, err := r.Session.WithAppendedMessage(msg)
 	if err != nil {
 		return err
 	}
-	return r.commitContext(ctx, candidate, msg)
+	return r.commitAppendedMessage(ctx, candidate, *msg)
 }
 
-func (r *ReActService) commitContext(ctx context.Context, candidate *session.Session, original *sharedkernel.Message) error {
+func (r *ReActService) commitCheckpoint(ctx context.Context, candidate *session.Session) error {
 	// 同步提交只读借用候选工作集，无需再次深复制；仓储返回后才切换内存。
-	if err := r.SessRepo.SaveRequestContext(ctx, r.Session.ID, candidate.RequestContext, original); err != nil {
+	revision, err := r.SessRepo.SaveCheckpoint(ctx, r.Session.ID, candidate.RequestContext)
+	if err != nil {
 		return fmt.Errorf("%w: %w", ErrPersistRequestContext, err)
 	}
+	candidate.Revision = revision
+	*r.Session = *candidate
+	return nil
+}
+
+func (r *ReActService) commitAppendedMessage(
+	ctx context.Context,
+	candidate *session.Session,
+	newMsg sharedkernel.Message,
+) error {
+	// newMsg 显式说明本次新增的 original；仓储会校验它与候选尾消息等价。
+	revision, err := r.SessRepo.CommitAppendedMessage(
+		ctx, r.Session.ID, candidate.RequestContext, newMsg,
+	)
+	if err != nil {
+		return fmt.Errorf("%w: %w", ErrPersistRequestContext, err)
+	}
+	candidate.Revision = revision
 	*r.Session = *candidate
 	return nil
 }

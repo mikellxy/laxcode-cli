@@ -30,6 +30,9 @@ const (
 	// settingsFileName 是用户主目录数据根下的配置文件名。
 	settingsFileName = "settings.json"
 
+	// sessionDBFileName 是当前工作目录下的 SQLite 会话数据库。
+	sessionDBFileName = "sessions.db"
+
 	// tracingLogDirName 与 tracingLogFileName 定位会话级 trace 日志。
 	tracingLogDirName  = "log"
 	tracingLogFileName = "tracing.log"
@@ -40,8 +43,13 @@ func Root(workDir string) string {
 	return filepath.Join(workDir, RootDirName)
 }
 
-// SessionRoot 返回会话数据根 ${workDir}/.laxcode/.session，
-// 可直接作为 sessionrepo.NewFsSessionRepo 的入参。
+// SessionDB 返回当前工作目录的会话数据库 ${workDir}/.laxcode/sessions.db。
+func SessionDB(workDir string) string {
+	return filepath.Join(Root(workDir), sessionDBFileName)
+}
+
+// SessionRoot 返回会话文件根 ${workDir}/.laxcode/.session；history 冷备、
+// artifact、trace 与 Plan Mode 文件仍按 session 分目录保存在这里。
 func SessionRoot(workDir string) string {
 	return filepath.Join(Root(workDir), SessionDirName)
 }

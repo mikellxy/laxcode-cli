@@ -126,7 +126,7 @@ func (s *SubAgent) Execute(ctx context.Context, args json.RawMessage) (string, e
 	defer childReg.Close()
 
 	// 事件静默：子 Agent 中间过程不外发（consumer 直接丢弃）。
-	childSvc := NewReActService(childSess, s.parent.SessRepo, s.parent.LLMClient, childReg, func(*ReactEvent) {}, s.parent.tracer)
+	childSvc := NewReActService(childSess, s.parent.SessRepo, s.parent.LLMClient, childReg, func(*ReactEvent) {}, s.parent.tracer, s.parent.Artifacts)
 	if err := childSvc.InitSession(ctx); err != nil {
 		return "", fmt.Errorf("init session: %w", err)
 	}

@@ -18,6 +18,7 @@ import (
 	"github.com/mikellxy/laxcode/internal/domain/prompt"
 	"github.com/mikellxy/laxcode/internal/domain/session"
 	"github.com/mikellxy/laxcode/internal/domain/tools"
+	"github.com/mikellxy/laxcode/internal/infrastructure/artifactstore"
 	"github.com/mikellxy/laxcode/internal/infrastructure/config"
 	"github.com/mikellxy/laxcode/internal/infrastructure/layout"
 	"github.com/mikellxy/laxcode/internal/infrastructure/llmprovider"
@@ -60,8 +61,14 @@ type Assembled struct {
 // 调用前须已由调用方校验（本函数不重复校验，缺失会在 Run 时才暴露）。
 // 返回的 error 仅来自会话初始化 / 系统提示词写入。
 func Assemble(ctx context.Context, in Input) (*Assembled, error) {
-	// session：repo 落在 layout.SessionRoot(workDir)；SessionID 为空则新建。
-	sessRepo := sessionrepo.NewFsSessionRepo(layout.SessionRoot(in.WorkDir))
+	// session：状态与完整历史写 SQLite；JSONL 冷备及 artifact 仍按 session
+	// 写入本地目录。SessionID 为空则新建。
+	sessRepo, err := sessionrepo.NewSqliteSessionRepo(
+		layout.SessionDB(in.WorkDir), layout.SessionRoot(in.WorkDir))
+	if err != nil {
+		return nil, err
+	}
+	artifactStore := artifactstore.New(layout.SessionRoot(in.WorkDir))
 	sess := session.NewSession(in.SessionID)
 	// 系统提示词：技能索引在启动时快照一次（会话期内不刷新）；技能发现端口
 	// 以领域类型接收即完成编译期断言（同 workFS）。Plan Mode 的会话规划目录
@@ -106,7 +113,7 @@ func Assemble(ctx context.Context, in Input) (*Assembled, error) {
 	llmClient := llmprovider.NewOpenApiProvider(c.OpenaiApiKey, c.OpenaiBaseUrl, c.OpenaiModel,
 		c.OpenaiContextWindow, c.OpenaiMaxOutputTokens)
 	svc := reactservice.NewReActService(sess, sessRepo, llmClient, toolReg,
-		in.Consumer, tracer)
+		in.Consumer, tracer, artifactStore)
 	// 子 Agent 复用 svc 的 LLMClient/tracer/Repo 派生隔离子服务，注册进同一
 	// toolReg（svc 持其引用，late register 对 svc 可见）。
 	toolReg.Register(reactservice.NewSubAgent(svc, in.WorkDir,
@@ -125,6 +132,7 @@ func Assemble(ctx context.Context, in Input) (*Assembled, error) {
 	cleanup := func() {
 		once.Do(func() {
 			_ = toolReg.Close()
+			_ = sessRepo.Close()
 			_ = traceHandle.Shutdown(ctx)
 		})
 	}

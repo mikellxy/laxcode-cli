@@ -53,47 +53,10 @@ func NewSession(sessionID string) *Session {
 	}
 }
 
-// LoadMessages 仅用于旧格式迁移和构造历史；正常续聊使用 Restore。
-// 首元素为系统消息时认领其估算占用，否则清零——避免留下上一次加载的悬挂值。
-func (s *Session) LoadMessages(msgs []sharedkernel.Message) {
-	loaded := sharedkernel.CloneMessages(msgs)
-	s.Messages = nil
-	s.LastSeq = 0
-	s.ActiveChatID = ""
-	for i := range loaded {
-		if loaded[i].Role == sharedkernel.RoleSystem {
-			s.Messages = append(s.Messages, loaded[i])
-			continue
-		}
-		// 旧格式只在首次迁移时补齐标识；新格式由 Restore 校验。
-		_ = s.identify(&loaded[i])
-		if loaded[i].Seq > s.LastSeq {
-			s.LastSeq = loaded[i].Seq
-		}
-		s.Messages = append(s.Messages, loaded[i])
-	}
-	s.RequestContext.inferActiveChatID()
-	s.refreshSysToken()
-}
-
 func (s *Session) refreshSysToken() {
 	s.sysToken = 0
 	if len(s.Messages) > 0 && s.Messages[0].Role == sharedkernel.RoleSystem {
 		s.sysToken = sharedkernel.EstimateTokenInt(s.Messages[0].Content)
-	}
-}
-
-// LoadMeta 仅用于旧格式迁移时认领原有 token 账目。
-func (s *Session) LoadMeta(meta sharedkernel.SessionMeta) {
-	s.TokenUsed.OverWrite(meta.TokenUsed)
-	s.WindowToken.OverWrite(meta.WindowToken)
-}
-
-// Meta 返回 token 账目视图；新格式随 RequestContext 一起落盘。
-func (s *Session) Meta() sharedkernel.SessionMeta {
-	return sharedkernel.SessionMeta{
-		TokenUsed:   s.TokenUsed,
-		WindowToken: s.WindowToken,
 	}
 }
 

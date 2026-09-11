@@ -192,7 +192,7 @@ func TestOtelImportsStayInTelemetryAndTracing(t *testing.T) {
 // 匹配（带引号，故不会误命中提示词模板里的说明性路径）。它们只允许出现在
 // infrastructure/layout：那是布局的单一真源。散落多份的后果是改一处忘一处——
 // 会话写到 A 目录、系统提示词却告诉模型 B 目录。
-var diskLayoutLiterals = []string{`".laxcode"`, `".session"`, `"tracing.log"`, `"settings.json"`, `"skills"`}
+var diskLayoutLiterals = []string{`".laxcode"`, `".session"`, `"sessions.db"`, `"tracing.log"`, `"settings.json"`, `"skills"`}
 
 const layoutHome = "internal/infrastructure/layout"
 
@@ -237,6 +237,7 @@ func TestDiskLayoutLiteralsStayInLayoutPkg(t *testing.T) {
 func TestCompositionRootWiresEveryAdapter(t *testing.T) {
 	imports := scanImports(t, "cmd/agentasm")["cmd/agentasm"]
 	want := []string{
+		modulePath + "internal/infrastructure/artifactstore",
 		modulePath + "internal/infrastructure/sessionrepo",
 		modulePath + "internal/infrastructure/llmprovider",
 		modulePath + "internal/infrastructure/workfs",

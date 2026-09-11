@@ -208,67 +208,11 @@ func TestAppendMessageAssistantSettlesTokens(t *testing.T) {
 	}
 }
 
-func TestLoadMessagesAdoptsLeadingSystem(t *testing.T) {
-	s := NewSession("s1")
-	s.LoadMessages([]sharedkernel.Message{
-		{Role: sharedkernel.RoleSystem, Content: strings.Repeat("a", 40)},
-		{Role: sharedkernel.RoleUser, Content: "q"},
-	})
-
-	if len(s.Messages) != 2 {
-		t.Fatalf("应原样认领历史，实际 %d 条", len(s.Messages))
-	}
-	if s.sysToken != sharedkernel.EstimateTokenInt(strings.Repeat("a", 40)) {
-		t.Errorf("应从首条系统消息重算估算占用，实际 %d", s.sysToken)
-	}
-
-	// 首条不是系统消息：估算占用清零，不留悬挂值
-	s.LoadMessages([]sharedkernel.Message{{Role: sharedkernel.RoleUser, Content: "q"}})
-	if s.sysToken != 0 {
-		t.Errorf("无系统消息时估算占用应为 0，实际 %d", s.sysToken)
-	}
-	s.LoadMessages(nil)
-	if s.sysToken != 0 || len(s.Messages) != 0 {
-		t.Errorf("加载空历史应清空状态，实际 %+v / %d", s.sysToken, len(s.Messages))
-	}
-}
-
-func TestLoadAndReadMeta(t *testing.T) {
-	s := NewSession("s1")
-	s.LoadMeta(sharedkernel.SessionMeta{
-		TokenUsed:   sharedkernel.TokenStatistics{TokenInput: 300, TokenOutput: 60},
-		WindowToken: sharedkernel.TokenStatistics{TokenInput: 120, TokenOutput: 15},
-	})
-
-	if s.TokenUsed.TokenInput != 300 || s.TokenUsed.TokenOutput != 60 {
-		t.Errorf("TokenUsed 应从 meta 恢复，实际 %+v", s.TokenUsed)
-	}
-	// WindowToken 恢复的是窗口占用，而不是旧实现里的 TokenUsed
-	if s.WindowToken.TokenInput != 120 || s.WindowToken.TokenOutput != 15 {
-		t.Errorf("WindowToken 应从 meta.WindowToken 恢复，实际 %+v", s.WindowToken)
-	}
-
-	// 账目快照供 application 层落盘
-	s.AppendMessage(&sharedkernel.Message{
-		Role:      sharedkernel.RoleAssistant,
-		TokenUsed: sharedkernel.TokenStatistics{TokenInput: 10, TokenOutput: 2},
-	})
-	meta := s.Meta()
-	if meta.TokenUsed != (sharedkernel.TokenStatistics{TokenInput: 310, TokenOutput: 62}) {
-		t.Errorf("Meta() 应反映最新累计用量，实际 %+v", meta)
-	}
-	if meta.WindowToken != (sharedkernel.TokenStatistics{TokenInput: 10, TokenOutput: 2}) {
-		t.Errorf("Meta() 应反映最新窗口占用，实际 %+v", meta)
-	}
-}
-
 func TestCompactPassesSavingsTargetWithoutGuessingWindowUsage(t *testing.T) {
 	s := NewSession("s1")
 	s.UpsertSysMessage("system prompt")
-	s.LoadMeta(sharedkernel.SessionMeta{
-		TokenUsed:   sharedkernel.TokenStatistics{TokenInput: 900_000, TokenOutput: 100},
-		WindowToken: sharedkernel.TokenStatistics{TokenInput: 180_000, TokenOutput: 2_000},
-	})
+	s.TokenUsed = sharedkernel.TokenStatistics{TokenInput: 900_000, TokenOutput: 100}
+	s.WindowToken = sharedkernel.TokenStatistics{TokenInput: 180_000, TokenOutput: 2_000}
 	fake := &fakeCompactor{retSaved: 3_000}
 
 	saved, err := s.Compact(fake, 50_000)
@@ -313,9 +257,7 @@ func TestCompactAdoptsCompressedMessages(t *testing.T) {
 
 func TestReconcileWindowInputUsesExactNextRequestCount(t *testing.T) {
 	s := NewSession("s1")
-	s.LoadMeta(sharedkernel.SessionMeta{WindowToken: sharedkernel.TokenStatistics{
-		TokenInput: 100, TokenOutput: 20,
-	}})
+	s.WindowToken = sharedkernel.TokenStatistics{TokenInput: 100, TokenOutput: 20}
 	s.ReconcileWindowInput(77)
 	if s.WindowToken != (sharedkernel.TokenStatistics{TokenInput: 77}) {
 		t.Fatalf("unexpected reconciled window usage: %+v", s.WindowToken)
@@ -330,7 +272,9 @@ func TestCompactNilStrategyAndError(t *testing.T) {
 
 	boom := errors.New("compress failed")
 	s2 := NewSession("s2")
-	s2.LoadMessages([]sharedkernel.Message{{Role: sharedkernel.RoleUser, Content: "q"}})
+	if err := s2.AppendMessage(&sharedkernel.Message{Role: sharedkernel.RoleUser, Content: "q"}); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := s2.Compact(&fakeCompactor{retErr: boom}, 100); !errors.Is(err, boom) {
 		t.Errorf("策略错误应透传，实际 %v", err)
 	}

@@ -44,6 +44,11 @@ func TestPaths(t *testing.T) {
 			want: filepath.Join(workDir, ".laxcode"),
 		},
 		{
+			name: "SessionDB",
+			got:  SessionDB(workDir),
+			want: filepath.Join(workDir, ".laxcode", "sessions.db"),
+		},
+		{
 			name: "SessionRoot",
 			got:  SessionRoot(workDir),
 			want: filepath.Join(workDir, ".laxcode", ".session"),
@@ -89,6 +94,9 @@ func TestHierarchy(t *testing.T) {
 	}
 	if got := filepath.Dir(SessionRoot(workDir)); got != Root(workDir) {
 		t.Errorf("SessionRoot 的父目录 = %q, want Root = %q", got, Root(workDir))
+	}
+	if got := filepath.Dir(SessionDB(workDir)); got != Root(workDir) {
+		t.Errorf("SessionDB 的父目录 = %q, want Root = %q", got, Root(workDir))
 	}
 	if got := filepath.Dir(SkillsRoot(workDir)); got != Root(workDir) {
 		t.Errorf("SkillsRoot 的父目录 = %q, want Root = %q", got, Root(workDir))

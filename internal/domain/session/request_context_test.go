@@ -63,29 +63,6 @@ func TestIdentifiersSurviveSnapshotAndResume(t *testing.T) {
 	}
 }
 
-func TestLegacyIdentifiersAreStable(t *testing.T) {
-	legacy := []sharedkernel.Message{
-		{Role: sharedkernel.RoleSystem, Content: "sys"},
-		{Role: sharedkernel.RoleAssistant, ToolCalls: []sharedkernel.ToolCall{{ID: "c"}}},
-		{Role: sharedkernel.RoleTool, ToolCallID: "c", Content: "result"},
-	}
-	a, b := NewSession("legacy"), NewSession("legacy")
-	a.LoadMessages(legacy)
-	b.LoadMessages(legacy)
-	if err := a.Snapshot().Validate(); err != nil {
-		t.Fatal(err)
-	}
-	if !reflect.DeepEqual(a.Snapshot(), b.Snapshot()) {
-		t.Fatal("migration IDs not stable")
-	}
-	if a.Messages[2].ToolCallGroupID != a.Messages[1].ToolCallGroupID {
-		t.Fatal("migration lost tool group")
-	}
-	if legacy[1].Seq != 0 {
-		t.Fatal("migration changed source")
-	}
-}
-
 func TestInvalidSnapshotDoesNotReplaceWorkingContext(t *testing.T) {
 	s := NewSession("bad")
 	s.UpsertSysMessage("keep")

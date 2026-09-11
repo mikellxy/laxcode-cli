@@ -1,4 +1,4 @@
-package sessionrepo
+package artifactstore
 
 import (
 	"context"
@@ -8,21 +8,42 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"unicode/utf8"
 
 	"github.com/mikellxy/laxcode/internal/domain/sharedkernel"
 	"github.com/mikellxy/laxcode/internal/domain/tools"
 )
 
-var _ tools.ArtifactStore = (*FsSessionRepo)(nil)
+type FileStore struct {
+	Root string
+}
+
+func New(root string) *FileStore { return &FileStore{Root: root} }
+
+func validSessionID(id string) error {
+	if id == "" || id == "." || id == ".." || strings.ContainsAny(id, "/\\\x00") {
+		return fmt.Errorf("invalid session ID")
+	}
+	return nil
+}
 
 func artifactID(content []byte) string {
 	sum := sha256.Sum256(content)
 	return hex.EncodeToString(sum[:])
 }
 
-func (r *FsSessionRepo) PutArtifact(ctx context.Context, id, content string) (sharedkernel.ArtifactRef, error) {
-	if err := validSessionID(id); err != nil {
+func syncDir(path string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	return f.Sync()
+}
+
+func (s *FileStore) PutArtifact(ctx context.Context, sessionID, content string) (sharedkernel.ArtifactRef, error) {
+	if err := validSessionID(sessionID); err != nil {
 		return sharedkernel.ArtifactRef{}, err
 	}
 	if err := ctx.Err(); err != nil {
@@ -32,7 +53,7 @@ func (r *FsSessionRepo) PutArtifact(ctx context.Context, id, content string) (sh
 		return sharedkernel.ArtifactRef{}, fmt.Errorf("artifact content is not valid UTF-8")
 	}
 	ref := sharedkernel.ArtifactRef{ID: artifactID([]byte(content)), ByteSize: len(content)}
-	path := filepath.Join(r.Dir, id, "artifacts", ref.ID)
+	path := filepath.Join(s.Root, sessionID, "artifacts", ref.ID)
 	if existing, err := os.ReadFile(path); err == nil {
 		if artifactID(existing) != ref.ID {
 			return ref, fmt.Errorf("artifact digest mismatch: %s", ref.ID)
@@ -41,7 +62,6 @@ func (r *FsSessionRepo) PutArtifact(ctx context.Context, id, content string) (sh
 	} else if !os.IsNotExist(err) {
 		return ref, err
 	}
-	// writeFile 为 JSON 文档追加换行；artifact 必须逐字节保存，使用专用写入。
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return ref, err
 	}
@@ -66,9 +86,9 @@ func (r *FsSessionRepo) PutArtifact(ctx context.Context, id, content string) (sh
 	return ref, syncDir(filepath.Dir(path))
 }
 
-func (r *FsSessionRepo) ReadArtifact(ctx context.Context, sid, id string, offset, limit int) (tools.ArtifactPage, error) {
+func (s *FileStore) ReadArtifact(ctx context.Context, sessionID, id string, offset, limit int) (tools.ArtifactPage, error) {
 	var page tools.ArtifactPage
-	if err := validSessionID(sid); err != nil {
+	if err := validSessionID(sessionID); err != nil {
 		return page, err
 	}
 	if err := ctx.Err(); err != nil {
@@ -81,7 +101,7 @@ func (r *FsSessionRepo) ReadArtifact(ctx context.Context, sid, id string, offset
 	if offset < 0 || limit < 1 || limit > tools.MaxArtifactPageRunes {
 		return page, fmt.Errorf("invalid artifact page range")
 	}
-	root, err := os.OpenRoot(filepath.Join(r.Dir, sid, "artifacts"))
+	root, err := os.OpenRoot(filepath.Join(s.Root, sessionID, "artifacts"))
 	if err != nil {
 		return page, fmt.Errorf("open session artifacts: %w", err)
 	}
@@ -106,5 +126,10 @@ func (r *FsSessionRepo) ReadArtifact(ctx context.Context, sid, id string, offset
 		return page, fmt.Errorf("artifact offset beyond end (%d)", len(runes))
 	}
 	end := offset + min(limit, len(runes)-offset)
-	return tools.ArtifactPage{ID: id, Content: string(runes[offset:end]), Offset: offset, NextOffset: end, TotalRunes: len(runes), EOF: end == len(runes)}, nil
+	return tools.ArtifactPage{
+		ID: id, Content: string(runes[offset:end]), Offset: offset,
+		NextOffset: end, TotalRunes: len(runes), EOF: end == len(runes),
+	}, nil
 }
+
+var _ tools.ArtifactStore = (*FileStore)(nil)

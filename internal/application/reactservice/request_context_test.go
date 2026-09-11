@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -12,12 +14,20 @@ import (
 	"github.com/mikellxy/laxcode/internal/domain/session"
 	"github.com/mikellxy/laxcode/internal/domain/sharedkernel"
 	"github.com/mikellxy/laxcode/internal/domain/tools"
+	"github.com/mikellxy/laxcode/internal/infrastructure/artifactstore"
 	"github.com/mikellxy/laxcode/internal/infrastructure/sessionrepo"
 )
 
 func TestCompactionCheckpointAndArtifactSurviveRestart(t *testing.T) {
 	ctx := context.Background()
-	repo := sessionrepo.NewFsSessionRepo(t.TempDir())
+	root := t.TempDir()
+	historyRoot := filepath.Join(root, ".session")
+	repo, err := sessionrepo.NewSqliteSessionRepo(filepath.Join(root, "sessions.db"), historyRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repo.Close()
+	artifacts := artifactstore.New(historyRoot)
 	s := session.NewSession("resume")
 	llm := &scriptedLLM{budget: llmprovider.ContextBudget{ContextWindow: 100, ReservedOutputTokens: 10}, countFn: func(msgs []sharedkernel.Message, _ []sharedkernel.ToolDefinition) (int, error) {
 		if strings.Contains(msgs[2].Content, "read_artifact") {
@@ -26,10 +36,11 @@ func TestCompactionCheckpointAndArtifactSurviveRestart(t *testing.T) {
 		return 80, nil
 	}}
 	reg := tools.NewDefaultRegistry(nil)
-	svc := NewReActService(s, repo, llm, reg, nil, nil)
+	svc := NewReActService(s, repo, llm, reg, nil, nil, artifacts)
 	if err := svc.InitSysPrompt(ctx, "sys"); err != nil {
 		t.Fatal(err)
 	}
+	s.ActiveChatID = "chat-test"
 	large := strings.Repeat("raw 中文🙂 output\n", 1000)
 	for _, id := range []string{"old", "a", "b", "c"} {
 		if err := svc.handleTurnMsg(ctx, assistantMsgWithTool(sharedkernel.ToolCall{ID: id, Name: "tool", Arguments: json.RawMessage(`{}`)})); err != nil {
@@ -50,16 +61,24 @@ func TestCompactionCheckpointAndArtifactSurviveRestart(t *testing.T) {
 	if before.Messages[2].Artifact == nil {
 		t.Fatal("no artifact reference")
 	}
-	resumed := NewReActService(session.NewSession(s.ID), repo, llm, tools.NewDefaultRegistry(nil), nil, nil)
+	resumed := NewReActService(session.NewSession(s.ID), repo, llm, tools.NewDefaultRegistry(nil), nil, nil, artifacts)
 	if err := resumed.InitSession(ctx); err != nil {
 		t.Fatal(err)
 	}
 	if !reflect.DeepEqual(before, resumed.Session.Snapshot()) {
 		t.Fatal("restart changed compacted request context")
 	}
-	raw, err := repo.GetMessages(ctx, s.ID)
+	rawData, err := os.ReadFile(filepath.Join(historyRoot, s.ID, "history.jsonl"))
 	if err != nil {
 		t.Fatal(err)
+	}
+	var raw []sharedkernel.Message
+	for _, line := range strings.Split(strings.TrimSpace(string(rawData)), "\n") {
+		var msg sharedkernel.Message
+		if err := json.Unmarshal([]byte(line), &msg); err != nil {
+			t.Fatal(err)
+		}
+		raw = append(raw, msg)
 	}
 	if raw[1].Content != large || raw[1].Artifact != nil {
 		t.Fatal("raw archive was modified")
@@ -83,9 +102,15 @@ func TestFailedCompactionNeverReplacesCurrentContext(t *testing.T) {
 		t.Run(failure, func(t *testing.T) {
 			repo := newMemRepo()
 			s := newTestSession("failure", repo)
+			s.ActiveChatID = "chat-test"
+			svc := NewReActService(s, repo, &scriptedLLM{}, tools.NewDefaultRegistry(nil), nil, nil, repo)
 			for _, id := range []string{"old", "a", "b", "c"} {
-				appendOrFatal(t, s, assistantMsgWithTool(sharedkernel.ToolCall{ID: id, Name: "tool"}))
-				appendOrFatal(t, s, &sharedkernel.Message{Role: sharedkernel.RoleTool, ToolCallID: id, Content: strings.Repeat("result", 1000)})
+				if err := svc.handleTurnMsg(context.Background(), assistantMsgWithTool(sharedkernel.ToolCall{ID: id, Name: "tool"})); err != nil {
+					t.Fatal(err)
+				}
+				if err := svc.handleTurnMsg(context.Background(), &sharedkernel.Message{Role: sharedkernel.RoleTool, ToolCallID: id, Content: strings.Repeat("result", 1000)}); err != nil {
+					t.Fatal(err)
+				}
 			}
 			llm := &scriptedLLM{budget: llmprovider.ContextBudget{ContextWindow: 100, ReservedOutputTokens: 10}, countFn: func(msgs []sharedkernel.Message, _ []sharedkernel.ToolDefinition) (int, error) {
 				if strings.Contains(msgs[2].Content, "read_artifact") {
@@ -99,10 +124,10 @@ func TestFailedCompactionNeverReplacesCurrentContext(t *testing.T) {
 				}
 				return 80, nil
 			}}
-			svc := NewReActService(s, repo, llm, tools.NewDefaultRegistry(nil), nil, nil)
+			svc.LLMClient = llm
 			before := s.Snapshot()
 			repo.failArtifact = failure == "artifact"
-			repo.failSaveContext = failure == "checkpoint"
+			repo.failCheckpoint = failure == "checkpoint"
 			err := svc.compactContext(context.Background(), svc.ToolRegistry.GetAvailableTools())
 			if err == nil {
 				t.Fatal("expected error")
@@ -130,7 +155,7 @@ func TestAppendCommitFailurePreservesContextAndRetryIdentity(t *testing.T) {
 		Role: sharedkernel.RoleTool, ToolCallID: "old", Content: "result",
 		Artifact: &sharedkernel.ArtifactRef{ID: "incoming"},
 	}
-	repo.failSaveContext = true
+	repo.failAppend = true
 	if err := svc.handleTurnMsg(ctx, &msg); !errors.Is(err, errRepo) {
 		t.Fatal("expected commit failure", err)
 	}
@@ -138,7 +163,7 @@ func TestAppendCommitFailurePreservesContextAndRetryIdentity(t *testing.T) {
 		t.Fatal("failed append changed committed state")
 	}
 	seq, turn, group := msg.Seq, msg.TurnID, msg.ToolCallGroupID
-	repo.failSaveContext = false
+	repo.failAppend = false
 	if err := svc.handleTurnMsg(ctx, &msg); err != nil {
 		t.Fatal(err)
 	}

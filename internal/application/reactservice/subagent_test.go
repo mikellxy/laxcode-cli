@@ -27,7 +27,7 @@ func newTestSubAgent(parent *ReActService, workDir string) *SubAgent {
 }
 
 // childSysPrompt 从 repo 中取出子会话（ID 以 sub: 前缀）的 system 消息内容：
-// 系统提示词独立存储（对齐 FsSessionRepo 的 sys_message.json），不在对话流水里。
+// 系统提示词属于当前工作集，不进入不可变原始历史。
 func childSysPrompt(t *testing.T, repo *memRepo) string {
 	t.Helper()
 	repo.mu.Lock()
@@ -282,12 +282,12 @@ func TestSubAgentWithParentSessionRepo(t *testing.T) {
 	if _, err := sa.Execute(context.Background(), json.RawMessage(`{"task":"t","work_dir":"/wd"}`)); err != nil {
 		t.Fatalf("Execute: %v", err)
 	}
-	msgs, err := repo.GetMessages(context.Background(), "parent-1")
+	contextSnapshot, err := repo.GetRequestContext(context.Background(), "parent-1")
 	if err != nil {
-		t.Fatalf("GetMessages: %v", err)
+		t.Fatalf("GetRequestContext: %v", err)
 	}
 	// 父会话自身应只有 system 一条
-	if len(msgs) != 1 || msgs[0].Role != sharedkernel.RoleSystem {
-		t.Errorf("父会话不应被 child 写入，实际 %+v", msgs)
+	if len(contextSnapshot.Messages) != 1 || contextSnapshot.Messages[0].Role != sharedkernel.RoleSystem {
+		t.Errorf("父会话不应被 child 写入，实际 %+v", contextSnapshot.Messages)
 	}
 }

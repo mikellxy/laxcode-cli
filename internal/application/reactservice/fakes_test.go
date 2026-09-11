@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"sync"
 	"testing"
 
@@ -16,30 +17,24 @@ import (
 )
 
 // memRepo 是按 sessionID 分桶的内存 SessionRepository，测试用。
-// 存储形态对齐 FsSessionRepo：系统提示词独立一份，GetMessages 时居首。
+// contexts 模拟数据库工作集，msgs 保留原始历史供行为断言。
 // fail* 开关用于验证仓储故障能沿 application 层透传，而不是被静默吞掉。
 type memRepo struct {
 	mu              sync.Mutex
 	msgs            map[string][]sharedkernel.Message
 	sysMsgs         map[string]sharedkernel.Message
-	metas           map[string]sharedkernel.SessionMeta
 	contexts        map[string]session.RequestContext
 	artifacts       map[string]map[string]string
-	pendingContexts map[string]memPendingContext
+	failLoadContext bool
 	failSaveContext bool
-	failWithPending bool
-	failArtifact    bool
-
+	failCheckpoint  bool
 	failAppend      bool
-	failUpsertSys   bool
-	failUpdateMeta  bool
-	failGetMessages bool
-	failGetMeta     bool
-}
-
-type memPendingContext struct {
-	snapshot session.RequestContext
-	original *sharedkernel.Message
+	failArtifact    bool
+	checkpointCalls int
+	appendCalls     int
+	lastCheckpoint  session.RequestContext
+	lastAppend      session.RequestContext
+	lastAppendedMsg sharedkernel.Message
 }
 
 // errRepo 是仓储故障的哨兵错误，供断言透传路径。
@@ -47,70 +42,88 @@ var errRepo = errors.New("repo failure")
 
 func newMemRepo() *memRepo {
 	return &memRepo{
-		msgs:            make(map[string][]sharedkernel.Message),
-		sysMsgs:         make(map[string]sharedkernel.Message),
-		metas:           make(map[string]sharedkernel.SessionMeta),
-		contexts:        make(map[string]session.RequestContext),
-		artifacts:       make(map[string]map[string]string),
-		pendingContexts: make(map[string]memPendingContext),
+		msgs:      make(map[string][]sharedkernel.Message),
+		sysMsgs:   make(map[string]sharedkernel.Message),
+		contexts:  make(map[string]session.RequestContext),
+		artifacts: make(map[string]map[string]string),
 	}
 }
 
-func (m *memRepo) GetRequestContext(ctx context.Context, id string) (session.RequestContext, error) {
-	if pending, ok := m.pendingContexts[id]; ok {
-		if pending.original != nil {
-			m.msgs[id] = append(m.msgs[id], pending.original.Clone())
-		}
-		m.contexts[id] = pending.snapshot.Clone()
-		m.metas[id] = sharedkernel.SessionMeta{
-			TokenUsed: pending.snapshot.TokenUsed, WindowToken: pending.snapshot.WindowToken,
-		}
-		delete(m.pendingContexts, id)
+func (m *memRepo) GetRequestContext(_ context.Context, id string) (session.RequestContext, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.failLoadContext {
+		return session.RequestContext{}, errRepo
 	}
 	if snapshot, ok := m.contexts[id]; ok {
 		return snapshot.Clone(), nil
 	}
-	msgs, err := m.GetMessages(ctx, id)
-	if err != nil {
-		return session.RequestContext{}, err
-	}
-	meta, err := m.GetMeta(ctx, id)
-	if err != nil {
-		return session.RequestContext{}, err
-	}
-	s := session.NewSession(id)
-	s.LoadMessages(msgs)
-	s.LoadMeta(meta)
-	return s.Snapshot(), nil
+	return session.RequestContext{Version: session.RequestContextVersion}, nil
 }
 
-func (m *memRepo) SaveRequestContext(ctx context.Context, id string, snapshot session.RequestContext, original *sharedkernel.Message) error {
-	if m.failWithPending {
-		var originalCopy *sharedkernel.Message
-		if original != nil {
-			copy := original.Clone()
-			originalCopy = &copy
-		}
-		m.pendingContexts[id] = memPendingContext{snapshot: snapshot.Clone(), original: originalCopy}
-		return errRepo
-	}
-	if m.failSaveContext || (original != nil && (m.failAppend || m.failUpdateMeta)) || (original == nil && m.failUpsertSys) {
-		return errRepo
+func (m *memRepo) SaveCheckpoint(_ context.Context, id string, snapshot session.RequestContext) (uint64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.checkpointCalls++
+	m.lastCheckpoint = snapshot.Clone()
+	previous, exists := m.contexts[id]
+	if m.failSaveContext || m.failCheckpoint {
+		return 0, errRepo
 	}
 	if err := snapshot.Validate(); err != nil {
-		return err
+		return 0, err
 	}
-	if original != nil {
-		if err := m.AppendMessage(ctx, id, original); err != nil {
-			return err
+	if exists && (snapshot.Revision != previous.Revision || snapshot.LastSeq != previous.LastSeq) {
+		return 0, errRepo
+	}
+	if !exists {
+		if snapshot.Revision != 0 || snapshot.LastSeq != 0 {
+			return 0, errRepo
+		}
+		for i := range snapshot.Messages {
+			if snapshot.Messages[i].Role != sharedkernel.RoleSystem {
+				return 0, errRepo
+			}
 		}
 	}
+	return m.saveSnapshot(id, snapshot), nil
+}
+
+func (m *memRepo) CommitAppendedMessage(
+	_ context.Context,
+	id string,
+	snapshot session.RequestContext,
+	newMsg sharedkernel.Message,
+) (uint64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.appendCalls++
+	m.lastAppend = snapshot.Clone()
+	m.lastAppendedMsg = newMsg.Clone()
+	previous, exists := m.contexts[id]
+	if m.failSaveContext || m.failAppend {
+		return 0, errRepo
+	}
+	if !exists || snapshot.Revision != previous.Revision || snapshot.LastSeq != previous.LastSeq+1 {
+		return 0, errRepo
+	}
+	if err := snapshot.Validate(); err != nil {
+		return 0, err
+	}
+	if len(snapshot.Messages) == 0 || !reflect.DeepEqual(snapshot.Messages[len(snapshot.Messages)-1], newMsg) {
+		return 0, errRepo
+	}
+	m.msgs[id] = append(m.msgs[id], newMsg.Clone())
+	return m.saveSnapshot(id, snapshot), nil
+}
+
+func (m *memRepo) saveSnapshot(id string, snapshot session.RequestContext) uint64 {
+	snapshot.Revision++
 	m.contexts[id] = snapshot.Clone()
-	m.metas[id] = sharedkernel.SessionMeta{TokenUsed: snapshot.TokenUsed, WindowToken: snapshot.WindowToken}
 	if len(snapshot.Messages) > 0 && snapshot.Messages[0].Role == sharedkernel.RoleSystem {
 		m.sysMsgs[id] = snapshot.Messages[0]
 	}
-	return nil
+	return snapshot.Revision
 }
 
 func (m *memRepo) PutArtifact(_ context.Context, sid, content string) (sharedkernel.ArtifactRef, error) {
@@ -138,59 +151,7 @@ func (m *memRepo) ReadArtifact(_ context.Context, sid, id string, offset, limit 
 	return tools.ArtifactPage{ID: id, Content: string(runes[offset:end]), Offset: offset, NextOffset: end, TotalRunes: len(runes), EOF: end == len(runes)}, nil
 }
 
-func (m *memRepo) AppendMessage(_ context.Context, sessionID string, msg *sharedkernel.Message) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.failAppend {
-		return errRepo
-	}
-	m.msgs[sessionID] = append(m.msgs[sessionID], msg.Clone())
-	return nil
-}
-
-func (m *memRepo) UpsertSysMessage(_ context.Context, sessionID string, msg *sharedkernel.Message) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.failUpsertSys {
-		return errRepo
-	}
-	m.sysMsgs[sessionID] = *msg
-	return nil
-}
-
-func (m *memRepo) UpdateMeta(_ context.Context, sessionID string, meta *sharedkernel.SessionMeta) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.failUpdateMeta {
-		return errRepo
-	}
-	m.metas[sessionID] = *meta
-	return nil
-}
-
-func (m *memRepo) GetMessages(_ context.Context, sessionID string) ([]sharedkernel.Message, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.failGetMessages {
-		return nil, errRepo
-	}
-	var out []sharedkernel.Message
-	if sys, ok := m.sysMsgs[sessionID]; ok {
-		out = append(out, sys)
-	}
-	return append(out, m.msgs[sessionID]...), nil
-}
-
-func (m *memRepo) GetMeta(_ context.Context, sessionID string) (sharedkernel.SessionMeta, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.failGetMeta {
-		return sharedkernel.SessionMeta{}, errRepo
-	}
-	return m.metas[sessionID], nil
-}
-
-// storedMsgs / storedMeta / storedSys 是断言用的读侧快照。
+// storedMsgs / storedSys 是断言用的读侧快照。
 func (m *memRepo) storedMsgs(sessionID string) []sharedkernel.Message {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -202,13 +163,6 @@ func (m *memRepo) storedSys(sessionID string) (sharedkernel.Message, bool) {
 	defer m.mu.Unlock()
 	sys, ok := m.sysMsgs[sessionID]
 	return sys, ok
-}
-
-func (m *memRepo) storedMeta(sessionID string) (sharedkernel.SessionMeta, bool) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	meta, ok := m.metas[sessionID]
-	return meta, ok
 }
 
 // scriptedLLM 按脚本依次返回 LLM 结果，用于无 API Key 驱动 ReAct 循环。
@@ -356,8 +310,10 @@ func (fatalTool) AfterExecInfo(json.RawMessage) string { return "" }
 func newTestSession(id string, repo session.SessionRepository) *session.Session {
 	sess := session.NewSession(id)
 	sess.UpsertSysMessage("system prompt")
-	if err := repo.SaveRequestContext(context.Background(), id, sess.Snapshot(), nil); err != nil {
+	if revision, err := repo.SaveCheckpoint(context.Background(), id, sess.Snapshot()); err != nil {
 		panic(err)
+	} else {
+		sess.Revision = revision
 	}
 	return sess
 }

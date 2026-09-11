@@ -11,6 +11,9 @@ const RequestContextVersion = 1
 // RequestContext 是会话最新工作集；完整历史仅在仓储追加保存。
 // LastSeq 不因压缩改变，避免重启后复用历史消息的标识。
 type RequestContext struct {
+	// Revision 是仓储乐观锁版本，不参与 JSON 冷备；首次保存为 0，每次数据库
+	// 提交成功后加一。
+	Revision     uint64                       `json:"-"`
 	Version      int                          `json:"version"`
 	LastSeq      uint64                       `json:"last_seq"`
 	ActiveChatID string                       `json:"active_chat_id,omitempty"`
