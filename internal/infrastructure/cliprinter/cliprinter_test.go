@@ -433,23 +433,26 @@ func TestUpdatePasteAtCursor(t *testing.T) {
 	}
 }
 
-func TestUpdateCommandCopyPaste(t *testing.T) {
+func TestUpdateCommandCopy(t *testing.T) {
 	m, _, _ := newTestModel()
 	m.lines = []string{"你好", "draft"}
 	_, cmd := m.Update(tea.KeyPressMsg{Code: 'c', Mod: tea.ModSuper})
 	if cmd == nil || !reflect.DeepEqual(cmd(), tea.SetClipboard("你好\ndraft")()) {
 		t.Fatal("Cmd+C 应复制完整草稿到剪贴板")
 	}
-	_, cmd = m.Update(tea.KeyPressMsg{Code: 'v', Mod: tea.ModSuper})
-	if cmd == nil || !reflect.DeepEqual(cmd(), tea.ReadClipboard()) {
-		t.Fatal("Cmd+V 应请求读取剪贴板")
+	if !reflect.DeepEqual(m.lines, []string{"你好", "draft"}) {
+		t.Fatalf("复制不应修改草稿：%q", m.lines)
 	}
-	m.Update(tea.ClipboardMsg{Selection: 'c', Content: "甲\n乙"})
-	if want := []string{"甲", "乙你好", "draft"}; !reflect.DeepEqual(m.lines, want) || m.row != 1 || m.col != 1 {
-		t.Fatalf("剪贴板应在光标处插入，got %q (%d,%d)", m.lines, m.row, m.col)
+}
+
+func TestUpdateSuperVDoesNotReadOSC52OrInsertV(t *testing.T) {
+	m, _, _ := newTestModel()
+	_, cmd := m.Update(tea.KeyPressMsg{Code: 'v', Mod: tea.ModSuper, Text: "v"})
+	if cmd != nil {
+		t.Fatal("Cmd+V 不应主动发起 OSC52 剪贴板读取")
 	}
-	if m.clipboardPending {
-		t.Fatal("读取剪贴板后应清除等待状态")
+	if !reflect.DeepEqual(m.lines, []string{""}) {
+		t.Fatalf("直接上报的 Cmd+V 不应误插入字符：%q", m.lines)
 	}
 }
 
@@ -461,9 +464,7 @@ func TestUpdateIgnoresPasteWhileBusy(t *testing.T) {
 			tea.PasteMsg{Content: "pasted\ntext"},
 			tea.KeyPressMsg{Code: 'v', Mod: tea.ModSuper},
 			tea.KeyPressMsg{Code: 'c', Mod: tea.ModSuper},
-			tea.ClipboardMsg{Selection: 'c', Content: "clipboard"},
 		} {
-			m.clipboardPending = true
 			_, cmd := m.Update(msg)
 			if cmd != nil || !reflect.DeepEqual(m.lines, []string{"draft"}) {
 				t.Fatalf("phase=%v 不应处理剪贴板编辑，msg=%T lines=%q", p, msg, m.lines)
@@ -473,18 +474,6 @@ func TestUpdateIgnoresPasteWhileBusy(t *testing.T) {
 		if cmd == nil || !reflect.DeepEqual(cmd(), tea.Quit()) {
 			t.Fatal("忙碌时 Ctrl+C 仍应退出")
 		}
-	}
-}
-
-func TestUpdateIgnoresClipboardAfterSubmit(t *testing.T) {
-	m, _, _ := newTestModel()
-	m.insert("draft")
-	m.Update(tea.KeyPressMsg{Code: 'v', Mod: tea.ModSuper})
-	m.Update(keyEnter())
-	m.Update(inChunkMsg{text: StreamEnd})
-	m.Update(tea.ClipboardMsg{Selection: 'c', Content: "late clipboard"})
-	if !reflect.DeepEqual(m.lines, []string{""}) {
-		t.Fatalf("上一轮的剪贴板响应不应插入下一轮输入，got %q", m.lines)
 	}
 }
 

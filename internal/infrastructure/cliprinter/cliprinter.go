@@ -62,15 +62,14 @@ func readIn(in <-chan string) tea.Cmd {
 // 终端宽高、交互阶段、流式缓冲（streamBuf）与收发通道。已完成内容不留在 model，
 // 而是即时打印到终端 scrollback（见 appendStream/flushStream）。
 type model struct {
-	lines            []string // 输入区按行保存，行内按 rune 处理
-	row, col         int      // 光标位置：lines[row] 中第 col 个 rune 之前
-	width            int      // 终端宽度（列数），用于绘制与屏幕等宽的分隔线
-	height           int      // 终端高度（行数）：clipLines 安全网，正常历史走 scrollback 不依赖它
-	phase            phase    // 当前交互阶段
-	streamBuf        string   // 正在流式接收、尚未遇到换行的尾部：完整行即时打印到 scrollback，尾部半行由 View 实时显示
-	outChan          chan<- string
-	inChan           <-chan string
-	clipboardPending bool // 等待由 Cmd+V 发起的剪贴板读取结果
+	lines     []string // 输入区按行保存，行内按 rune 处理
+	row, col  int      // 光标位置：lines[row] 中第 col 个 rune 之前
+	width     int      // 终端宽度（列数），用于绘制与屏幕等宽的分隔线
+	height    int      // 终端高度（行数）：clipLines 安全网，正常历史走 scrollback 不依赖它
+	phase     phase    // 当前交互阶段
+	streamBuf string   // 正在流式接收、尚未遇到换行的尾部：完整行即时打印到 scrollback，尾部半行由 View 实时显示
+	outChan   chan<- string
+	inChan    <-chan string
 }
 
 // Init 实现 tea.Model：启动时无需执行命令。
@@ -161,16 +160,9 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.phase = phaseInput
 		return m, m.flushStream()
 	case tea.PasteMsg:
-		// 终端通常自行处理 Cmd+V，再通过 bracketed paste 发送文本。
+		// 粘贴统一由终端通过 bracketed paste 发送；不主动查询 OSC52 剪贴板。
 		if m.phase == phaseInput {
 			m.paste(msg.Content)
-		}
-	case tea.ClipboardMsg:
-		if m.clipboardPending && msg.Selection == 'c' {
-			m.clipboardPending = false
-			if m.phase == phaseInput {
-				m.paste(msg.Content)
-			}
 		}
 	case tea.KeyPressMsg:
 		if msg.String() == "ctrl+c" {
@@ -187,14 +179,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if input := strings.Join(m.lines, "\n"); input != "" {
 				return m, tea.SetClipboard(input)
 			}
-		case "super+v":
-			// 直接上报按键时通过 OSC52 读取（需要终端支持）；普通粘贴走 PasteMsg。
-			if !m.clipboardPending {
-				m.clipboardPending = true
-				return m, tea.ReadClipboard
-			}
 		case "enter":
-			m.clipboardPending = false
 			input := strings.Join(m.lines, "\n")
 			if strings.TrimSpace(input) == "" {
 				// 空输入不发送，仅清空输入区（对齐原 CLI 跳过空行的行为）
@@ -247,7 +232,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		default:
 			// KeyPressMsg.String() 对可打印字符返回字符本身（空格返回 "space"），
 			// 直接用 Text 拿原始文本更稳，可跳过 IME/组合键产生的控制字符。
-			if msg.Text != "" {
+			if msg.Text != "" && msg.Mod&tea.ModSuper == 0 {
 				m.insert(msg.Text)
 			}
 		}
