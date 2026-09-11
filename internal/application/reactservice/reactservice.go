@@ -92,7 +92,7 @@ func (r *ReActService) InitSession(ctx context.Context) error {
 func (r *ReActService) InitSysPrompt(ctx context.Context, p string) error {
 	candidate := r.Session.Clone()
 	candidate.UpsertSysMessage(p)
-	return r.commitCheckpoint(ctx, candidate)
+	return r.commitSnapshot(ctx, candidate)
 }
 
 // Chat 先为数据库中恢复出的未完成 ReAct 补齐缺失的 tool result；随后立即
@@ -145,7 +145,7 @@ func (r *ReActService) recoverBeforeChat(ctx context.Context) error {
 	if tail.Role == sharedkernel.RoleAssistant && len(tail.ToolCalls) == 0 {
 		candidate := r.Session.Clone()
 		candidate.ActiveChatID = ""
-		return r.commitCheckpoint(ctx, candidate)
+		return r.commitSnapshot(ctx, candidate)
 	}
 
 	for _, call := range missingToolResults(r.Session.Messages) {
@@ -413,8 +413,8 @@ func (r *ReActService) compactContext(ctx context.Context, toolDefs []sharedkern
 	}
 
 	candidate.ReconcileWindowInput(current)
-	phase = "checkpoint"
-	if err := r.commitCheckpoint(ctx, candidate); err != nil {
+	phase = "snapshot"
+	if err := r.commitSnapshot(ctx, candidate); err != nil {
 		return err
 	}
 	phase = "completed"
@@ -503,9 +503,9 @@ func (r *ReActService) handleTurnMsg(ctx context.Context, msg *sharedkernel.Mess
 	return r.commitAppendedMessage(ctx, candidate, *msg)
 }
 
-func (r *ReActService) commitCheckpoint(ctx context.Context, candidate *session.Session) error {
+func (r *ReActService) commitSnapshot(ctx context.Context, candidate *session.Session) error {
 	// 同步提交只读借用候选工作集，无需再次深复制；仓储返回后才切换内存。
-	revision, err := r.SessRepo.SaveCheckpoint(ctx, r.Session.ID, candidate.RequestContext)
+	revision, err := r.SessRepo.CommitSnapshot(ctx, r.Session.ID, candidate.RequestContext)
 	if err != nil {
 		return fmt.Errorf("%w: %w", ErrPersistRequestContext, err)
 	}
@@ -519,7 +519,9 @@ func (r *ReActService) commitAppendedMessage(
 	candidate *session.Session,
 	newMsg sharedkernel.Message,
 ) error {
-	// newMsg 显式说明本次新增的 original；仓储会校验它与候选尾消息等价。
+	// newMsg 显式说明本次新增的 original；仓储会校验它与候选尾消息等价，
+	// 并校验 ActiveChatID 双向约束：最终 assistant 必须已清空、其余消息须
+	// 处于活跃对话。违反时提交被整体拒绝，候选须由调用方保证满足契约。
 	revision, err := r.SessRepo.CommitAppendedMessage(
 		ctx, r.Session.ID, candidate.RequestContext, newMsg,
 	)

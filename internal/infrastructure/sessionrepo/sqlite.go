@@ -294,16 +294,16 @@ func (r *SqliteSessionRepo) getRequestContext(db *gorm.DB, id string) (session.R
 type commitKind uint8
 
 const (
-	commitCheckpoint commitKind = iota
+	commitSnapshot commitKind = iota
 	commitAppend
 )
 
-func (r *SqliteSessionRepo) SaveCheckpoint(
+func (r *SqliteSessionRepo) CommitSnapshot(
 	ctx context.Context,
 	id string,
 	snapshot session.RequestContext,
 ) (uint64, error) {
-	return r.commit(ctx, id, snapshot, commitCheckpoint, nil)
+	return r.commit(ctx, id, snapshot, commitSnapshot, nil)
 }
 
 func (r *SqliteSessionRepo) CommitAppendedMessage(
@@ -394,18 +394,18 @@ func validateCommit(
 	newMsg *sharedkernel.Message,
 ) error {
 	if !exists {
-		if kind != commitCheckpoint {
+		if kind != commitSnapshot {
 			return fmt.Errorf("%w: appended message requires an existing session", ErrContextConflict)
 		}
 		if snapshot.Revision != 0 {
 			return fmt.Errorf("%w: got=%d want=0", ErrContextConflict, snapshot.Revision)
 		}
 		if snapshot.LastSeq != 0 {
-			return fmt.Errorf("%w: new checkpoint last_seq=%d want=0", ErrStaleSequence, snapshot.LastSeq)
+			return fmt.Errorf("%w: new snapshot last_seq=%d want=0", ErrStaleSequence, snapshot.LastSeq)
 		}
 		for i := range snapshot.Messages {
 			if snapshot.Messages[i].Role != sharedkernel.RoleSystem {
-				return fmt.Errorf("%w: new checkpoint contains a non-system message", ErrStaleSequence)
+				return fmt.Errorf("%w: new snapshot contains a non-system message", ErrStaleSequence)
 			}
 		}
 		return nil
@@ -415,12 +415,12 @@ func validateCommit(
 		return fmt.Errorf("%w: got=%d want=%d", ErrContextConflict, snapshot.Revision, current.Revision)
 	}
 	switch kind {
-	case commitCheckpoint:
+	case commitSnapshot:
 		if snapshot.LastSeq != current.LastSeq {
-			return fmt.Errorf("%w: checkpoint last_seq=%d current=%d", ErrStaleSequence, snapshot.LastSeq, current.LastSeq)
+			return fmt.Errorf("%w: snapshot last_seq=%d current=%d", ErrStaleSequence, snapshot.LastSeq, current.LastSeq)
 		}
 		if newMsg != nil {
-			return fmt.Errorf("%w: checkpoint includes an appended message", ErrStaleSequence)
+			return fmt.Errorf("%w: snapshot includes an appended message", ErrStaleSequence)
 		}
 	case commitAppend:
 		if current.LastSeq == ^uint64(0) || snapshot.LastSeq != current.LastSeq+1 {

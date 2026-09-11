@@ -87,6 +87,7 @@ func TestRunEmitsReasoningEvent(t *testing.T) {
 func TestRunToolCallLoop(t *testing.T) {
 	repo := newMemRepo()
 	sess := newTestSession("s-tool", repo)
+	sess.ActiveChatID = "chat-1"
 	llm := &scriptedLLM{responses: []scriptedResp{
 		{msg: assistantMsgWithTool(sharedkernel.ToolCall{
 			ID:        "tc-1",
@@ -245,6 +246,7 @@ func TestRunPropagatesGenerateError(t *testing.T) {
 func TestRunUnknownToolDoesNotHang(t *testing.T) {
 	repo := newMemRepo()
 	sess := newTestSession("s-ghost", repo)
+	sess.ActiveChatID = "chat-1"
 	llm := &scriptedLLM{responses: []scriptedResp{
 		{msg: assistantMsgWithTool(sharedkernel.ToolCall{ID: "g1", Name: "ghost_tool", Arguments: []byte(`{}`)})},
 		{msg: assistantMsg("recovered")},
@@ -300,22 +302,22 @@ func TestInitSessionRestoresHistoryAndMeta(t *testing.T) {
 	// 预置一份“上一次运行”留下的会话状态
 	stored := session.NewSession(sid)
 	stored.UpsertSysMessage("旧提示词")
-	revision, err := repo.SaveCheckpoint(ctx, sid, stored.Snapshot())
+	revision, err := repo.CommitSnapshot(ctx, sid, stored.Snapshot())
 	if err != nil {
 		t.Fatalf("预置系统提示词：%v", err)
 	}
 	stored.Revision = revision
 	userMsg := sharedkernel.Message{Role: sharedkernel.RoleUser, Content: "上一轮提问"}
-	if err := stored.AppendMessage(&userMsg); err != nil {
+	candidate, err := stored.WithStartedChat(&userMsg)
+	if err != nil {
 		t.Fatal(err)
 	}
-	stored.TokenUsed = sharedkernel.TokenStatistics{TokenInput: 300, TokenOutput: 40}
-	stored.WindowToken = sharedkernel.TokenStatistics{TokenInput: 120, TokenOutput: 8}
-	revision, err = repo.CommitAppendedMessage(ctx, sid, stored.Snapshot(), userMsg)
+	candidate.TokenUsed = sharedkernel.TokenStatistics{TokenInput: 300, TokenOutput: 40}
+	candidate.WindowToken = sharedkernel.TokenStatistics{TokenInput: 120, TokenOutput: 8}
+	revision, err = repo.CommitAppendedMessage(ctx, sid, candidate.Snapshot(), userMsg)
 	if err != nil {
 		t.Fatalf("预置工作集：%v", err)
 	}
-	stored.Revision = revision
 
 	svc := NewReActService(session.NewSession(sid), repo, &scriptedLLM{}, tools.NewDefaultRegistry(nil), nil, nil)
 	if err := svc.InitSession(ctx); err != nil {
@@ -379,14 +381,14 @@ func TestInitSysPromptWritesRepoAndKeepsSysAtHead(t *testing.T) {
 	if stored := repo.storedMsgs("s-sys"); len(stored) != 0 {
 		t.Errorf("系统提示词不应写进 history，实际 %+v", stored)
 	}
-	if repo.checkpointCalls != 2 || repo.appendCalls != 0 {
-		t.Fatalf("系统提示词应只走 checkpoint：checkpoint=%d append=%d", repo.checkpointCalls, repo.appendCalls)
+	if repo.snapshotCalls != 2 || repo.appendCalls != 0 {
+		t.Fatalf("系统提示词应只走快照提交：snapshot=%d append=%d", repo.snapshotCalls, repo.appendCalls)
 	}
 }
 
 func TestInitSysPromptPropagatesRepoError(t *testing.T) {
 	repo := newMemRepo()
-	repo.failCheckpoint = true
+	repo.failSnapshot = true
 	svc := NewReActService(session.NewSession("s1"), repo, &scriptedLLM{}, tools.NewDefaultRegistry(nil), nil, nil)
 	if err := svc.InitSysPrompt(context.Background(), "p"); !errors.Is(err, errRepo) {
 		t.Errorf("UpsertSysMessage 失败应透传，实际 %v", err)
@@ -427,9 +429,9 @@ func TestChatAppendsUserMessageToRepoAndSession(t *testing.T) {
 	if stored[0].Role != sharedkernel.RoleUser || stored[1].Role != sharedkernel.RoleAssistant {
 		t.Errorf("history 落盘顺序不符：%+v", stored)
 	}
-	if repo.checkpointCalls != 1 || repo.appendCalls != 2 {
-		t.Fatalf("Chat 应由一次初始化 checkpoint 和两次 append 组成：checkpoint=%d append=%d",
-			repo.checkpointCalls, repo.appendCalls)
+	if repo.snapshotCalls != 1 || repo.appendCalls != 2 {
+		t.Fatalf("Chat 应由一次初始化快照提交和两次 append 组成：snapshot=%d append=%d",
+			repo.snapshotCalls, repo.appendCalls)
 	}
 	if sys, ok := repo.storedSys("s-chat"); !ok || sys.Content != "system prompt" {
 		t.Errorf("系统提示词应独立落盘，实际 %+v / %v", sys, ok)
@@ -654,13 +656,14 @@ func TestRequestContextIncludesUserMessagesAndUsage(t *testing.T) {
 	ctx := context.Background()
 	repo := newMemRepo()
 	sess := newTestSession("s-persist", repo)
+	sess.ActiveChatID = "chat-1"
 	svc := NewReActService(sess, repo, &scriptedLLM{}, tools.NewDefaultRegistry(nil), nil, nil)
 
 	if err := svc.handleTurnMsg(ctx, &sharedkernel.Message{Role: sharedkernel.RoleUser, Content: "q"}); err != nil {
 		t.Fatal(err)
 	}
 	if len(repo.contexts[sess.ID].Messages) != 2 {
-		t.Fatal("user message must checkpoint immediately")
+		t.Fatal("user message must persist immediately")
 	}
 	if err := svc.handleTurnMsg(ctx, &sharedkernel.Message{
 		Role:      sharedkernel.RoleAssistant,

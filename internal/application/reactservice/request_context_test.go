@@ -18,7 +18,7 @@ import (
 	"github.com/mikellxy/laxcode/internal/infrastructure/sessionrepo"
 )
 
-func TestCompactionCheckpointAndArtifactSurviveRestart(t *testing.T) {
+func TestCompactionSnapshotAndArtifactSurviveRestart(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
 	historyRoot := filepath.Join(root, ".session")
@@ -98,7 +98,7 @@ func TestCompactionCheckpointAndArtifactSurviveRestart(t *testing.T) {
 }
 
 func TestFailedCompactionNeverReplacesCurrentContext(t *testing.T) {
-	for _, failure := range []string{"artifact", "count", "target", "checkpoint"} {
+	for _, failure := range []string{"artifact", "count", "target", "snapshot"} {
 		t.Run(failure, func(t *testing.T) {
 			repo := newMemRepo()
 			s := newTestSession("failure", repo)
@@ -127,7 +127,7 @@ func TestFailedCompactionNeverReplacesCurrentContext(t *testing.T) {
 			svc.LLMClient = llm
 			before := s.Snapshot()
 			repo.failArtifact = failure == "artifact"
-			repo.failCheckpoint = failure == "checkpoint"
+			repo.failSnapshot = failure == "snapshot"
 			err := svc.compactContext(context.Background(), svc.ToolRegistry.GetAvailableTools())
 			if err == nil {
 				t.Fatal("expected error")
@@ -145,6 +145,7 @@ func TestFailedCompactionNeverReplacesCurrentContext(t *testing.T) {
 func TestAppendCommitFailurePreservesContextAndRetryIdentity(t *testing.T) {
 	repo := newMemRepo()
 	s := newTestSession("append-fail", repo)
+	s.ActiveChatID = "chat-1"
 	svc := NewReActService(s, repo, &scriptedLLM{}, tools.NewDefaultRegistry(nil), nil, nil)
 	ctx := context.Background()
 	if err := svc.handleTurnMsg(ctx, assistantMsgWithTool(sharedkernel.ToolCall{ID: "old", Arguments: json.RawMessage(`{}`)})); err != nil {

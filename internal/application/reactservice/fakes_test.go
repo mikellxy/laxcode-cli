@@ -27,12 +27,12 @@ type memRepo struct {
 	artifacts       map[string]map[string]string
 	failLoadContext bool
 	failSaveContext bool
-	failCheckpoint  bool
+	failSnapshot  bool
 	failAppend      bool
 	failArtifact    bool
-	checkpointCalls int
+	snapshotCalls int
 	appendCalls     int
-	lastCheckpoint  session.RequestContext
+	lastSnapshot  session.RequestContext
 	lastAppend      session.RequestContext
 	lastAppendedMsg sharedkernel.Message
 }
@@ -61,13 +61,13 @@ func (m *memRepo) GetRequestContext(_ context.Context, id string) (session.Reque
 	return session.RequestContext{Version: session.RequestContextVersion}, nil
 }
 
-func (m *memRepo) SaveCheckpoint(_ context.Context, id string, snapshot session.RequestContext) (uint64, error) {
+func (m *memRepo) CommitSnapshot(_ context.Context, id string, snapshot session.RequestContext) (uint64, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.checkpointCalls++
-	m.lastCheckpoint = snapshot.Clone()
+	m.snapshotCalls++
+	m.lastSnapshot = snapshot.Clone()
 	previous, exists := m.contexts[id]
-	if m.failSaveContext || m.failCheckpoint {
+	if m.failSaveContext || m.failSnapshot {
 		return 0, errRepo
 	}
 	if err := snapshot.Validate(); err != nil {
@@ -111,6 +111,13 @@ func (m *memRepo) CommitAppendedMessage(
 		return 0, err
 	}
 	if len(snapshot.Messages) == 0 || !reflect.DeepEqual(snapshot.Messages[len(snapshot.Messages)-1], newMsg) {
+		return 0, errRepo
+	}
+	isFinalAssistant := newMsg.Role == sharedkernel.RoleAssistant && len(newMsg.ToolCalls) == 0
+	if isFinalAssistant && snapshot.ActiveChatID != "" {
+		return 0, errRepo
+	}
+	if !isFinalAssistant && snapshot.ActiveChatID == "" {
 		return 0, errRepo
 	}
 	m.msgs[id] = append(m.msgs[id], newMsg.Clone())
@@ -310,7 +317,7 @@ func (fatalTool) AfterExecInfo(json.RawMessage) string { return "" }
 func newTestSession(id string, repo session.SessionRepository) *session.Session {
 	sess := session.NewSession(id)
 	sess.UpsertSysMessage("system prompt")
-	if revision, err := repo.SaveCheckpoint(context.Background(), id, sess.Snapshot()); err != nil {
+	if revision, err := repo.CommitSnapshot(context.Background(), id, sess.Snapshot()); err != nil {
 		panic(err)
 	} else {
 		sess.Revision = revision

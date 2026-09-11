@@ -25,9 +25,9 @@ func newTestRepo(t *testing.T) (*SqliteSessionRepo, string) {
 	return repo, filepath.Join(root, ".session")
 }
 
-func saveCheckpoint(t *testing.T, repo *SqliteSessionRepo, s *session.Session) {
+func saveSnapshot(t *testing.T, repo *SqliteSessionRepo, s *session.Session) {
 	t.Helper()
-	revision, err := repo.SaveCheckpoint(context.Background(), s.ID, s.Snapshot())
+	revision, err := repo.CommitSnapshot(context.Background(), s.ID, s.Snapshot())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -52,7 +52,7 @@ func TestSqliteSessionRepoPersistsHistoryAndCompactedVariants(t *testing.T) {
 	repo, historyRoot := newTestRepo(t)
 	s := session.NewSession("s1")
 	s.UpsertSysMessage("system")
-	saveCheckpoint(t, repo, s)
+	saveSnapshot(t, repo, s)
 
 	user := sharedkernel.Message{Role: sharedkernel.RoleUser, Content: "question"}
 	started, err := s.WithStartedChat(&user)
@@ -72,7 +72,7 @@ func TestSqliteSessionRepoPersistsHistoryAndCompactedVariants(t *testing.T) {
 
 	s.Messages[2].Content = "short answer"
 	s.Messages[2].Artifact = &sharedkernel.ArtifactRef{ID: "abc", ByteSize: 27}
-	saveCheckpoint(t, repo, s)
+	saveSnapshot(t, repo, s)
 
 	got, err := repo.GetRequestContext(context.Background(), s.ID)
 	if err != nil {
@@ -126,25 +126,25 @@ func TestSqliteSessionRepoRejectsStaleRevision(t *testing.T) {
 	repo, _ := newTestRepo(t)
 	s := session.NewSession("conflict")
 	s.UpsertSysMessage("one")
-	saveCheckpoint(t, repo, s)
+	saveSnapshot(t, repo, s)
 	stale := s.Snapshot()
 
 	s.UpsertSysMessage("two")
-	saveCheckpoint(t, repo, s)
+	saveSnapshot(t, repo, s)
 	stale.Messages[0].Content = "stale"
-	if _, err := repo.SaveCheckpoint(context.Background(), s.ID, stale); !errors.Is(err, ErrContextConflict) {
+	if _, err := repo.CommitSnapshot(context.Background(), s.ID, stale); !errors.Is(err, ErrContextConflict) {
 		t.Fatalf("expected revision conflict, got %v", err)
 	}
 }
 
-func TestSaveCheckpointEnforcesCheckpointSequence(t *testing.T) {
+func TestCommitSnapshotEnforcesSequence(t *testing.T) {
 	repo, historyRoot := newTestRepo(t)
-	s := session.NewSession("checkpoint-sequence")
+	s := session.NewSession("snapshot-sequence")
 	s.UpsertSysMessage("system")
-	saveCheckpoint(t, repo, s)
+	saveSnapshot(t, repo, s)
 
 	if _, err := os.Stat(filepath.Join(historyRoot, s.ID, historyFile)); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("checkpoint must not create history backup, stat err=%v", err)
+		t.Fatalf("snapshot commit must not create history backup, stat err=%v", err)
 	}
 
 	user := s.BuildUserMessage("question")
@@ -152,8 +152,8 @@ func TestSaveCheckpointEnforcesCheckpointSequence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := repo.SaveCheckpoint(context.Background(), s.ID, grown.Snapshot()); !errors.Is(err, ErrStaleSequence) {
-		t.Fatalf("checkpoint accepted LastSeq growth: %v", err)
+	if _, err := repo.CommitSnapshot(context.Background(), s.ID, grown.Snapshot()); !errors.Is(err, ErrStaleSequence) {
+		t.Fatalf("snapshot accepted LastSeq growth: %v", err)
 	}
 
 	s = grown
@@ -161,17 +161,17 @@ func TestSaveCheckpointEnforcesCheckpointSequence(t *testing.T) {
 	rolledBack := s.Snapshot()
 	rolledBack.LastSeq = 0
 	rolledBack.Messages = rolledBack.Messages[:1]
-	if _, err := repo.SaveCheckpoint(context.Background(), s.ID, rolledBack); !errors.Is(err, ErrStaleSequence) {
-		t.Fatalf("checkpoint accepted LastSeq rollback: %v", err)
+	if _, err := repo.CommitSnapshot(context.Background(), s.ID, rolledBack); !errors.Is(err, ErrStaleSequence) {
+		t.Fatalf("snapshot accepted LastSeq rollback: %v", err)
 	}
 
-	newSession := session.NewSession("checkpoint-import")
+	newSession := session.NewSession("snapshot-import")
 	imported := sharedkernel.Message{Role: sharedkernel.RoleUser, Content: "not an initializer"}
 	if err := newSession.AppendMessage(&imported); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := repo.SaveCheckpoint(context.Background(), newSession.ID, newSession.Snapshot()); !errors.Is(err, ErrStaleSequence) {
-		t.Fatalf("checkpoint accepted initial history import: %v", err)
+	if _, err := repo.CommitSnapshot(context.Background(), newSession.ID, newSession.Snapshot()); !errors.Is(err, ErrStaleSequence) {
+		t.Fatalf("snapshot accepted initial history import: %v", err)
 	}
 }
 
@@ -231,7 +231,7 @@ func TestCommitAppendedMessageRejectsInvalidIntent(t *testing.T) {
 			repo, _ := newTestRepo(t)
 			s := session.NewSession("invalid-append")
 			s.UpsertSysMessage("system")
-			saveCheckpoint(t, repo, s)
+			saveSnapshot(t, repo, s)
 			msg := s.BuildUserMessage("question")
 			candidate, err := s.WithStartedChat(&msg)
 			if err != nil {
@@ -266,12 +266,14 @@ func TestCommitAppendedMessageRejectsInvalidIntent(t *testing.T) {
 	repo, _ = newTestRepo(t)
 	s := session.NewSession("final-active")
 	s.UpsertSysMessage("system")
-	saveCheckpoint(t, repo, s)
+	saveSnapshot(t, repo, s)
 	final := sharedkernel.Message{Role: sharedkernel.RoleAssistant, Content: "done"}
 	finalCandidate, err := s.WithAppendedMessage(&final)
 	if err != nil {
 		t.Fatal(err)
 	}
+	// 绕过 domain 手工构造异常快照：正常路径不会出现最终 assistant 携带
+	// 活跃对话，此处验证仓储对绕过聚合方法的调用方的防御性拒绝。
 	finalCandidate.ActiveChatID = "chat-must-be-cleared"
 	if _, err := repo.CommitAppendedMessage(context.Background(), s.ID, finalCandidate.Snapshot(), final); err == nil {
 		t.Fatal("final assistant with active chat was accepted")
@@ -282,7 +284,7 @@ func TestCommitAppendedMessageKeepsHistoryChatAfterFinalAssistant(t *testing.T) 
 	repo, _ := newTestRepo(t)
 	s := session.NewSession("history-chat")
 	s.UpsertSysMessage("system")
-	saveCheckpoint(t, repo, s)
+	saveSnapshot(t, repo, s)
 
 	user := s.BuildUserMessage("question")
 	candidate, err := s.WithStartedChat(&user)
@@ -345,7 +347,7 @@ func TestCommitAppendedMessageRollsBackAllDatabaseWrites(t *testing.T) {
 	repo, _ := newTestRepo(t)
 	s := session.NewSession("rollback")
 	s.UpsertSysMessage("system")
-	saveCheckpoint(t, repo, s)
+	saveSnapshot(t, repo, s)
 	before := s.Snapshot()
 	if err := repo.db.Exec(`CREATE TRIGGER fail_history_insert
 		BEFORE INSERT ON history_entries
@@ -391,7 +393,7 @@ func TestHistoryBackupFailureDoesNotFailDatabaseCommit(t *testing.T) {
 	defer repo.Close()
 	s := session.NewSession("backup-failure")
 	s.UpsertSysMessage("sys")
-	saveCheckpoint(t, repo, s)
+	saveSnapshot(t, repo, s)
 	msg := sharedkernel.Message{Role: sharedkernel.RoleUser, Content: "persist me"}
 	started, err := s.WithStartedChat(&msg)
 	if err != nil {

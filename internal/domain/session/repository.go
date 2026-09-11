@@ -15,11 +15,11 @@ import (
 type SessionRepository interface {
 	// GetRequestContext 读取数据库中的最新工作集；会话不存在时返回空工作集。
 	GetRequestContext(ctx context.Context, sessionID string) (RequestContext, error)
-	// SaveCheckpoint 保存不产生新 original 消息的工作集变更。新 Session 只能
+	// CommitSnapshot 提交不产生新 original 消息的工作集快照。新 Session 只能
 	// 通过该方法以 Revision=0、LastSeq=0 初始化；成功后 revision 仍会递增。
 	// 参数在同步调用期间只读借用。实现不得修改或在返回后保留任何切片、
 	// 指针引用；内存存储或异步处理须自行复制。调用方在返回前也不得修改参数。
-	SaveCheckpoint(ctx context.Context, sessionID string, snapshot RequestContext) (uint64, error)
+	CommitSnapshot(ctx context.Context, sessionID string, snapshot RequestContext) (uint64, error)
 	// CommitAppendedMessage 原子保存一条明确的新增 original 消息及其对应的最新
 	// 工作集。snapshot 必须只比当前状态前进一步，且尾消息必须与 newMsg 等价。
 	CommitAppendedMessage(ctx context.Context, sessionID string, snapshot RequestContext, newMsg sharedkernel.Message) (uint64, error)
