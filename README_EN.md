@@ -38,6 +38,7 @@ Write the following into the config file
   "OPENAI_MODEL": "gpt-4o-mini",
   "OPENAI_CONTEXT_WINDOW": 128000,
   "OPENAI_MAX_OUTPUT_TOKENS": 16384,
+  "LLM_ROUTER_ADDR": "127.0.0.1:0",
   "COMPACTION_OPENAI_MODEL": "gpt-4o-mini",
   "COMPACTION_OPENAI_CONTEXT_WINDOW": 128000,
   "COMPACTION_OPENAI_MAX_OUTPUT_TOKENS": 4096
@@ -50,6 +51,8 @@ export OPENAI_BASE_URL=https://api.openai.com/v1     # any OpenAI-compatible end
 export OPENAI_MODEL=gpt-4o-mini
 export OPENAI_CONTEXT_WINDOW=128000
 export OPENAI_MAX_OUTPUT_TOKENS=16384
+# Defaults to 127.0.0.1:0; use a fixed port when external access is needed
+export LLM_ROUTER_ADDR=127.0.0.1:18080
 # Omitted compaction-provider settings inherit the main provider
 export COMPACTION_OPENAI_MODEL=gpt-4o-mini
 ```
@@ -108,6 +111,20 @@ go run ./examples/sse-client -task "list the current directory and count the go 
 go run ./examples/sse-client -task "what did we talk about" -session=20260910-142622.514
 ```
 
+Interactive, one-shot, and SSE modes all start a local model router alongside the
+main process. The main `GenerateStream` reaches the model indirectly through
+`POST /openai/generate_stream`. The router binds to a random available
+`127.0.0.1:0` port by default; set `LLM_ROUTER_ADDR` to expose a stable local port.
+The body follows the OpenAI Responses API, and the configured model overrides any
+`model` in the request:
+
+```shell
+LLM_ROUTER_ADDR=127.0.0.1:18080 ./bin/laxcode
+curl -N http://127.0.0.1:18080/openai/generate_stream \
+  -H 'Content-Type: application/json' \
+  -d '{"input":"hello"}'
+```
+
 | Argument   | Default | Description               |
 |------------|---------|---------------------------|
 | `-sse`     | false   | Start the sse server      |
@@ -142,6 +159,10 @@ ${workdir}/.laxcode/.session/
 ### 2.2 Runtime Log
 
 At startup, the standard-library `log/slog` logger creates `./log/laxcode.log` and appends INFO-and-above JSON Lines records. `context_compaction_triggered` is emitted when the context reaches the compaction threshold, `context_compaction_completed` after the compacted snapshot is committed, and `context_compaction_failed` on failure. Records contain only token, message, tool-call-group, artifact, protected-range, and duration statistics—never message bodies or tool output.
+
+The model router writes separately to `./log/llmrouter.log`. Every request record
+contains slog's `time` plus `request_body_bytes`, `duration_ms`, and `status_code`;
+request bodies and API keys are not logged.
 
 ## 3. Tools
 LaxCode fully implements the OpenAI function call protocol inside the ReAct loop. Built-in tools are injected at startup, and tool definitions are sent with every LLM call.
@@ -236,17 +257,20 @@ LaxCode/
 │   └── run_oneshot/       # one-shot-mode frontend (result JSON contract, exit codes)
 ├── internal/
 │   ├── application/
-│   │   └── reactservice/  # ReAct reasoning loop, sub-agent delegation
+│   │   ├── reactservice/  # ReAct reasoning loop, sub-agent delegation
+│   │   └── llm_router/    # Local model-gateway HTTP/SSE orchestration
 │   ├── domain/
 │   │   ├── session/       # session aggregate, SessionRepository interface
 │   │   ├── tools/         # tool registry & read/write/edit/bash behavioral contracts, WorkFS / ShellRunner ports
 │   │   ├── llmprovider/   # LLM client interface
+│   │   ├── llmrouter/     # Gateway upstream streaming port
 │   │   ├── prompt/        # system prompt assembly (persona / skill index / Plan Mode), SkillSource port
 │   │   ├── compactor/     # context compaction strategy
 │   │   ├── telemetry/     # observability vocabulary: span names, attribute keys, tracing helpers
 │   │   └── sharedkernel/  # shared types: messages, tool definitions, token stats & estimation
 │   └── infrastructure/
 │       ├── llmprovider/   # OpenAI Responses protocol implementation
+│       ├── llmrouter/     # Gateway OpenAI SDK streaming adapter
 │       ├── sessionrepo/   # filesystem session repository (JSONL persistence)
 │       ├── workfs/        # real-filesystem implementation of the WorkFS port
 │       ├── shell/         # ShellRunner port implementation: exec, process groups, timeout kill

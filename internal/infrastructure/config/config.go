@@ -21,6 +21,9 @@ type envAndFileConf struct {
 	CompactionOpenaiModel           string `mapstructure:"compaction_openai_model"`
 	CompactionOpenaiContextWindow   int    `mapstructure:"compaction_openai_context_window"`
 	CompactionOpenaiMaxOutputTokens int    `mapstructure:"compaction_openai_max_output_tokens"`
+	LlmRouterAddr                   string `mapstructure:"llm_router_addr"`
+	// LlmRouterURL 是进程启动后写入的实际本地端点，不从环境或配置文件读取。
+	LlmRouterURL string `mapstructure:"-"`
 }
 
 const (
@@ -28,6 +31,9 @@ const (
 	// 因此给出保守默认值，并允许按实际部署显式配置。
 	DefaultContextWindow   = 200_000
 	DefaultMaxOutputTokens = 4096
+	// 端口 0 让操作系统分配空闲端口，避免多个 laxcode 进程互相冲突；如需稳定
+	// 地址供外部客户端访问，可通过 LLM_ROUTER_ADDR 显式覆盖。
+	DefaultLLMRouterAddr = "127.0.0.1:0"
 )
 
 var EnvAndFileConf envAndFileConf
@@ -74,6 +80,7 @@ func ParseEnvAndFile() error {
 
 	EnvOrFile.SetDefault("openai_context_window", DefaultContextWindow)
 	EnvOrFile.SetDefault("openai_max_output_tokens", DefaultMaxOutputTokens)
+	EnvOrFile.SetDefault("llm_router_addr", DefaultLLMRouterAddr)
 	EnvOrFile.BindEnv("openai_api_key", "OPENAI_API_KEY")
 	EnvOrFile.BindEnv("openai_base_url", "OPENAI_BASE_URL")
 	EnvOrFile.BindEnv("openai_model", "OPENAI_MODEL")
@@ -84,6 +91,7 @@ func ParseEnvAndFile() error {
 	EnvOrFile.BindEnv("compaction_openai_model", "COMPACTION_OPENAI_MODEL")
 	EnvOrFile.BindEnv("compaction_openai_context_window", "COMPACTION_OPENAI_CONTEXT_WINDOW")
 	EnvOrFile.BindEnv("compaction_openai_max_output_tokens", "COMPACTION_OPENAI_MAX_OUTPUT_TOKENS")
+	EnvOrFile.BindEnv("llm_router_addr", "LLM_ROUTER_ADDR")
 	EnvOrFile.SetEnvKeyReplacer(strings.NewReplacer("_", "_"))
 
 	if err = EnvOrFile.Unmarshal(&EnvAndFileConf); err != nil {

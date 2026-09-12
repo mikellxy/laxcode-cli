@@ -61,8 +61,8 @@ func Run() {
 
 	s := newServer(workDir, config.CliConf.Plan)
 	mux := http.NewServeMux()
-	// Go 1.22+ 的方法+路径模式：非 POST /chat 由 ServeMux 自动回 405，
-	// 无需在 handler 内重复判方法。
+	// Go 1.22+ 的方法+路径模式：方法不匹配时由 ServeMux 自动回 405，
+	// 无需在各 handler 内重复判方法。
 	mux.HandleFunc("POST /chat", s.handleChat)
 	mux.HandleFunc("GET /healthz", s.handleHealthz)
 

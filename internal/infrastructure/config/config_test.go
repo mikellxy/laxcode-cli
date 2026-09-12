@@ -55,6 +55,22 @@ func TestParseEnvAndFileFromEnv(t *testing.T) {
 		EnvAndFileConf.OpenaiMaxOutputTokens != DefaultMaxOutputTokens {
 		t.Errorf("context budget defaults not applied: %+v", EnvAndFileConf)
 	}
+	if EnvAndFileConf.LlmRouterAddr != DefaultLLMRouterAddr {
+		t.Errorf("llm router default addr = %q", EnvAndFileConf.LlmRouterAddr)
+	}
+}
+
+func TestParseEnvAndFileLLMRouterAddrFromEnv(t *testing.T) {
+	swapConfigGlobals(t)
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("LLM_ROUTER_ADDR", "127.0.0.1:18080")
+
+	if err := ParseEnvAndFile(); err != nil {
+		t.Fatalf("ParseEnvAndFile: %v", err)
+	}
+	if EnvAndFileConf.LlmRouterAddr != "127.0.0.1:18080" {
+		t.Fatalf("llm router addr = %q", EnvAndFileConf.LlmRouterAddr)
+	}
 }
 
 func TestParseEnvAndFileEnvOverridesFile(t *testing.T) {

@@ -3,8 +3,10 @@ package llmprovider
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/mikellxy/laxcode/internal/domain/sharedkernel"
@@ -30,6 +32,59 @@ func TestProviderContextBudgetAndMaxOutputTokens(t *testing.T) {
 	if m["max_output_tokens"] != float64(8_192) {
 		t.Fatalf("max_output_tokens must match the reserved budget: %v", m)
 	}
+}
+
+func TestGenerateStreamUsesLocalRouter(t *testing.T) {
+	var received map[string]any
+	transport := providerRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if req.Method != http.MethodPost || req.URL.String() != "http://127.0.0.1:18080/openai/generate_stream" {
+			t.Errorf("unexpected local router request: %s %s", req.Method, req.URL)
+		}
+		if got := req.Header.Get("Accept"); got != "text/event-stream" {
+			t.Errorf("Accept = %q", got)
+		}
+		if err := json.NewDecoder(req.Body).Decode(&received); err != nil {
+			t.Errorf("decode request: %v", err)
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Status:     "200 OK",
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body: io.NopCloser(strings.NewReader(
+				"event: response.output_text.delta\n" +
+					"data: {\"type\":\"response.output_text.delta\",\"delta\":\"via router\",\"sequence_number\":1,\"item_id\":\"item-1\",\"output_index\":0,\"content_index\":0}\n\n" +
+					"event: response.output_text.done\n" +
+					"data: {\"type\":\"response.output_text.done\",\"text\":\"via router\",\"sequence_number\":2,\"item_id\":\"item-1\",\"output_index\":0,\"content_index\":0}\n\n")),
+			Request: req,
+		}, nil
+	})
+
+	p := NewOpenApiProviderWithStreamGateway(
+		"upstream-key", "https://upstream.example/v1", "configured-model",
+		"http://127.0.0.1:18080/openai/generate_stream", 1000, 100)
+	p.httpClient = &http.Client{Transport: transport}
+
+	msg, err := p.GenerateStream(context.Background(), []sharedkernel.Message{{
+		Role: sharedkernel.RoleUser, Content: "hello",
+	}}, nil, func(sharedkernel.StreamChunk) {})
+	if err != nil {
+		t.Fatalf("GenerateStream: %v", err)
+	}
+	if msg.Content != "via router" {
+		t.Fatalf("content = %q", msg.Content)
+	}
+	if received["model"] != "configured-model" {
+		t.Fatalf("model was not forwarded: %v", received)
+	}
+	if _, ok := received["input"].([]any); !ok {
+		t.Fatalf("input was not forwarded: %v", received)
+	}
+}
+
+type providerRoundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f providerRoundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
 }
 
 func TestCountInputTokensUsesCompleteResponseRequestShape(t *testing.T) {

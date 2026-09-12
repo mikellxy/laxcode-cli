@@ -110,7 +110,8 @@ func Assemble(ctx context.Context, in Input) (*Assembled, error) {
 
 	// provider + service
 	c := config.EnvAndFileConf
-	llmClient := llmprovider.NewOpenApiProvider(c.OpenaiApiKey, c.OpenaiBaseUrl, c.OpenaiModel,
+	llmClient := llmprovider.NewOpenApiProviderWithStreamGateway(
+		c.OpenaiApiKey, c.OpenaiBaseUrl, c.OpenaiModel, c.LlmRouterURL,
 		c.OpenaiContextWindow, c.OpenaiMaxOutputTokens)
 	contextSummaryLLMClient := llmprovider.NewOpenApiProvider(
 		c.CompactionOpenaiApiKey, c.CompactionOpenaiBaseUrl, c.CompactionOpenaiModel,

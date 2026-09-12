@@ -38,6 +38,7 @@ touch ~/.laxcode/settings.json
   "OPENAI_MODEL": "gpt-4o-mini",
   "OPENAI_CONTEXT_WINDOW": 128000,
   "OPENAI_MAX_OUTPUT_TOKENS": 16384,
+  "LLM_ROUTER_ADDR": "127.0.0.1:0",
   "COMPACTION_OPENAI_MODEL": "gpt-4o-mini",
   "COMPACTION_OPENAI_CONTEXT_WINDOW": 128000,
   "COMPACTION_OPENAI_MAX_OUTPUT_TOKENS": 4096
@@ -50,6 +51,8 @@ export OPENAI_BASE_URL=https://api.openai.com/v1     # 任意 OpenAI 兼容端�
 export OPENAI_MODEL=gpt-4o-mini
 export OPENAI_CONTEXT_WINDOW=128000
 export OPENAI_MAX_OUTPUT_TOKENS=16384
+# 默认 127.0.0.1:0；需要从外部访问路由器时改成固定端口
+export LLM_ROUTER_ADDR=127.0.0.1:18080
 # 压缩 provider 的未配置项会继承主 provider
 export COMPACTION_OPENAI_MODEL=gpt-4o-mini
 ```
@@ -106,6 +109,18 @@ go run ./examples/sse-client -task "列出当前目录并统计 go 文件数量"
 go run ./examples/sse-client -task "我们都聊了什么" -session=20260910-142622.514
 ```
 
+无论使用交互、one-shot 还是 SSE 模式，进程都会同时启动本地模型路由器，主
+`GenerateStream` 经 `POST /openai/generate_stream` 间接访问模型。路由器默认绑定
+`127.0.0.1:0` 的随机空闲端口；如需从外部调用，请设置固定的 `LLM_ROUTER_ADDR`。
+请求体采用 OpenAI Responses API 格式，服务端配置会覆盖请求里的 `model`：
+
+```shell
+LLM_ROUTER_ADDR=127.0.0.1:18080 ./bin/laxcode
+curl -N http://127.0.0.1:18080/openai/generate_stream \
+  -H 'Content-Type: application/json' \
+  -d '{"input":"hello"}'
+```
+
 | 参数       | 默认  | 说明                |
 |------------|-------|---------------------|
 | `-sse`     | false | 启动 sse server     |
@@ -140,6 +155,9 @@ ${workdir}/.laxcode/
 ### 2.2 运行日志
 
 进程启动时使用标准库 `log/slog` 创建 `./log/laxcode.log`，以 JSON Lines 追加写入 INFO 及以上日志。上下文达到压缩阈值时记录 `context_compaction_triggered`，成功提交后记录 `context_compaction_completed`；失败记录 `context_compaction_failed`。日志只包含 token、消息数量、调用组、artifact、保护区和耗时等统计，不记录消息正文或工具输出。
+
+模型路由器单独写入 `./log/llmrouter.log`；每次请求包含 slog 自动生成的 `time`，
+以及 `request_body_bytes`、`duration_ms`、`status_code` 字段，不记录请求正文或 API key。
 
 ## 3. 工具
 LaxCode 在 ReAct 循环中完整实现 openai function call 协议。启动时默认注入内置工具，并在每轮调用 llm 时发送工具定义
@@ -235,17 +253,20 @@ LaxCode/
 │   └── run_oneshot/       # one-shot 模式前端（结果 JSON 契约输出、exit code）
 ├── internal/
 │   ├── application/
-│   │   └── reactservice/  # ReAct 推理循环、子 Agent 委派
+│   │   ├── reactservice/  # ReAct 推理循环、子 Agent 委派
+│   │   └── llm_router/    # 本地模型网关 HTTP/SSE 编排
 │   ├── domain/
 │   │   ├── session/       # 会话聚合、SessionRepository 仓储接口
 │   │   ├── tools/         # 工具注册表与 read/write/edit/bash 行为契约，WorkFS / ShellRunner 端口
 │   │   ├── llmprovider/   # LLM 客户端接口
+│   │   ├── llmrouter/     # 网关上游流式端口
 │   │   ├── prompt/        # 系统提示词组装（人格 / Skill 索引 / Plan Mode），SkillSource 端口
 │   │   ├── compactor/     # 上下文压缩策略
 │   │   ├── telemetry/     # 观测词汇表：span 名、属性键、追踪辅助函数
 │   │   └── sharedkernel/  # 消息、工具定义、token 统计与估算等共享类型
 │   └── infrastructure/
 │       ├── llmprovider/   # OpenAI Responses 协议实现
+│       ├── llmrouter/     # 网关 OpenAI SDK 流式适配器
 │       ├── sessionrepo/   # 会话文件仓储（JSONL 落盘）
 │       ├── workfs/        # WorkFS 端口的真实文件系统实现
 │       ├── shell/         # ShellRunner 端口实现：exec、进程组、超时杀进程

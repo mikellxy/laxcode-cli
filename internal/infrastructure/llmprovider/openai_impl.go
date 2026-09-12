@@ -1,14 +1,18 @@
 package llmprovider
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
 
 	domainllm "github.com/mikellxy/laxcode/internal/domain/llmprovider"
 	"github.com/mikellxy/laxcode/internal/domain/sharedkernel"
 	"github.com/openai/openai-go/v3"
 	"github.com/openai/openai-go/v3/option"
+	"github.com/openai/openai-go/v3/packages/ssestream"
 	"github.com/openai/openai-go/v3/responses"
 )
 
@@ -16,6 +20,18 @@ type OpenApiProvider struct {
 	client openai.Client
 	model  string
 	budget domainllm.ContextBudget
+
+	streamGatewayURL string
+	httpClient       *http.Client
+}
+
+// NewOpenApiProviderWithStreamGateway 构造一个仅将 GenerateStream 经本地网关
+// 转发的 provider。Generate 与 CountInputTokens 仍使用上游 SDK client；这两条
+// 路径分别服务上下文摘要和 token 计数，不属于主 ReAct 流式生成流量。
+func NewOpenApiProviderWithStreamGateway(apiKey, baseURL, model, streamGatewayURL string, budgetValues ...int) *OpenApiProvider {
+	p := NewOpenApiProvider(apiKey, baseURL, model, budgetValues...)
+	p.streamGatewayURL = streamGatewayURL
+	return p
 }
 
 // 编译期契约：基础设施 provider 必须满足领域层 LLMClient 接口。
@@ -29,8 +45,9 @@ func NewOpenApiProvider(apiKey, baseURL, model string, budgetValues ...int) *Ope
 		contextWindow, reservedOutput = budgetValues[0], budgetValues[1]
 	}
 	return &OpenApiProvider{
-		client: openai.NewClient(option.WithAPIKey(apiKey), option.WithBaseURL(baseURL)),
-		model:  model,
+		client:     openai.NewClient(option.WithAPIKey(apiKey), option.WithBaseURL(baseURL)),
+		model:      model,
+		httpClient: http.DefaultClient,
 		budget: domainllm.ContextBudget{
 			ContextWindow:        contextWindow,
 			ReservedOutputTokens: reservedOutput,
@@ -172,7 +189,7 @@ func (p *OpenApiProvider) buildResponseParams(msgs []sharedkernel.Message, tools
 	return reqParams
 }
 
-// GenerateStream 是批式 Generate 的流式对应：用 Responses.NewStreaming 消费
+// GenerateStream 是批式 Generate 的流式对应：通过本地路由器取得 Responses
 // SSE 事件，一边经 emit 实时推送领域级增量（正文 / reasoning 三段式、完整
 // 工具调用），一边累积出与批式 Generate 语义等价的完整消息返回。事件分派
 // 见 design 决策 5 的映射表。工具调用不流式：以 output_item.done 的完整 item
@@ -182,7 +199,10 @@ func (p *OpenApiProvider) GenerateStream(ctx context.Context, msgs []sharedkerne
 	emit func(chunk sharedkernel.StreamChunk)) (*sharedkernel.Message, error) {
 	reqParams := p.buildResponseParams(msgs, toolsDefs)
 
-	stream := p.client.Responses.NewStreaming(ctx, reqParams)
+	stream, err := p.newResponseStream(ctx, reqParams)
+	if err != nil {
+		return nil, err
+	}
 	defer stream.Close()
 
 	msg := &sharedkernel.Message{Role: sharedkernel.RoleAssistant}
@@ -255,4 +275,39 @@ func (p *OpenApiProvider) GenerateStream(ctx context.Context, msgs []sharedkerne
 	}
 
 	return msg, nil
+}
+
+// newResponseStream 在正常程序装配下把请求体 POST 到进程内本地路由器；构造函数
+// 未提供网关 URL 时保留 SDK 直连，供独立 provider 使用及向后兼容现有调用方。
+func (p *OpenApiProvider) newResponseStream(ctx context.Context, params responses.ResponseNewParams) (*ssestream.Stream[responses.ResponseStreamEventUnion], error) {
+	if p.streamGatewayURL == "" {
+		return p.client.Responses.NewStreaming(ctx, params), nil
+	}
+
+	body, err := json.Marshal(params)
+	if err != nil {
+		return nil, fmt.Errorf("marshal local LLM router request: %w", err)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, p.streamGatewayURL, bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("create local LLM router request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "text/event-stream")
+
+	httpClient := p.httpClient
+	if httpClient == nil {
+		httpClient = http.DefaultClient
+	}
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("call local LLM router: %w", err)
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		defer resp.Body.Close()
+		errorBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		return nil, fmt.Errorf("local LLM router returned %s: %s", resp.Status, bytes.TrimSpace(errorBody))
+	}
+
+	return ssestream.NewStream[responses.ResponseStreamEventUnion](ssestream.NewDecoder(resp), nil), nil
 }
