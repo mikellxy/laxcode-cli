@@ -2,6 +2,7 @@ package reactservice
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -19,10 +20,149 @@ import (
 	"github.com/mikellxy/laxcode/internal/infrastructure/artifactstore"
 	"github.com/mikellxy/laxcode/internal/infrastructure/config"
 	"github.com/mikellxy/laxcode/internal/infrastructure/layout"
+	infrallm "github.com/mikellxy/laxcode/internal/infrastructure/llmprovider"
 	"github.com/mikellxy/laxcode/internal/infrastructure/sessionrepo"
 	"github.com/mikellxy/laxcode/internal/infrastructure/workfs"
 	_ "modernc.org/sqlite" // 注册 database/sql 驱动名 "sqlite"，测试直查数据库
 )
+
+// summaryCompactionMainLLM 用确定性的 token 计数驱动四组真实 read_file：
+// 第四组完成后触发压缩，本地 artifact 压缩仍高于目标，LLM 摘要后达标。
+type summaryCompactionMainLLM struct {
+	calls               int
+	lastMsgs            []sharedkernel.Message
+	preCompactionMsgs   []sharedkernel.Message
+	capturedToolOutputs map[string]string
+	usages              []sharedkernel.TokenStatistics
+	totalUsage          sharedkernel.TokenStatistics
+}
+
+func (m *summaryCompactionMainLLM) Generate(_ context.Context, msgs []sharedkernel.Message, _ []sharedkernel.ToolDefinition) (*sharedkernel.Message, error) {
+	m.lastMsgs = sharedkernel.CloneMessages(msgs)
+	if m.capturedToolOutputs == nil {
+		m.capturedToolOutputs = make(map[string]string)
+	}
+	for _, msg := range msgs {
+		if msg.Role == sharedkernel.RoleTool {
+			m.capturedToolOutputs[msg.ToolCallID] = msg.Content
+		}
+	}
+	m.calls++
+	msg := &sharedkernel.Message{Role: sharedkernel.RoleAssistant}
+	if m.calls <= 4 {
+		msg.Content = fmt.Sprintf("第 %d 组：读取两个事实文件", m.calls)
+		msg.ToolCalls = []sharedkernel.ToolCall{
+			{
+				ID:        fmt.Sprintf("summary-read-alpha-%d", m.calls),
+				Name:      "read_file",
+				Arguments: []byte(fmt.Sprintf(`{"path":%q,"start_line_no":1,"start_bytes":1}`, integrationAlpha)),
+			},
+			{
+				ID:        fmt.Sprintf("summary-read-beta-%d", m.calls),
+				Name:      "read_file",
+				Arguments: []byte(fmt.Sprintf(`{"path":%q,"start_line_no":1,"start_bytes":1}`, integrationBeta)),
+			},
+		}
+	} else {
+		msg.Content = "摘要压缩完成后的最终回答"
+	}
+	msg.TokenUsed = sharedkernel.TokenStatistics{
+		TokenInput:  1000 + m.calls,
+		TokenOutput: 10 + m.calls,
+	}
+	m.usages = append(m.usages, msg.TokenUsed)
+	m.totalUsage.Add(msg.TokenUsed)
+	return msg, nil
+}
+
+func (m *summaryCompactionMainLLM) GenerateStream(ctx context.Context, msgs []sharedkernel.Message, defs []sharedkernel.ToolDefinition, emit func(sharedkernel.StreamChunk)) (*sharedkernel.Message, error) {
+	msg, err := m.Generate(ctx, msgs, defs)
+	if err != nil {
+		return nil, err
+	}
+	if msg.Content != "" {
+		emit(sharedkernel.StreamChunk{Kind: sharedkernel.ChunkTextStart})
+		emit(sharedkernel.StreamChunk{Kind: sharedkernel.ChunkTextDelta, Delta: msg.Content})
+		emit(sharedkernel.StreamChunk{Kind: sharedkernel.ChunkTextEnd})
+	}
+	for i := range msg.ToolCalls {
+		emit(sharedkernel.StreamChunk{Kind: sharedkernel.ChunkToolCall, ToolCall: &msg.ToolCalls[i]})
+	}
+	return msg, nil
+}
+
+func (m *summaryCompactionMainLLM) CountInputTokens(_ context.Context, msgs []sharedkernel.Message, _ []sharedkernel.ToolDefinition) (int, error) {
+	for _, msg := range msgs {
+		if strings.Contains(msg.Content, "结构化历史摘要") {
+			if strings.Contains(msg.Content, `"objective"`) {
+				return 400, nil
+			}
+			return 300, nil
+		}
+	}
+	for _, msg := range msgs {
+		if strings.Contains(msg.Content, "read_artifact") {
+			return 1300, nil
+		}
+	}
+	if countToolCallGroups(msgs) >= 4 {
+		if m.preCompactionMsgs == nil {
+			m.preCompactionMsgs = sharedkernel.CloneMessages(msgs)
+		}
+		return 1600, nil
+	}
+	return 100, nil
+}
+
+func (*summaryCompactionMainLLM) ContextBudget() llmprovider.ContextBudget {
+	return llmprovider.ContextBudget{ContextWindow: 2000, ReservedOutputTokens: 200}
+}
+
+// maxSummaryGenerateCalls 是单次集成测试允许的摘要生成上限。生产侧 compactContext
+// 在首次摘要仍超标时还会追加一次“基于已有摘要的有界再压缩”，而本用例的确定性
+// 计数（摘要后回落到 400 < target=1080）不该走到那一步。一旦走到，第二次调用
+// 在记录器边界就被拒绝，不再转发给真实 provider：先失败，而不是先烧掉一次
+// 真实计费调用的 token。
+const maxSummaryGenerateCalls = 1
+
+// recordingSummaryLLM 保留真实摘要 provider 的调用证据和实测 usage，并对生成
+// 次数设硬上限（见 maxSummaryGenerateCalls）。
+type recordingSummaryLLM struct {
+	inner                 llmprovider.LLMClient
+	generateCalls         int
+	countCalls            int
+	lastGenerateMsgs      []sharedkernel.Message
+	lastGenerateToolCount int
+	totalUsage            sharedkernel.TokenStatistics
+}
+
+func (r *recordingSummaryLLM) Generate(ctx context.Context, msgs []sharedkernel.Message, defs []sharedkernel.ToolDefinition) (*sharedkernel.Message, error) {
+	if r.generateCalls >= maxSummaryGenerateCalls {
+		return nil, fmt.Errorf("LLM 摘要压缩被触发第 %d 次，超过上限 %d：已在记录器边界拦截，未向真实 provider 发起请求",
+			r.generateCalls+1, maxSummaryGenerateCalls)
+	}
+	r.generateCalls++
+	r.lastGenerateMsgs = sharedkernel.CloneMessages(msgs)
+	r.lastGenerateToolCount = len(defs)
+	msg, err := r.inner.Generate(ctx, msgs, defs)
+	if msg != nil {
+		r.totalUsage.Add(msg.TokenUsed)
+	}
+	return msg, err
+}
+
+func (r *recordingSummaryLLM) GenerateStream(ctx context.Context, msgs []sharedkernel.Message, defs []sharedkernel.ToolDefinition, emit func(sharedkernel.StreamChunk)) (*sharedkernel.Message, error) {
+	return r.inner.GenerateStream(ctx, msgs, defs, emit)
+}
+
+func (r *recordingSummaryLLM) CountInputTokens(ctx context.Context, msgs []sharedkernel.Message, defs []sharedkernel.ToolDefinition) (int, error) {
+	r.countCalls++
+	return r.inner.CountInputTokens(ctx, msgs, defs)
+}
+
+func (r *recordingSummaryLLM) ContextBudget() llmprovider.ContextBudget {
+	return r.inner.ContextBudget()
+}
 
 // integrationWorkDir 是集成测试的固定工作目录：运行前清空 .laxcode（含
 // SQLite 数据库与 JSONL 冷备），运行后保留现场便于人工检查落库数据。
@@ -618,4 +758,347 @@ func TestChatCompactionPersistsGenerationsInSQLite(t *testing.T) {
 	if !strings.Contains(historyLines[3], "0123456789") {
 		t.Errorf("JSONL 第 4 行应保留 alpha 原文，实际 %s", historyLines[3][:40])
 	}
+}
+
+// TestChatLLMSummaryCompactionAlignsMemoryWithSQLite 使用真实摘要 provider，
+// 验证“真实文件读取 → 本地压缩不足 → LLM 摘要 → generation 切换 →
+// SQLite 重启恢复”的完整链路。测试凭据未配置时跳过，不影响普通测试套件。
+func TestChatLLMSummaryCompactionAlignsMemoryWithSQLite(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skip external summary provider integration test in short mode")
+	}
+	apiKey := os.Getenv("OPENAI_API_KEY_TEST")
+	baseURL := os.Getenv("OPENAI_BASE_URL_TEST")
+	model := os.Getenv("OPENAI_MODEL_TEST")
+	if apiKey == "" || baseURL == "" || model == "" {
+		t.Skip("OPENAI_API_KEY_TEST, OPENAI_BASE_URL_TEST and OPENAI_MODEL_TEST are required")
+	}
+
+	ctx := context.Background()
+	workDir := t.TempDir()
+	alphaMarker := "ALPHA_REQUIRED_FACT_" + uuid.New().String()
+	betaMarker := "BETA_REQUIRED_FACT_" + uuid.New().String()
+	alphaContent := alphaMarker + "\n" + strings.Repeat("alpha supporting context\n", 80)
+	betaContent := betaMarker + "\n" + strings.Repeat("beta supporting context\n", 80)
+	for name, content := range map[string]string{integrationAlpha: alphaContent, integrationBeta: betaContent} {
+		if err := os.WriteFile(filepath.Join(workDir, name), []byte(content), 0o600); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+	}
+
+	sessionID := uuid.New().String()
+	repo, err := sessionrepo.NewSqliteSessionRepo(layout.SessionDB(workDir), layout.SessionRoot(workDir))
+	if err != nil {
+		t.Fatalf("open sqlite repository: %v", err)
+	}
+	t.Cleanup(func() { _ = repo.Close() })
+	artifacts := artifactstore.New(layout.SessionRoot(workDir))
+	mainLLM := &summaryCompactionMainLLM{}
+	realSummaryLLM := infrallm.NewOpenApiProvider(apiKey, baseURL, model)
+	summaryLLM := &recordingSummaryLLM{inner: realSummaryLLM}
+	reg := tools.NewDefaultRegistry(nil)
+	reg.Register(tools.NewReadFileTool(workDir, workfs.New()))
+	svc := NewReActService(session.NewSession(sessionID), repo, mainLLM, summaryLLM,
+		reg, func(*ReactEvent) {}, nil, artifacts)
+	if err := svc.InitSession(ctx); err != nil {
+		t.Fatalf("InitSession: %v", err)
+	}
+	if err := svc.InitSysPrompt(ctx, "真实摘要压缩集成测试系统提示词"); err != nil {
+		t.Fatalf("InitSysPrompt: %v", err)
+	}
+
+	question := fmt.Sprintf("读取 %s 和 %s，并精确保留标记 %s 与 %s，后续回答仍需要这些事实。",
+		integrationAlpha, integrationBeta, alphaMarker, betaMarker)
+	final, err := svc.Chat(ctx, question)
+	if err != nil {
+		t.Fatalf("Chat: %v", err)
+	}
+	if final == nil || final.Content != "摘要压缩完成后的最终回答" || len(final.ToolCalls) != 0 {
+		t.Fatalf("unexpected final answer: %+v", final)
+	}
+
+	// ===== 摘要 provider 调用边界：一次压缩 = 一次真实摘要生成 =====
+	// 上限已由 recordingSummaryLLM 在边界强制（超出即拒绝转发，不产生第二次计费
+	// 调用），这里再对账一次，确保没走到“基于已有摘要的再压缩”分支。
+	if summaryLLM.generateCalls != maxSummaryGenerateCalls || summaryLLM.countCalls != 1 {
+		t.Fatalf("summary provider calls: generate=%d (limit %d) count=%d, want generate=1 count=1",
+			summaryLLM.generateCalls, maxSummaryGenerateCalls, summaryLLM.countCalls)
+	}
+	if summaryLLM.lastGenerateToolCount != 0 || len(summaryLLM.lastGenerateMsgs) != 2 ||
+		summaryLLM.lastGenerateMsgs[0].Role != sharedkernel.RoleSystem ||
+		summaryLLM.lastGenerateMsgs[1].Role != sharedkernel.RoleUser {
+		t.Fatalf("unexpected summary request envelope: tools=%d messages=%+v",
+			summaryLLM.lastGenerateToolCount, summaryLLM.lastGenerateMsgs)
+	}
+	var summaryRequest contextSummaryRequest
+	if err := json.Unmarshal([]byte(summaryLLM.lastGenerateMsgs[1].Content), &summaryRequest); err != nil {
+		t.Fatalf("decode recorded summary request: %v", err)
+	}
+	wantSourceSeq := []uint64{2, 3, 4, 5}
+	if summaryRequest.MaximumSummaryTokens != 780 || len(summaryRequest.Messages) != len(wantSourceSeq) {
+		t.Fatalf("unexpected summary request target/source count: target=%d messages=%+v",
+			summaryRequest.MaximumSummaryTokens, summaryRequest.Messages)
+	}
+	for i, wantSeq := range wantSourceSeq {
+		if summaryRequest.Messages[i].Seq != wantSeq {
+			t.Fatalf("summary source[%d].seq=%d, want %d", i, summaryRequest.Messages[i].Seq, wantSeq)
+		}
+	}
+	if strings.Contains(summaryLLM.lastGenerateMsgs[1].Content, "summary-read-alpha-2") ||
+		strings.Contains(summaryLLM.lastGenerateMsgs[1].Content, "summary-read-beta-2") {
+		t.Fatal("protected tool-call groups leaked into summary request")
+	}
+
+	alphaOutput := mainLLM.capturedToolOutputs["summary-read-alpha-1"]
+	betaOutput := mainLLM.capturedToolOutputs["summary-read-beta-1"]
+	if !strings.Contains(alphaOutput, alphaMarker) || !strings.Contains(betaOutput, betaMarker) {
+		t.Fatalf("real read_file outputs were not captured: alpha=%q beta=%q", alphaOutput, betaOutput)
+	}
+	alphaSum := sha256.Sum256([]byte(alphaOutput))
+	betaSum := sha256.Sum256([]byte(betaOutput))
+	alphaArtifactID := fmt.Sprintf("%x", alphaSum)
+	betaArtifactID := fmt.Sprintf("%x", betaSum)
+	if summaryRequest.Messages[2].Artifact == nil || summaryRequest.Messages[2].Artifact.ID != alphaArtifactID ||
+		summaryRequest.Messages[3].Artifact == nil || summaryRequest.Messages[3].Artifact.ID != betaArtifactID {
+		t.Fatalf("summary request did not carry artifact references: %+v", summaryRequest.Messages)
+	}
+	if !strings.Contains(summaryRequest.Messages[2].Content, alphaMarker) ||
+		!strings.Contains(summaryRequest.Messages[3].Content, betaMarker) {
+		t.Fatal("summary provider did not receive the full pre-truncation tool outputs")
+	}
+
+	// ===== 内存工作集 =====
+	sess := svc.Session
+	if mainLLM.calls != 5 || sess.Revision != 16 || sess.LastSeq != 15 ||
+		sess.MemoryGeneration != 2 || len(sess.Messages) != 12 {
+		t.Fatalf("unexpected memory head: main_calls=%d revision=%d last_seq=%d generation=%d messages=%d",
+			mainLLM.calls, sess.Revision, sess.LastSeq, sess.MemoryGeneration, len(sess.Messages))
+	}
+	wantSeq := []uint64{1, 2, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15}
+	wantRoles := []string{
+		sharedkernel.RoleSystem, sharedkernel.RoleUser,
+		sharedkernel.RoleAssistant, sharedkernel.RoleTool, sharedkernel.RoleTool,
+		sharedkernel.RoleAssistant, sharedkernel.RoleTool, sharedkernel.RoleTool,
+		sharedkernel.RoleAssistant, sharedkernel.RoleTool, sharedkernel.RoleTool,
+		sharedkernel.RoleAssistant,
+	}
+	for i := range sess.Messages {
+		msg := sess.Messages[i]
+		if msg.Seq != wantSeq[i] || msg.Role != wantRoles[i] {
+			t.Fatalf("memory[%d] identity=(seq=%d role=%s), want (seq=%d role=%s)",
+				i, msg.Seq, msg.Role, wantSeq[i], wantRoles[i])
+		}
+		if i != 1 && !reflect.DeepEqual(msg.OriginalSeq, []uint64{msg.Seq}) {
+			t.Fatalf("memory seq=%d original_seq=%v, want singleton", msg.Seq, msg.OriginalSeq)
+		}
+	}
+	summaryMsg := sess.Messages[1]
+	if summaryMsg.Role != sharedkernel.RoleUser || summaryMsg.Seq != 2 ||
+		!reflect.DeepEqual(summaryMsg.OriginalSeq, []uint64{2, 3, 4, 5}) ||
+		summaryMsg.TokenUsed != (sharedkernel.TokenStatistics{}) {
+		t.Fatalf("unexpected summary identity: %+v", summaryMsg)
+	}
+	_, summaryJSON, ok := strings.Cut(summaryMsg.Content, "\n")
+	if !ok {
+		t.Fatalf("summary message has no JSON body: %q", summaryMsg.Content)
+	}
+	var structuredSummary contextSummary
+	if err := json.Unmarshal([]byte(summaryJSON), &structuredSummary); err != nil {
+		t.Fatalf("decode persisted structured summary: %v", err)
+	}
+	if !strings.Contains(summaryMsg.Content, alphaMarker) || !strings.Contains(summaryMsg.Content, betaMarker) {
+		t.Fatalf("structured summary lost required facts: %s", summaryMsg.Content)
+	}
+	summaryArtifactIDs := make(map[string]bool)
+	for _, artifact := range structuredSummary.Artifacts {
+		summaryArtifactIDs[artifact.ID] = true
+	}
+	if !summaryArtifactIDs[alphaArtifactID] || !summaryArtifactIDs[betaArtifactID] {
+		t.Fatalf("structured summary lost artifact IDs: want %s/%s, got %+v",
+			alphaArtifactID, betaArtifactID, structuredSummary.Artifacts)
+	}
+	if len(mainLLM.preCompactionMsgs) != 14 {
+		t.Fatalf("pre-compaction snapshot has %d messages, want 14", len(mainLLM.preCompactionMsgs))
+	}
+	protectedBySeq := make(map[uint64]sharedkernel.Message)
+	for _, msg := range mainLLM.preCompactionMsgs {
+		if msg.Seq >= 6 {
+			protectedBySeq[msg.Seq] = msg
+		}
+	}
+	for _, msg := range sess.Messages {
+		if msg.Seq >= 6 && msg.Seq <= 14 && !reflect.DeepEqual(msg, protectedBySeq[msg.Seq]) {
+			t.Fatalf("protected message seq=%d changed:\ngot  %+v\nwant %+v",
+				msg.Seq, msg, protectedBySeq[msg.Seq])
+		}
+	}
+	wantTotalUsage := mainLLM.totalUsage
+	wantTotalUsage.Add(summaryLLM.totalUsage)
+	if sess.TokenUsed != wantTotalUsage {
+		t.Fatalf("memory token usage=%+v, want main %+v + summary %+v = %+v",
+			sess.TokenUsed, mainLLM.totalUsage, summaryLLM.totalUsage, wantTotalUsage)
+	}
+	if sess.WindowToken != mainLLM.usages[4] {
+		t.Fatalf("window token=%+v, want final main usage %+v", sess.WindowToken, mainLLM.usages[4])
+	}
+
+	// artifact 必须能按摘要中保留的 ID 完整读回。
+	for id, wantContent := range map[string]string{alphaArtifactID: alphaOutput, betaArtifactID: betaOutput} {
+		page, err := artifacts.ReadArtifact(ctx, sessionID, id, 0, tools.MaxArtifactPageRunes)
+		if err != nil {
+			t.Fatalf("read artifact %s: %v", id, err)
+		}
+		if !page.EOF || page.Content != wantContent {
+			t.Fatalf("artifact %s differs from original tool output", id)
+		}
+	}
+
+	// ===== SQLite 重启与表级断言 =====
+	memorySnapshot := sess.Snapshot()
+	if err := repo.Close(); err != nil {
+		t.Fatalf("close write repository: %v", err)
+	}
+	readRepo, err := sessionrepo.NewSqliteSessionRepo(layout.SessionDB(workDir), layout.SessionRoot(workDir))
+	if err != nil {
+		t.Fatalf("reopen sqlite repository: %v", err)
+	}
+	t.Cleanup(func() { _ = readRepo.Close() })
+	loaded, err := readRepo.GetRequestContext(ctx, sessionID)
+	if err != nil {
+		t.Fatalf("reload request context: %v", err)
+	}
+	if !reflect.DeepEqual(loaded, memorySnapshot) {
+		t.Fatalf("reloaded SQLite context differs from memory:\nsqlite %+v\nmemory %+v", loaded, memorySnapshot)
+	}
+
+	rawDB, err := sql.Open("sqlite", layout.SessionDB(workDir))
+	if err != nil {
+		t.Fatalf("open raw sqlite: %v", err)
+	}
+	t.Cleanup(func() { _ = rawDB.Close() })
+	type dbGroup struct{ count, minSeq, maxSeq uint64 }
+	rows, err := rawDB.QueryContext(ctx,
+		`SELECT message_type, memory_generation, COUNT(*), MIN(seq), MAX(seq)
+		 FROM messages WHERE session_id = ? GROUP BY message_type, memory_generation`, sessionID)
+	if err != nil {
+		t.Fatalf("query message groups: %v", err)
+	}
+	groups := make(map[string]dbGroup)
+	for rows.Next() {
+		var messageType string
+		var generation uint64
+		var group dbGroup
+		if err := rows.Scan(&messageType, &generation, &group.count, &group.minSeq, &group.maxSeq); err != nil {
+			rows.Close()
+			t.Fatalf("scan message group: %v", err)
+		}
+		groups[fmt.Sprintf("%s/%d", messageType, generation)] = group
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		t.Fatalf("iterate message groups: %v", err)
+	}
+	if err := rows.Close(); err != nil {
+		t.Fatalf("close message group rows: %v", err)
+	}
+	wantGroups := map[string]dbGroup{
+		"original/0":  {count: 15, minSeq: 1, maxSeq: 15},
+		"in_memory/1": {count: 14, minSeq: 1, maxSeq: 14},
+		"in_memory/2": {count: 12, minSeq: 1, maxSeq: 15},
+	}
+	if !reflect.DeepEqual(groups, wantGroups) {
+		t.Fatalf("unexpected DB generation groups: got %+v want %+v", groups, wantGroups)
+	}
+
+	var dbSummaryRole, dbSummaryOriginalSeq, dbSummaryToolCallID, dbSummaryContent string
+	var dbSummaryTokenInput, dbSummaryTokenOutput int64
+	if err := rawDB.QueryRowContext(ctx,
+		`SELECT role, original_seq_json, tool_call_id, content, token_input, token_output
+		 FROM messages
+		 WHERE session_id = ? AND message_type = 'in_memory' AND memory_generation = 2 AND seq = 2`,
+		sessionID).Scan(&dbSummaryRole, &dbSummaryOriginalSeq, &dbSummaryToolCallID,
+		&dbSummaryContent, &dbSummaryTokenInput, &dbSummaryTokenOutput); err != nil {
+		t.Fatalf("query persisted summary row: %v", err)
+	}
+	if dbSummaryRole != sharedkernel.RoleUser || dbSummaryOriginalSeq != "[2,3,4,5]" ||
+		dbSummaryToolCallID != "" || dbSummaryContent != summaryMsg.Content ||
+		dbSummaryTokenInput != 0 || dbSummaryTokenOutput != 0 {
+		t.Fatalf("unexpected persisted summary row: role=%s original_seq=%s tool_call_id=%q tokens=%d/%d content=%q",
+			dbSummaryRole, dbSummaryOriginalSeq, dbSummaryToolCallID,
+			dbSummaryTokenInput, dbSummaryTokenOutput, dbSummaryContent)
+	}
+
+	var removedRows int
+	if err := rawDB.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM messages
+		 WHERE session_id = ? AND message_type = 'in_memory' AND memory_generation = 2 AND seq IN (3,4,5)`,
+		sessionID).Scan(&removedRows); err != nil {
+		t.Fatalf("query removed generation-2 rows: %v", err)
+	}
+	if removedRows != 0 {
+		t.Fatalf("generation 2 retained %d summarized source rows", removedRows)
+	}
+
+	rows, err = rawDB.QueryContext(ctx,
+		`SELECT seq, original_seq_json FROM messages
+		 WHERE session_id = ? AND message_type = 'original' ORDER BY seq`, sessionID)
+	if err != nil {
+		t.Fatalf("query original identities: %v", err)
+	}
+	originalIdentityCount := 0
+	for rows.Next() {
+		var seq uint64
+		var originalSeqJSON string
+		if err := rows.Scan(&seq, &originalSeqJSON); err != nil {
+			rows.Close()
+			t.Fatalf("scan original identity: %v", err)
+		}
+		if originalSeqJSON != fmt.Sprintf("[%d]", seq) {
+			rows.Close()
+			t.Fatalf("original seq=%d has identity %s", seq, originalSeqJSON)
+		}
+		originalIdentityCount++
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		t.Fatalf("iterate original identities: %v", err)
+	}
+	if err := rows.Close(); err != nil {
+		t.Fatalf("close original identity rows: %v", err)
+	}
+	if originalIdentityCount != 15 {
+		t.Fatalf("original identity rows=%d, want 15", originalIdentityCount)
+	}
+
+	for seq, wantContent := range map[uint64]string{4: alphaOutput, 5: betaOutput} {
+		originalContent, originalArtifact := fetchMessageRow(t, rawDB, ctx, sessionID, "original", 0, seq)
+		generationOneContent, generationOneArtifact := fetchMessageRow(t, rawDB, ctx, sessionID, "in_memory", 1, seq)
+		if originalContent != wantContent || originalArtifact.Valid ||
+			generationOneContent != wantContent || generationOneArtifact.Valid {
+			t.Fatalf("seq=%d original/gen1 content or artifact changed", seq)
+		}
+	}
+
+	historyData, err := os.ReadFile(filepath.Join(layout.SessionRoot(workDir), sessionID, "history.jsonl"))
+	if err != nil {
+		t.Fatalf("read history.jsonl: %v", err)
+	}
+	historyLines := strings.Split(strings.TrimSpace(string(historyData)), "\n")
+	if len(historyLines) != 15 || strings.Contains(string(historyData), "结构化历史摘要") {
+		t.Fatalf("unexpected original history backup: lines=%d contains_summary=%t",
+			len(historyLines), strings.Contains(string(historyData), "结构化历史摘要"))
+	}
+
+	t.Logf("memory verified: revision=%d last_seq=%d generation=%d messages=%d seq=%v roles=%v",
+		sess.Revision, sess.LastSeq, sess.MemoryGeneration, len(sess.Messages), wantSeq, wantRoles)
+	t.Logf("summary verified: original_seq=%v objective=%q artifacts=%d provider_calls=%d usage=%+v",
+		summaryMsg.OriginalSeq, structuredSummary.Objective, len(structuredSummary.Artifacts),
+		summaryLLM.generateCalls, summaryLLM.totalUsage)
+	// 摘要正文逐字留存（前缀行 + 归一化后的单行 JSON），便于人工核对模型是否保住了
+	// 必需事实与 artifact 引用；t.Logf 只在 -v 下输出，不影响常规测试日志。
+	t.Logf("summary content (%d bytes):\n%s", len(summaryMsg.Content), summaryMsg.Content)
+	t.Logf("database verified: groups=%+v original_rows=%d gen2_removed_source_rows=%d history_lines=%d",
+		groups, originalIdentityCount, removedRows, len(historyLines))
+	t.Logf("artifacts verified: alpha=%s bytes=%d beta=%s bytes=%d",
+		alphaArtifactID, len(alphaOutput), betaArtifactID, len(betaOutput))
 }
