@@ -31,6 +31,10 @@ type ReActService struct {
 	// noop，不产生任何观测输出。类型经 telemetry 别名持有，本包不直接
 	// 依赖 OTel（span 的开启与收尾均走 telemetry 辅助函数）。
 	tracer telemetry.Tracer
+	// agentRole 写入 ReAct span 的 laxcode.agent_role：主服务为 main，
+	// 子 Agent 派生服务为 sub（经 NewSubAgentService 构造时注入），
+	// 使子会话的 ReAct span 不再被误标为主会话。
+	agentRole string
 }
 
 var (
@@ -54,6 +58,20 @@ type ReactEvent struct {
 	ChunkEvent *sharedkernel.StreamChunk // LLM 流式增量，仅 chunk 事件携带
 }
 
+// RunStats 是一次 Chat 的运行账目：think 循环内已有的轮次 / 工具调用 /
+// token 累计统计原本只落 span 属性，此处透出给需要机器判定运行状态的调用方
+// （子 Agent 委派边界的完整性判定）。InputTokens/OutputTokens 为实测计费
+// 口径，仅累计正常生成轮；FinishReason 为最后一轮的终止原因。
+type RunStats struct {
+	Turns        int
+	ToolCalls    int
+	InputTokens  int
+	OutputTokens int
+	// FinishReason 是最后一个模型轮的终止原因；err 提前返回时为出错轮
+	// 已采集的值（可能为空）。
+	FinishReason string
+}
+
 func NewReActService(sess *session.Session,
 	sessRepo session.SessionRepository,
 	llmClient llmprovider.LLMClient,
@@ -73,6 +91,7 @@ func NewReActService(sess *session.Session,
 		ToolRegistry:            toolRegistry,
 		ReActEventConsumerF:     reActEventConsumerF,
 		tracer:                  telemetry.OrNoop(tracer),
+		agentRole:               telemetry.AgentRoleMain,
 	}
 	// ArtifactStore 与数据库会话仓储相互独立；子服务绑定自己的 session ID。
 	if len(artifactStores) > 0 && artifactStores[0] != nil {
@@ -80,6 +99,23 @@ func NewReActService(sess *session.Session,
 		r.Artifacts = store
 		toolRegistry.Register(tools.NewReadArtifactTool(store, sess.ID))
 	}
+	return r
+}
+
+// NewSubAgentService 构造子 Agent 用的 ReActService：与 NewReActService 的
+// 区别仅是 agentRole=sub，使子会话的 ReAct span 角色正确。子 Agent 的完整
+// 装配（受限工具集、事件静默）由 SubAgent.Execute 编排。
+func NewSubAgentService(sess *session.Session,
+	sessRepo session.SessionRepository,
+	llmClient llmprovider.LLMClient,
+	contextSummaryLLMClient llmprovider.LLMClient,
+	toolRegistry tools.Registry,
+	reActEventConsumerF func(reactEvent *ReactEvent),
+	tracer telemetry.Tracer,
+	artifactStores ...tools.ArtifactStore) *ReActService {
+	r := NewReActService(sess, sessRepo, llmClient, contextSummaryLLMClient,
+		toolRegistry, reActEventConsumerF, tracer, artifactStores...)
+	r.agentRole = telemetry.AgentRoleSub
 	return r
 }
 
@@ -106,16 +142,23 @@ func (r *ReActService) InitSysPrompt(ctx context.Context, p string) error {
 // Chat 先为数据库中恢复出的未完成 ReAct 补齐缺失的 tool result；随后立即
 // 追加本次用户消息，让模型在同一次后续推理中综合旧工具结果与用户的新要求。
 func (r *ReActService) Chat(ctx context.Context, p string) (*sharedkernel.Message, error) {
+	msg, _, err := r.ChatWithStats(ctx, p)
+	return msg, err
+}
+
+// ChatWithStats 是 Chat 的带账目变体：需要运行统计（轮次、工具调用、token、
+// 终止原因）的调用方使用；前端三个调用方继续走 Chat 保持零改动。
+func (r *ReActService) ChatWithStats(ctx context.Context, p string) (*sharedkernel.Message, *RunStats, error) {
 	if err := r.recoverBeforeChat(ctx); err != nil {
-		return nil, fmt.Errorf("recover previous chat: %w", err)
+		return nil, nil, fmt.Errorf("recover previous chat: %w", err)
 	}
 	userMsg := r.Session.BuildUserMessage(p)
 	candidate, err := r.Session.WithAppendedMessage(&userMsg)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if err := r.commitCreatedMessage(ctx, candidate, userMsg, userMsg); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	return r.think(ctx)
 }
@@ -186,19 +229,20 @@ func missingToolResults(messages []sharedkernel.Message) []sharedkernel.ToolCall
 	return missing
 }
 
-func (r *ReActService) think(ctx context.Context) (*sharedkernel.Message, error) {
+func (r *ReActService) think(ctx context.Context) (*sharedkernel.Message, *RunStats, error) {
 	// session_id 写入 ctx 向下传播：工具注册表的 tool-exec span 经它读取
 	// 业务关联键（span 属性不会自动继承）。ReAct span 的父链由调用方 ctx
 	// 决定，交互模式下本 span 自动成为 root。
 	ctx = telemetry.ContextWithSessionID(ctx, r.Session.ID)
 	ctx, reActSpan := telemetry.Start(ctx, r.tracer, telemetry.SpanReAct,
 		telemetry.AttrSessionID.String(r.Session.ID),
-		telemetry.AttrAgentRole.String(telemetry.AgentRoleMain),
+		telemetry.AttrAgentRole.String(r.agentRole),
 	)
 	// run 级 token 合计在 defer 中统一落属性，各 return 路径共享
 	var reActInput, reActOutput int
 	var reActErr error
 	startTime := time.Now()
+	stats := &RunStats{}
 	defer func() {
 		reActSpan.SetAttributes(
 			telemetry.AttrInputTokens.Int(reActInput),
@@ -213,8 +257,10 @@ func (r *ReActService) think(ctx context.Context) (*sharedkernel.Message, error)
 	turnCnt := 0
 	for {
 		turnCnt++
+		stats.Turns = turnCnt
 		turnCtx, turnSpan := telemetry.Start(ctx, r.tracer, telemetry.LLMTurn,
-			telemetry.AttrTurnSeq.Int(turnCnt))
+			telemetry.AttrTurnSeq.Int(turnCnt),
+		)
 		turnStart := time.Now()
 		// closeTurn 是本轮 span 的唯一收尾点：各 return 路径都经它落耗时与错误
 		// 状态。span 生命周期留在本函数而不交给持久化辅助函数，本包才能继续
@@ -231,36 +277,44 @@ func (r *ReActService) think(ctx context.Context) (*sharedkernel.Message, error)
 		if err := r.compactContext(turnCtx, toolDefs); err != nil {
 			reActErr = err
 			closeTurn(err)
-			return nil, err
+			return nil, stats, err
 		}
 
 		msg, err := r.LLMClient.GenerateStream(turnCtx, r.Session.Messages, toolDefs, func(chunkEvent sharedkernel.StreamChunk) {
 			r.ReActEventConsumerF(&ReactEvent{Type: ReActEventTypeChunk, ChunkEvent: &chunkEvent})
 		})
 		if err != nil {
+			// 出错轮已采集的终止原因（provider 在返回错误的同时可能标记
+			// cancelled）留给 stats；Think 循环本身不再继续。
+			stats.FinishReason = msgFinishReason(msg)
 			reActErr = err
 			closeTurn(err)
-			return nil, err
+			return msg, stats, err
 		}
 		if err := r.handleTurnMsg(ctx, msg); err != nil {
 			reActErr = err
 			closeTurn(err)
-			return nil, err
+			return nil, stats, err
 		}
 		// llm-turn / ReAct 级 token 用量统计
 		reActInput += msg.TokenUsed.TokenInput
 		reActOutput += msg.TokenUsed.TokenOutput
+		stats.InputTokens += msg.TokenUsed.TokenInput
+		stats.OutputTokens += msg.TokenUsed.TokenOutput
+		stats.FinishReason = msg.FinishReason
 		turnSpan.SetAttributes(
 			telemetry.AttrInputTokens.Int(msg.TokenUsed.TokenInput),
 			telemetry.AttrOutputTokens.Int(msg.TokenUsed.TokenOutput),
 			telemetry.AttrToolCallCount.Int(len(msg.ToolCalls)),
+			telemetry.AttrFinishReason.String(msg.FinishReason),
 		)
 
 		// 无工具调用，推理循环完成
 		if len(msg.ToolCalls) == 0 {
 			closeTurn(nil)
-			return msg, nil
+			return msg, stats, nil
 		}
+		stats.ToolCalls += len(msg.ToolCalls)
 
 		for _, tc := range msg.ToolCalls {
 			info := r.ToolRegistry.BeforeExecInfo(&tc)
@@ -272,11 +326,20 @@ func (r *ReActService) think(ctx context.Context) (*sharedkernel.Message, error)
 			if err := r.handleTurnMsg(ctx, toolMsg); err != nil {
 				reActErr = err
 				closeTurn(err)
-				return nil, err
+				return nil, stats, err
 			}
 		}
 		closeTurn(nil)
 	}
+}
+
+// msgFinishReason 在错误路径上读取消息可能携带的终止原因；msg 为 nil 或
+// 未标记时返回空串。
+func msgFinishReason(msg *sharedkernel.Message) string {
+	if msg == nil {
+		return ""
+	}
+	return msg.FinishReason
 }
 
 // compactContext 以“下一个完整 provider 请求”为计数口径。占用达到

@@ -58,6 +58,7 @@ type messageModel struct {
 	ReasoningID      string    `gorm:"column:reasoning_id;type:varchar(255);not null"`
 	ReasoningContent string    `gorm:"column:reasoning_content;type:text;not null"`
 	ToolCallsJSON    []byte    `gorm:"column:tool_calls_json;type:json"`
+	FinishReason     string    `gorm:"column:finish_reason;type:varchar(32);not null;default:''"`
 	ArtifactID       *string   `gorm:"column:artifact_id;type:varchar(64)"`
 	ArtifactByteSize *int64    `gorm:"column:artifact_byte_size"`
 	TokenInput       int64     `gorm:"column:token_input;not null"`
@@ -117,20 +118,21 @@ func (r *SqliteSessionRepo) migrate() error {
 				created_at DATETIME NOT NULL,
 				updated_at DATETIME NOT NULL
 			)`,
-			`CREATE TABLE IF NOT EXISTS messages (
-				session_id VARCHAR(128) NOT NULL,
-				message_type VARCHAR(32) NOT NULL CHECK (message_type IN ('original', 'in_memory')),
-				memory_generation BIGINT NOT NULL CHECK (memory_generation >= 0),
-				seq BIGINT NOT NULL CHECK (seq >= 1),
-				original_seq_json JSON NOT NULL CHECK (json_valid(original_seq_json) AND json_array_length(original_seq_json) >= 1),
-				role VARCHAR(32) NOT NULL,
-				tool_call_id VARCHAR(128) NOT NULL DEFAULT '',
-				content TEXT NOT NULL,
-				reasoning_id VARCHAR(255) NOT NULL DEFAULT '',
-				reasoning_content TEXT NOT NULL DEFAULT '',
-				tool_calls_json JSON,
-				artifact_id VARCHAR(64),
-				artifact_byte_size BIGINT,
+				`CREATE TABLE IF NOT EXISTS messages (
+					session_id VARCHAR(128) NOT NULL,
+					message_type VARCHAR(32) NOT NULL CHECK (message_type IN ('original', 'in_memory')),
+					memory_generation BIGINT NOT NULL CHECK (memory_generation >= 0),
+					seq BIGINT NOT NULL CHECK (seq >= 1),
+					original_seq_json JSON NOT NULL CHECK (json_valid(original_seq_json) AND json_array_length(original_seq_json) >= 1),
+					role VARCHAR(32) NOT NULL,
+					tool_call_id VARCHAR(128) NOT NULL DEFAULT '',
+					content TEXT NOT NULL,
+					reasoning_id VARCHAR(255) NOT NULL DEFAULT '',
+					reasoning_content TEXT NOT NULL DEFAULT '',
+					tool_calls_json JSON,
+					finish_reason VARCHAR(32) NOT NULL DEFAULT '',
+					artifact_id VARCHAR(64),
+					artifact_byte_size BIGINT,
 				token_input BIGINT NOT NULL DEFAULT 0,
 				token_output BIGINT NOT NULL DEFAULT 0,
 				created_at DATETIME NOT NULL,
@@ -452,6 +454,7 @@ func messageToModel(id, messageType string, generation uint64, msg sharedkernel.
 		Seq: msg.Seq, OriginalSeqJSON: originalSeq, Role: msg.Role,
 		ToolCallID: msg.ToolCallID, Content: msg.Content, ReasoningID: msg.ReasoningID,
 		ReasoningContent: msg.ReasoningContent, ToolCallsJSON: toolCalls,
+		FinishReason: msg.FinishReason,
 		TokenInput: int64(msg.TokenUsed.TokenInput), TokenOutput: int64(msg.TokenUsed.TokenOutput),
 		CreatedAt: now, UpdatedAt: now,
 	}
@@ -468,6 +471,7 @@ func messagePayload(row messageModel) map[string]any {
 		"original_seq_json": row.OriginalSeqJSON, "role": row.Role, "tool_call_id": row.ToolCallID,
 		"content": row.Content, "reasoning_id": row.ReasoningID,
 		"reasoning_content": row.ReasoningContent, "tool_calls_json": row.ToolCallsJSON,
+		"finish_reason": row.FinishReason,
 		"artifact_id": row.ArtifactID, "artifact_byte_size": row.ArtifactByteSize,
 		"token_input": row.TokenInput, "token_output": row.TokenOutput, "updated_at": row.UpdatedAt,
 	}
@@ -487,7 +491,7 @@ func modelToMessage(row messageModel) (sharedkernel.Message, error) {
 	msg := sharedkernel.Message{
 		Seq: row.Seq, OriginalSeq: originalSeq, Role: row.Role, Content: row.Content,
 		ReasoningID: row.ReasoningID, ReasoningContent: row.ReasoningContent,
-		ToolCalls: calls, ToolCallID: row.ToolCallID,
+		ToolCalls: calls, ToolCallID: row.ToolCallID, FinishReason: row.FinishReason,
 		TokenUsed: sharedkernel.TokenStatistics{TokenInput: int(row.TokenInput), TokenOutput: int(row.TokenOutput)},
 	}
 	if row.ArtifactID != nil {

@@ -30,7 +30,7 @@ const (
 	// 兼容端点的 /models 响应不会标准化暴露 context window，
 	// 因此给出保守默认值，并允许按实际部署显式配置。
 	DefaultContextWindow   = 200_000
-	DefaultMaxOutputTokens = 4096
+	DefaultMaxOutputTokens = 16_384
 	// 端口 0 让操作系统分配空闲端口，避免多个 laxcode 进程互相冲突；如需稳定
 	// 地址供外部客户端访问，可通过 LLM_ROUTER_ADDR 显式覆盖。
 	DefaultLLMRouterAddr = "127.0.0.1:0"

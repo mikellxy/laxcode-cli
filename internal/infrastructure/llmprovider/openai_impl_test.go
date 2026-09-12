@@ -81,6 +81,119 @@ func TestGenerateStreamUsesLocalRouter(t *testing.T) {
 	}
 }
 
+// TestGenerateStreamCapturesIncompleteFinishReason 复现评估事故：输出顶到
+// max_output_tokens 时 Responses API 发 response.incomplete（携带 usage 与
+// incomplete_details.reason），此前被忽略导致 usage=0、截断被伪装成成功。
+func TestGenerateStreamCapturesIncompleteFinishReason(t *testing.T) {
+	p := newStreamTestProvider(t, "event: response.output_text.delta\n"+
+		"data: {\"type\":\"response.output_text.delta\",\"delta\":\"6. **可观测\",\"sequence_number\":1,\"item_id\":\"item-1\",\"output_index\":0,\"content_index\":0}\n\n"+
+		"event: response.incomplete\n"+
+		"data: {\"type\":\"response.incomplete\",\"sequence_number\":2,"+
+		"\"response\":{\"id\":\"resp-1\",\"status\":\"incomplete\","+
+		"\"incomplete_details\":{\"reason\":\"max_output_tokens\"},"+
+		"\"usage\":{\"input_tokens\":20327,\"output_tokens\":16384}}}\n\n")
+
+	msg, err := p.GenerateStream(context.Background(), []sharedkernel.Message{{
+		Role: sharedkernel.RoleUser, Content: "报告",
+	}}, nil, func(sharedkernel.StreamChunk) {})
+	if err != nil {
+		t.Fatalf("GenerateStream: %v", err)
+	}
+	if msg.Content != "6. **可观测" {
+		t.Fatalf("content = %q", msg.Content)
+	}
+	if msg.FinishReason != sharedkernel.FinishReasonMaxOutputTokens {
+		t.Fatalf("finish_reason 应为 max_output_tokens，实际 %q", msg.FinishReason)
+	}
+	if msg.TokenUsed.TokenInput != 20327 || msg.TokenUsed.TokenOutput != 16384 {
+		t.Fatalf("usage 应取自 incomplete 事件，实际 %+v", msg.TokenUsed)
+	}
+}
+
+// TestGenerateStreamNoTerminalEventMarksUsageUnavailable 模拟兼容端点不发
+// completed/incomplete 的裸流：FinishReason 应为 usage_unavailable，而不是
+// 无标记的零值（评估 5.9 的“无解释的 0”）。
+func TestGenerateStreamNoTerminalEventMarksUsageUnavailable(t *testing.T) {
+	p := newStreamTestProvider(t, "event: response.output_text.delta\n"+
+		"data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\",\"sequence_number\":1,\"item_id\":\"item-1\",\"output_index\":0,\"content_index\":0}\n\n")
+
+	msg, err := p.GenerateStream(context.Background(), []sharedkernel.Message{{
+		Role: sharedkernel.RoleUser, Content: "q",
+	}}, nil, func(sharedkernel.StreamChunk) {})
+	if err != nil {
+		t.Fatalf("GenerateStream: %v", err)
+	}
+	if msg.FinishReason != sharedkernel.FinishReasonUsageUnavailable {
+		t.Fatalf("finish_reason 应为 usage_unavailable，实际 %q", msg.FinishReason)
+	}
+}
+
+// TestGenerateStreamCompletedKeepsStopReason 验证正常 completed 路径：
+// stop + usage 采集不受新分支影响。
+func TestGenerateStreamCompletedKeepsStopReason(t *testing.T) {
+	p := newStreamTestProvider(t, "event: response.output_text.delta\n"+
+		"data: {\"type\":\"response.output_text.delta\",\"delta\":\"done\",\"sequence_number\":1,\"item_id\":\"item-1\",\"output_index\":0,\"content_index\":0}\n\n"+
+		"event: response.completed\n"+
+		"data: {\"type\":\"response.completed\",\"sequence_number\":2,"+
+		"\"response\":{\"id\":\"resp-2\",\"status\":\"completed\","+
+		"\"usage\":{\"input_tokens\":100,\"output_tokens\":7}}}\n\n")
+
+	msg, err := p.GenerateStream(context.Background(), []sharedkernel.Message{{
+		Role: sharedkernel.RoleUser, Content: "q",
+	}}, nil, func(sharedkernel.StreamChunk) {})
+	if err != nil {
+		t.Fatalf("GenerateStream: %v", err)
+	}
+	if msg.FinishReason != sharedkernel.FinishReasonStop {
+		t.Fatalf("finish_reason 应为 stop，实际 %q", msg.FinishReason)
+	}
+	if msg.TokenUsed.TokenInput != 100 || msg.TokenUsed.TokenOutput != 7 {
+		t.Fatalf("usage 不符：%+v", msg.TokenUsed)
+	}
+}
+
+// TestGenerateStreamFailedEventMarksCancelled 验证 response.failed 事件：
+// finish_reason=cancelled 且 usage（若携带）不丢。
+func TestGenerateStreamFailedEventMarksCancelled(t *testing.T) {
+	p := newStreamTestProvider(t, "event: response.failed\n"+
+		"data: {\"type\":\"response.failed\",\"sequence_number\":1,"+
+		"\"response\":{\"id\":\"resp-3\",\"status\":\"failed\","+
+		"\"usage\":{\"input_tokens\":50,\"output_tokens\":0}}}\n\n")
+
+	msg, err := p.GenerateStream(context.Background(), []sharedkernel.Message{{
+		Role: sharedkernel.RoleUser, Content: "q",
+	}}, nil, func(sharedkernel.StreamChunk) {})
+	if err != nil {
+		t.Fatalf("GenerateStream: %v", err)
+	}
+	if msg.FinishReason != sharedkernel.FinishReasonCancelled {
+		t.Fatalf("finish_reason 应为 cancelled，实际 %q", msg.FinishReason)
+	}
+	if msg.TokenUsed.TokenInput != 50 {
+		t.Fatalf("failed 路径 usage 不符：%+v", msg.TokenUsed)
+	}
+}
+
+// newStreamTestProvider 构造走本地网关路径的 provider，SSE 正文由 fake
+// transport 直接返回，不发起真实网络请求。
+func newStreamTestProvider(t *testing.T, sseBody string) *OpenApiProvider {
+	t.Helper()
+	transport := providerRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Status:     "200 OK",
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body:       io.NopCloser(strings.NewReader(sseBody)),
+			Request:    req,
+		}, nil
+	})
+	p := NewOpenApiProviderWithStreamGateway(
+		"sk-test", "https://upstream.example/v1", "m",
+		"http://127.0.0.1:1/openai/generate_stream", 1000, 100)
+	p.httpClient = &http.Client{Transport: transport}
+	return p
+}
+
 type providerRoundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f providerRoundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {

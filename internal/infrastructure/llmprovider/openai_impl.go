@@ -264,17 +264,57 @@ func (p *OpenApiProvider) GenerateStream(ctx context.Context, msgs []sharedkerne
 			}
 		case "response.completed":
 			resp := ev.AsResponseCompleted().Response
-			msg.TokenUsed = sharedkernel.TokenStatistics{
-				TokenInput:  int(resp.Usage.InputTokens),
-				TokenOutput: int(resp.Usage.OutputTokens),
-			}
+			msg.TokenUsed = usageFromResponse(resp.Usage)
+			msg.FinishReason = sharedkernel.FinishReasonStop
+		case "response.incomplete":
+			// 达到 max_output_tokens 或被过滤时 Responses API 发 incomplete
+			// 而非 completed：usage 同样携带，终止原因是 incomplete_details.reason。
+			resp := ev.AsResponseIncomplete().Response
+			msg.TokenUsed = usageFromResponse(resp.Usage)
+			msg.FinishReason = incompleteFinishReason(resp.IncompleteDetails.Reason)
+		case "response.failed":
+			resp := ev.AsResponseFailed().Response
+			msg.TokenUsed = usageFromResponse(resp.Usage)
+			msg.FinishReason = sharedkernel.FinishReasonCancelled
 		}
 	}
+	// 终止事件从未出现（兼容端点不发 completed/incomplete/failed）或出现但
+	// 未携带 usage：显式降级为 usage_unavailable，消费方不会把零值 usage
+	// 误读成一次正常的免费生成。正常 stop 覆盖不了这里，因为该路径只在
+	// FinishReason 为空时进入。
+	if msg.FinishReason == "" {
+		msg.FinishReason = sharedkernel.FinishReasonUsageUnavailable
+	}
 	if err := stream.Err(); err != nil {
-		return nil, err
+		// ctx 取消 / 网关 error 事件 / 流中断：已累积的部分内容连同
+		// cancelled 标记一起返回，调用方可区分“半句截断的失败”与成功。
+		msg.FinishReason = sharedkernel.FinishReasonCancelled
+		return msg, err
 	}
 
 	return msg, nil
+}
+
+// usageFromResponse 把 SDK 的 ResponseUsage 转为领域 token 统计。
+func usageFromResponse(usage responses.ResponseUsage) sharedkernel.TokenStatistics {
+	return sharedkernel.TokenStatistics{
+		TokenInput:  int(usage.InputTokens),
+		TokenOutput: int(usage.OutputTokens),
+	}
+}
+
+// incompleteFinishReason 把 incomplete_details.reason 归一为领域枚举：
+// max_output_tokens 透传（调用方据此识别截断）；content_filter 同名透传；
+// 其余未知原因按协议属于“内容未正常收束”，保守归到 content_filter 之外
+// 的通用不完整类——当前没有独立枚举，先以 max_output_tokens 表达
+// “输出不完整”，与子 Agent 完整性判定兼容。
+func incompleteFinishReason(reason string) string {
+	switch reason {
+	case sharedkernel.FinishReasonMaxOutputTokens, sharedkernel.FinishReasonContentFilter:
+		return reason
+	default:
+		return sharedkernel.FinishReasonMaxOutputTokens
+	}
 }
 
 // newResponseStream 在正常程序装配下把请求体 POST 到进程内本地路由器；构造函数

@@ -35,6 +35,7 @@ const (
 	AttrTurnSeq       attribute.Key = "laxcode.loop_seq"
 	AttrToolCallCount attribute.Key = "laxcode.tool_call_count"
 	AttrTimeCostMs    attribute.Key = "laxcode.time_cost_ms"
+	AttrFinishReason  attribute.Key = "laxcode.finish_reason"
 )
 
 // AttrAgentRole 的取值

@@ -109,7 +109,7 @@ func TestSubAgentExecuteHappyPath(t *testing.T) {
 	repo := newMemRepo()
 	sess := newTestSession("parent", repo)
 	llm := &scriptedLLM{responses: []scriptedResp{
-		{msg: assistantMsg("child result")},
+		{msg: assistantMsg("child result"), finishReason: sharedkernel.FinishReasonStop},
 	}}
 	parent := NewReActService(sess, repo, llm, nil, tools.NewDefaultRegistry(nil), nil, nil)
 	sa := newTestSubAgent(parent, "/tmp/wd")
@@ -118,8 +118,24 @@ func TestSubAgentExecuteHappyPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Execute 不应返回 error：%v", err)
 	}
-	if out != "child result" {
-		t.Errorf("应返回子 Agent 结论文本，实际 %q", out)
+	var res SubAgentResult
+	if err := json.Unmarshal([]byte(out), &res); err != nil {
+		t.Fatalf("工具结果应为合法 SubAgentResult JSON：%v\n%s", err, out)
+	}
+	if res.Status != SubAgentStatusComplete {
+		t.Errorf("stop 结束应标记 complete，实际 %q", res.Status)
+	}
+	if res.Report != "child result" {
+		t.Errorf("report 应为子 Agent 结论文本，实际 %q", res.Report)
+	}
+	if res.ChildSessionID == "" || !strings.HasPrefix(res.ChildSessionID, "sub:") {
+		t.Errorf("child_session_id 应为 sub: 前缀，实际 %q", res.ChildSessionID)
+	}
+	if res.FinishReason != sharedkernel.FinishReasonStop {
+		t.Errorf("finish_reason 应为 stop，实际 %q", res.FinishReason)
+	}
+	if res.Usage.Turns != 1 {
+		t.Errorf("usage.turns 应为 1，实际 %d", res.Usage.Turns)
 	}
 	// 父会话不受影响（子会话独立、绝不写回）
 	if len(sess.Messages) != 1 {
@@ -158,6 +174,61 @@ func TestSubAgentExecuteHappyPath(t *testing.T) {
 	}
 }
 
+// TestSubAgentExecuteTruncatedReportIsPartial 复现评估事故的编排：子 Agent
+// 最终报告顶到 max_output_tokens 截断（finish_reason=max_output_tokens），
+// 结果应标记 partial 而非 complete，主 Agent 不再把半份报告当成功。
+func TestSubAgentExecuteTruncatedReportIsPartial(t *testing.T) {
+	repo := newMemRepo()
+	sess := newTestSession("parent", repo)
+	llm := &scriptedLLM{responses: []scriptedResp{
+		{msg: assistantMsg("6. **可观测"), finishReason: sharedkernel.FinishReasonMaxOutputTokens},
+	}}
+	parent := NewReActService(sess, repo, llm, nil, tools.NewDefaultRegistry(nil), nil, nil)
+	sa := newTestSubAgent(parent, "/tmp/wd")
+
+	out, err := sa.Execute(context.Background(), json.RawMessage(`{"task":"t","abstract":"x"}`))
+	if err != nil {
+		t.Fatalf("截断不应返回 error（父循环不中断）：%v", err)
+	}
+	var res SubAgentResult
+	if err := json.Unmarshal([]byte(out), &res); err != nil {
+		t.Fatalf("应返回合法 JSON：%v\n%s", err, out)
+	}
+	if res.Status != SubAgentStatusPartial {
+		t.Errorf("截断报告应标记 partial，实际 %q", res.Status)
+	}
+	if res.FinishReason != sharedkernel.FinishReasonMaxOutputTokens {
+		t.Errorf("finish_reason 应为 max_output_tokens，实际 %q", res.FinishReason)
+	}
+	if res.Report != "6. **可观测" {
+		t.Errorf("半份报告应保留在 report 字段，实际 %q", res.Report)
+	}
+}
+
+// TestSubAgentExecuteUsageUnavailableIsPartial 验证 provider 未修复场景的
+// 兜底：流正常结束但无终止事件（usage_unavailable）也不判 complete。
+func TestSubAgentExecuteUsageUnavailableIsPartial(t *testing.T) {
+	repo := newMemRepo()
+	sess := newTestSession("parent", repo)
+	llm := &scriptedLLM{responses: []scriptedResp{
+		{msg: assistantMsg("report"), finishReason: sharedkernel.FinishReasonUsageUnavailable},
+	}}
+	parent := NewReActService(sess, repo, llm, nil, tools.NewDefaultRegistry(nil), nil, nil)
+	sa := newTestSubAgent(parent, "/tmp/wd")
+
+	out, err := sa.Execute(context.Background(), json.RawMessage(`{"task":"t"}`))
+	if err != nil {
+		t.Fatalf("Execute：%v", err)
+	}
+	var res SubAgentResult
+	if err := json.Unmarshal([]byte(out), &res); err != nil {
+		t.Fatalf("应返回合法 JSON：%v", err)
+	}
+	if res.Status != SubAgentStatusPartial {
+		t.Errorf("usage_unavailable 应标记 partial，实际 %q", res.Status)
+	}
+}
+
 func TestSubAgentExecuteChildFailureReturnsString(t *testing.T) {
 	repo := newMemRepo()
 	sess := newTestSession("parent", repo)
@@ -171,8 +242,88 @@ func TestSubAgentExecuteChildFailureReturnsString(t *testing.T) {
 	if err != nil {
 		t.Fatalf("子 Agent 内部失败不应中断父循环（error 应为 nil），实际 %v", err)
 	}
-	if !strings.Contains(out, "sub agent failed") || !strings.Contains(out, "child llm failed") {
-		t.Errorf("失败原因应以工具结果字符串返回，实际 %q", out)
+	var res SubAgentResult
+	if err := json.Unmarshal([]byte(out), &res); err != nil {
+		t.Fatalf("失败也应以结构化 JSON 返回：%v\n%s", err, out)
+	}
+	if res.Status != SubAgentStatusFailed {
+		t.Errorf("运行失败应标记 failed，实际 %q", res.Status)
+	}
+	if !strings.Contains(res.Report, "child llm failed") {
+		t.Errorf("失败原因应在 report 字段，实际 %q", res.Report)
+	}
+}
+
+// TestSubAgentExecuteCancelled 验证 ctx 取消传播时标记 cancelled 而非
+// failed：父 Agent 据此区分“用户主动停止”与“子任务故障”。
+func TestSubAgentExecuteCancelled(t *testing.T) {
+	repo := newMemRepo()
+	sess := newTestSession("parent", repo)
+	llm := &scriptedLLM{responses: []scriptedResp{
+		{err: context.Canceled},
+	}}
+	parent := NewReActService(sess, repo, llm, nil, tools.NewDefaultRegistry(nil), nil, nil)
+	sa := newTestSubAgent(parent, "/tmp/wd")
+
+	out, err := sa.Execute(context.Background(), json.RawMessage(`{"task":"t"}`))
+	if err != nil {
+		t.Fatalf("取消不应返回 error：%v", err)
+	}
+	var res SubAgentResult
+	if err := json.Unmarshal([]byte(out), &res); err != nil {
+		t.Fatalf("应返回合法 JSON：%v", err)
+	}
+	if res.Status != SubAgentStatusCancelled {
+		t.Errorf("ctx 取消应标记 cancelled，实际 %q", res.Status)
+	}
+}
+
+// TestSubAgentResultJSONStableGolden 锁定结果协议的 JSON 形态：字段名与
+// 顺序稳定，防止后续改动悄悄漂移（父侧消费方依赖该结构）。
+func TestSubAgentResultJSONStableGolden(t *testing.T) {
+	res := SubAgentResult{
+		Status:         SubAgentStatusPartial,
+		ChildSessionID: "sub:20260912-164713.063-parent",
+		FinishReason:   sharedkernel.FinishReasonMaxOutputTokens,
+		Report:         "half report",
+		Usage:          Usage{InputTokens: 20327, OutputTokens: 16384, Turns: 12, ToolCalls: 18},
+	}
+	got, err := json.Marshal(res)
+	if err != nil {
+		t.Fatalf("marshal：%v", err)
+	}
+	want := `{"status":"partial","child_session_id":"sub:20260912-164713.063-parent","finish_reason":"max_output_tokens","report":"half report","usage":{"input_tokens":20327,"output_tokens":16384,"turns":12,"tool_calls":18}}`
+	if string(got) != want {
+		t.Errorf("SubAgentResult JSON 形态漂移：\n got: %s\nwant: %s", got, want)
+	}
+}
+
+// TestClassifySubAgentRun 覆盖状态判定的纯函数分支表。
+func TestClassifySubAgentRun(t *testing.T) {
+	cases := []struct {
+		name string
+		msg  *sharedkernel.Message
+		stat *RunStats
+		err  error
+		want string
+	}{
+		{"nil msg nil err", nil, nil, nil, SubAgentStatusPartial},
+		{"stop via stats", nil, &RunStats{FinishReason: sharedkernel.FinishReasonStop}, nil, SubAgentStatusComplete},
+		{"stop via msg", &sharedkernel.Message{FinishReason: sharedkernel.FinishReasonStop}, nil, nil, SubAgentStatusComplete},
+		{"stats 覆盖 msg", &sharedkernel.Message{FinishReason: sharedkernel.FinishReasonStop}, &RunStats{FinishReason: sharedkernel.FinishReasonMaxOutputTokens}, nil, SubAgentStatusPartial},
+		{"max_output_tokens", nil, &RunStats{FinishReason: sharedkernel.FinishReasonMaxOutputTokens}, nil, SubAgentStatusPartial},
+		{"usage_unavailable", nil, &RunStats{FinishReason: sharedkernel.FinishReasonUsageUnavailable}, nil, SubAgentStatusPartial},
+		{"空 finish_reason", nil, &RunStats{}, nil, SubAgentStatusPartial},
+		{"运行错误", nil, nil, errors.New("llm boom"), SubAgentStatusFailed},
+		{"ctx 取消", nil, nil, context.Canceled, SubAgentStatusCancelled},
+		{"ctx 超时", nil, nil, context.DeadlineExceeded, SubAgentStatusCancelled},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := classifySubAgentRun(tc.msg, tc.stat, tc.err); got != tc.want {
+				t.Errorf("classify = %q, want %q", got, tc.want)
+			}
+		})
 	}
 }
 
@@ -259,15 +410,22 @@ func TestSubAgentChildUsesWorkDirOverride(t *testing.T) {
 	repo := newMemRepo()
 	sess := newTestSession("parent", repo)
 	parent := NewReActService(sess, repo, &scriptedLLM{
-		responses: []scriptedResp{{msg: assistantMsg("ok")}},
+		responses: []scriptedResp{{msg: assistantMsg("ok"), finishReason: sharedkernel.FinishReasonStop}},
 	}, nil, tools.NewDefaultRegistry(nil), nil, nil)
 	// work_dir 入参覆盖构造时目录——子工具集以覆盖目录为工作区，
 	// 由 child 注册表构造（bash/read_file）消费；无法直接观测目录，
-	// 这里验证覆盖路径不报错即可
+	// 这里验证覆盖路径不报错且结果协议正常即可
 	sa := newTestSubAgent(parent, "/default/wd")
 	out, err := sa.Execute(context.Background(), json.RawMessage(`{"task":"t","work_dir":"/custom/wd"}`))
-	if err != nil || out != "ok" {
-		t.Fatalf("work_dir 覆盖执行失败：out=%q err=%v", out, err)
+	if err != nil {
+		t.Fatalf("work_dir 覆盖执行失败：err=%v", err)
+	}
+	var res SubAgentResult
+	if err := json.Unmarshal([]byte(out), &res); err != nil {
+		t.Fatalf("应返回合法 JSON：%v\n%s", err, out)
+	}
+	if res.Report != "ok" || res.Status != SubAgentStatusComplete {
+		t.Fatalf("结果不符：%+v", res)
 	}
 }
 

@@ -7,6 +7,26 @@ const (
 	RoleTool      = "tool"
 )
 
+// FinishReason 的规范取值：各 provider 的原始终止信号（Responses API 的
+// response.completed / response.incomplete / error 事件等）在基础设施层
+// 归一到这五个值，领域与 application 层只面对稳定枚举。
+const (
+	// FinishReasonStop 表示模型正常结束生成（Responses API status=completed）。
+	FinishReasonStop = "stop"
+	// FinishReasonMaxOutputTokens 表示输出达到 max_output_tokens 上限被截断，
+	// 内容可能停在半句；Responses API 以 response.incomplete 事件表达。
+	FinishReasonMaxOutputTokens = "max_output_tokens"
+	// FinishReasonContentFilter 表示生成被安全策略截断。
+	FinishReasonContentFilter = "content_filter"
+	// FinishReasonCancelled 表示请求被取消或流中断（ctx 取消、网关错误、
+	// response.failed 等）。
+	FinishReasonCancelled = "cancelled"
+	// FinishReasonUsageUnavailable 表示流正常结束但终止事件缺失或未携带
+	// usage：token 账目不可信（可能是无解释的 0），显式降级标记，
+	// 消费方不得据此判定生成完整。
+	FinishReasonUsageUnavailable = "usage_unavailable"
+)
+
 type Message struct {
 	// Seq 在 session 内单调递增，system 首次创建时也会占用一个序号。
 	Seq uint64 `json:"seq,omitempty"`
@@ -27,6 +47,10 @@ type Message struct {
 	// TokenOutput 为本次响应输出。仅 assistant 消息携带非零值；
 	// user/tool/system 消息恒为零值。序列化无 omitempty，历史文件每行恒输出。
 	TokenUsed TokenStatistics `json:"token_used"`
+	// FinishReason 记录该次模型调用的终止原因，provider 语义归一后的取值
+	// 见 FinishReason* 常量。仅 assistant 消息携带；其余角色恒为空。
+	// omitempty：历史文件里普通消息零体积增量。
+	FinishReason string `json:"finish_reason,omitempty"`
 }
 
 // ArtifactRef 指向当前 session 内的不可变工具输出，ID 为内容 SHA-256。

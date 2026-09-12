@@ -206,6 +206,9 @@ type scriptedLLM struct {
 type scriptedResp struct {
 	msg *sharedkernel.Message
 	err error
+	// finishReason 直接写入返回消息的 FinishReason（不覆盖脚本 msg 里的
+	// 显式取值），用于编排截断 / 取消等终止场景。
+	finishReason string
 }
 
 func (s *scriptedLLM) Generate(_ context.Context, msgs []sharedkernel.Message, _ []sharedkernel.ToolDefinition) (*sharedkernel.Message, error) {
@@ -216,6 +219,11 @@ func (s *scriptedLLM) Generate(_ context.Context, msgs []sharedkernel.Message, _
 		return &sharedkernel.Message{Role: sharedkernel.RoleAssistant, Content: ""}, nil
 	}
 	r := s.responses[s.calls-1]
+	if r.finishReason != "" && r.msg != nil {
+		msg := r.msg.Clone()
+		msg.FinishReason = r.finishReason
+		return &msg, r.err
+	}
 	return r.msg, r.err
 }
 
