@@ -20,12 +20,14 @@ var testSessionDir = filepath.Join(testWorkDir, ".laxcode", ".session", "sess-ab
 func TestGetSysPromptPersonalityAndWorkDir(t *testing.T) {
 	out := GetSysPrompt(testWorkDir, nil, nil)
 
-	// 人格提示词必须出现且 %s 占位被 workDir 填充（沙箱约束依赖它）
+	// 人格提示词必须出现且 %s 占位被 workDir 填充（工作区边界依赖它）
 	if !strings.Contains(out, testWorkDir) {
 		t.Errorf("系统提示应包含工作目录 %q，实际输出:\n%s", testWorkDir, out)
 	}
-	if !strings.Contains(out, "【沙箱强制约束】") {
-		t.Errorf("系统提示应包含人格模板正文")
+	for _, section := range []string{"【工作区边界】", "【工程原则】", "【沟通与交付】"} {
+		if !strings.Contains(out, section) {
+			t.Errorf("系统提示应包含人格模板段落 %q", section)
+		}
 	}
 	// plan 传 nil 时不应出现 Plan Mode 规划说明，调用方无需为会话目录编造取值
 	if strings.Contains(out, "Plan Mode") || strings.Contains(out, "plan.md") {
@@ -33,6 +35,29 @@ func TestGetSysPromptPersonalityAndWorkDir(t *testing.T) {
 	}
 	if strings.Contains(out, "%s") {
 		t.Errorf("模板占位符应全部被替换，实际输出:\n%s", out)
+	}
+}
+
+func TestGetSysPromptKeepsEngineeringGuidanceToolAgnostic(t *testing.T) {
+	out := GetSysPrompt(testWorkDir, nil, nil)
+
+	for _, rigidInstruction := range []string{
+		"只能使用 bash",
+		"严格按 suggestion",
+		"永远不要把文件夹路径传给 read_file",
+	} {
+		if strings.Contains(out, rigidInstruction) {
+			t.Errorf("通用工程提示不应硬编码工具流程 %q", rigidInstruction)
+		}
+	}
+	for _, principle := range []string{
+		"渐进式投入",
+		"验证力度应与任务风险相称",
+		"及时收束",
+	} {
+		if !strings.Contains(out, principle) {
+			t.Errorf("系统提示应包含工程原则 %q", principle)
+		}
 	}
 }
 
@@ -105,7 +130,7 @@ func TestGetSysPromptSectionOrder(t *testing.T) {
 	skills := []Skill{{Name: "commit", Description: "生成规范 commit message"}}
 	out := GetSysPrompt(testWorkDir, skills, &PlanMode{SessionDir: testSessionDir})
 
-	personalityAt := strings.Index(out, "【沙箱强制约束】")
+	personalityAt := strings.Index(out, "【工作区边界】")
 	skillsAt := strings.Index(out, "## 可用技能（Skills）")
 	planAt := strings.Index(out, "Plan Mode")
 	if personalityAt < 0 || skillsAt < 0 || planAt < 0 {

@@ -19,7 +19,7 @@ type PlanMode struct {
 	SessionDir string
 }
 
-// GetSysPrompt 返回 agent 的 system prompt：人格提示词（含工作目录沙箱约束）
+// GetSysPrompt 返回 agent 的 system prompt：通用工程提示词（含工作区边界）
 // 拼接已加载的技能索引段；plan 非 nil 时再追加 Plan Mode 工作流提示词。
 //
 // skills 由调用方经 LoadSkills 预先加载（技能发现属 SkillSource 端口职责，
@@ -29,7 +29,7 @@ type PlanMode struct {
 func GetSysPrompt(workDir string, skills []Skill, plan *PlanMode) string {
 	var sb strings.Builder
 
-	// 人格提示词含 %s 工作目录占位，须格式化填入（沙箱约束依赖它）
+	// 通用工程提示词含 %s 工作目录占位，须格式化填入（工作区边界依赖它）
 	sb.WriteString(fmt.Sprintf(personalityPrompt, workDir))
 
 	if index := RenderSkillIndex(skills); index != "" {
