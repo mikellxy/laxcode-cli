@@ -27,10 +27,10 @@ type PagedReadRequest struct {
 // PagedReadResult 是一次分页读取的结果。
 type PagedReadResult struct {
 	Content                []byte
-	LinesRead              int  // 本次读到的完整行数；被截断的末行不计入
+	LinesRead              int  // 本次读到的完整行数（含行尾 \n）；被截断的末行不计入
 	StartLineNo            int  // 实际生效的起始行号（入参被钳制后的值）
 	EndLineNo              int  // 本次触及的最后一行行号
-	LastLineTruncated      bool // 末行是否未读完整
+	LastLineTruncated      bool // 末行是否未读完整；其行尾 \n 尚未随 Content 返回时同样为 true
 	LastLineTruncatedBytes int  // 末行已消费的字节偏移（不含换行符），续读传 +1
 	Finished               bool // 是否已到达 EOF
 	Err                    error
@@ -40,6 +40,10 @@ type PagedReadResult struct {
 // 起读取，内容至多 MaxBytes 字节、至多 MaxLines 行。
 // Content 中每行均以 \n 结尾（含文件本身无尾换行的末行）；\r\n 归一为 \n；
 // 超出 bufio 缓冲区长度的行分段读取后拼接。
+//
+// MaxBytes 是 Content 的硬上限，行尾 \n 同样计入：若预算恰好在行内容末尾用尽，
+// 该行按“未读完整”返回（LastLineTruncated=true、LastLineTruncatedBytes=行内容长度），
+// 其行尾 \n 留到下一次调用返回，既不超预算也不丢内容。
 func ReadPaged(r io.Reader, req PagedReadRequest) *PagedReadResult {
 	// 行号与行内字节偏移均为 1-based，非法值钳制到行首
 	startLineNo := req.StartLineNo
@@ -109,19 +113,22 @@ func ReadPaged(r io.Reader, req PagedReadRequest) *PagedReadResult {
 		// 至多保留 MaxBytes 字节
 		nKeep := min(len(line), req.MaxBytes-nRead)
 		result.Content = append(result.Content, line[:nKeep]...)
-		if !isPrefix && nKeep == len(line) {
-			result.Content = append(result.Content, byte('\n'))
-			linesRead++
-		}
 		nRead += nKeep
 		lineConsumed += nKeep
 
-		// 末行是否需要截断
-		result.LastLineTruncated = isPrefix || nKeep < len(line)
-		if result.LastLineTruncated {
-			result.LastLineTruncatedBytes = lineConsumed
-		} else {
+		// 行尾 \n 也占用字节预算：只有在整行内容都读入、且还能容纳 1 个 \n 时，
+		// 才把这一行记为完整行并补 \n；否则本行按“未读完整”处理，\n 留给下一次
+		// 调用（start_bytes=LastLineTruncatedBytes+1）返回。
+		// 这样 Content 长度恒等于 nRead，绝不会超出 MaxBytes，且不丢字节。
+		if !isPrefix && nKeep == len(line) && nRead < req.MaxBytes {
+			result.Content = append(result.Content, byte('\n'))
+			nRead++
+			linesRead++
+			result.LastLineTruncated = false
 			result.LastLineTruncatedBytes = 0
+		} else {
+			result.LastLineTruncated = true
+			result.LastLineTruncatedBytes = lineConsumed
 		}
 	}
 

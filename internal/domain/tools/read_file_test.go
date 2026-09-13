@@ -148,6 +148,53 @@ func TestReadFileTool(t *testing.T) {
 		t.Fatal("pagination did not finish in 10 pages")
 	})
 
+	t.Run("多行短文本每页内容不超过字节上限", func(t *testing.T) {
+		// 每行 26 字节（25 字符 + 行尾 \n）：若行尾换行符不计入字节预算，
+		// 2000 行上限会让单页内容达到 52000 字节，超出 50KB 上限
+		var sb strings.Builder
+		for i := 1; i <= 3000; i++ {
+			fmt.Fprintf(&sb, "%-25d\n", i)
+		}
+		seed("shortlines.txt", sb.String())
+		full := sb.String()
+
+		resumeRe := regexp.MustCompile(`续读请传 start_line_no=(\d+), start_bytes=(\d+)`)
+		var assembled strings.Builder
+		args := map[string]any{"path": "shortlines.txt"}
+		for page := 1; page <= 10; page++ {
+			out := exec(args)
+			idx := strings.LastIndex(out, "\n(")
+			if idx < 0 {
+				t.Fatalf("第 %d 页缺少分页 footer: %q", page, out)
+			}
+			content := out[:idx]
+			if len(content) > readFileToolMaxReadBytes {
+				t.Fatalf("第 %d 页内容 %d 字节超过上限 %d", page, len(content), readFileToolMaxReadBytes)
+			}
+			assembled.WriteString(content)
+			if strings.Contains(out, "文件已读完") {
+				if assembled.String() != full {
+					t.Fatalf("拼接 %d 字节，want %d 字节", assembled.Len(), len(full))
+				}
+				return
+			}
+			m := resumeRe.FindStringSubmatch(out)
+			if m == nil {
+				t.Fatalf("cannot parse resume params from footer: %q", out)
+			}
+			line, err := strconv.Atoi(m[1])
+			if err != nil {
+				t.Fatalf("invalid start_line_no %q: %v", m[1], err)
+			}
+			b, err := strconv.Atoi(m[2])
+			if err != nil {
+				t.Fatalf("invalid start_bytes %q: %v", m[2], err)
+			}
+			args = map[string]any{"path": "shortlines.txt", "start_line_no": line, "start_bytes": b}
+		}
+		t.Fatal("pagination did not finish in 10 pages")
+	})
+
 	t.Run("空文件输出文件为空", func(t *testing.T) {
 		seed("empty.txt", "")
 		if got := exec(map[string]any{"path": "empty.txt"}); got != "(文件为空)\n" {

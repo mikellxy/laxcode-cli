@@ -153,16 +153,18 @@ func TestReadPaged(t *testing.T) {
 			wantFinished:  true,
 		},
 		{
-			name:           "nMax 截断行内容时不补换行符",
+			// 6 字节预算 = "aaaa\n"（5）+ 第二行的 1 个字节；行尾换行符计入预算后
+			// 只能带走 "b"，剩余 "bbb" 与换行符留给续读。
+			name:           "行尾换行符计入预算后截断行内容",
 			content:        "aaaa\nbbbb\n",
 			nMax:           6,
 			linesMax:       10,
 			startLineNo:    1,
-			wantContent:    "aaaa\nbb",
+			wantContent:    "aaaa\nb",
 			wantLinesRead:  1,
 			wantEndLineNo:  2,
 			wantTruncated:  true,
-			wantTruncBytes: 2,
+			wantTruncBytes: 1,
 		},
 		{
 			name:          "截断后按偏移续读补齐该行",
@@ -237,14 +239,28 @@ func TestReadPaged(t *testing.T) {
 			wantFinished:  true,
 		},
 		{
-			name:          "nMax 恰好在行边界用尽",
+			name:          "预算恰好包含行尾换行符时该行完整",
 			content:       "abcd\nefgh\n",
-			nMax:          4,
+			nMax:          5,
 			linesMax:      10,
 			startLineNo:   1,
 			wantContent:   "abcd\n",
 			wantLinesRead: 1,
 			wantEndLineNo: 1,
+		},
+		{
+			// 4 字节预算恰好在行内容末尾用尽，塞不下行尾 \n：该行按“未读完整”
+			// 返回，续读传 start_line_no=1、start_bytes=5 取回换行符。
+			name:           "预算恰好落在行内容末尾时换行符留待续读",
+			content:        "abcd\nefgh\n",
+			nMax:           4,
+			linesMax:       10,
+			startLineNo:    1,
+			wantContent:    "abcd",
+			wantLinesRead:  0,
+			wantEndLineNo:  1,
+			wantTruncated:  true,
+			wantTruncBytes: 4,
 		},
 		{
 			name:          "startBytes 超出行长时起始行按空行结束",
